@@ -7,6 +7,45 @@ bridges the two protocols for as long as the client is attached.
 
 This document is architecture only. No code yet.
 
+## Guiding principle: as dumb as possible
+
+bicchierino is a **stateless JSON⇄IRC translator**, nothing more. It holds
+no state that outlives a connection, and it originates no domain logic of
+its own — grappa already decides what happened, bicchierino only decides
+how to say it in IRC.
+
+This is possible, not just a nice slogan, because grappa's own persistence
+turns out to be complete enough to make it true (checked directly, see
+`lib/grappa/scrollback/message.ex` + `event_router.ex`):
+`Grappa.Scrollback.Message` covers `:privmsg`, `:notice`, `:action`,
+`:join`, `:part`, `:quit`, `:nick_change`, `:mode`, `:topic`, `:kick`, plus
+a `:server_event` catch-all that keeps `raw_verb`/`raw_sender`/`raw_params`
+for anything else (`KILL`, `WALLOPS`, vendor verbs, …) — nothing falls
+through uncaptured. So a fresh login + a REST replay reconstructs a session
+that is content-equivalent to one that stayed connected the whole time.
+grappa's own wire is JSON, not IRC bytes (`Scrollback.Wire` says the IRC
+serializer is still an unbuilt "Phase 6" on grappa's side) — the JSON→IRC
+translation is exactly bicchierino's one job, same as it's already
+shottino's one job on the client side today.
+
+**What "no state" actually means, precisely:**
+- **Nothing persists across a disconnect.** No session cache, no reattach,
+  no on-disk anything. Every new connection is a fresh `/auth/login` +
+  fresh WS join + fresh channel-snapshot fetch + fresh `CHATHISTORY` replay
+  for backfill. This resolves former open questions 1 and 4 outright —
+  4 doesn't just get answered, it stops applying: there is no reattach
+  path to decide an identity rule for.
+- **Something small DOES live in memory for the duration of one live
+  connection**, and this is not a contradiction: to answer `WHOIS`/`NAMES`/
+  `WHO` without a REST round-trip per query, bicchierino keeps the same
+  kind of per-channel member/topic/mode mirror shottino keeps
+  (`ircd_cmd_whois` answers from `app->windows[i].members`, never forwards
+  upstream). This isn't extra state to design or maintain — it falls out
+  for free from relaying `JOIN`/`PART`/`QUIT`/`NICK`/`MODE`/`KICK` events to
+  the client, which bicchierino has to parse and translate anyway. Discarded
+  the instant the socket closes; never written anywhere; never consulted by
+  a different connection.
+
 ## Scope
 
 **In scope:**
@@ -123,8 +162,9 @@ downstream IRC client                bicchierino                    grappa
         |                                |<-- event (echo/others) ------|
         |<-- :nick PRIVMSG #chan :hi ----|                             |
         |                                |                             |
-        |--- QUIT / disconnect --------->|--- (see open question: -----|
-        |                                |     teardown or detach?)    |
+        |--- QUIT / disconnect --------->|--- WS leave + close -------->|
+        |                                | (in-memory mirror dropped;   |
+        |                                |  nothing persisted)          |
 ```
 
 ## Decided
@@ -154,32 +194,24 @@ the design.
 
 ## Open questions — decide before writing code
 
-1. **Session persistence on disconnect.** Does the grappa session die with
-   the IRC socket (simplest, but loses "offline while client is away"
-   bouncer behavior — the whole point of a bouncer), or does it persist
-   detached and reattach on the next connection with matching
-   account+network+password (real bouncer behavior, needs a session cache
-   keyed by (account, network), closer to what scbnc already does for real
-   IRC servers)? This is the single biggest architectural fork — decides
-   whether bicchierino needs any persistent state at all.
-2. **grappa base URL**: one bicchierino process → one grappa deployment,
+~~1. Session persistence on disconnect.~~ **Resolved** — see "Guiding
+principle" above. No persistence, no reattach.
+
+~~2. Reattach identity.~~ **Moot** — no reattach path exists to need one.
+
+1. **grappa base URL**: one bicchierino process → one grappa deployment,
    configured at daemon startup (matches how you'd actually run it against
    e.g. your own grappa instance), or does it need to be per-connection
    too? Leaning toward daemon-level config — the account/password varying
    per-connection is the actual ask, the target deployment isn't.
-3. **TLS**: both legs need it eventually (downstream for real clients off
+2. **TLS**: both legs need it eventually (downstream for real clients off
    loopback, upstream because grappa is presumably HTTPS/WSS). libevent's
    `bufferevent_openssl` on both sides, matching scbnc's existing approach
    — no new decision needed here, just confirming before implementation.
-4. **Reattach identity**: if (1) picks persistence, how is "same session"
-   decided — (account, network) alone, or password re-checked each time?
-   Re-checking is safer (a revoked/changed password should kick a stale
-   session) but means every reconnect is a fresh `/auth/login` call even
-   for a session that never actually died.
 
 ## Next step
 
-Once (1)-(2) above are answered, the actual work is: read
+Once (1) above is answered, the actual work is: read
 `GrappaWeb.UserSocket`/`UserChannel` to pin the exact connect-param and
 channel-topic shape, then write the skeleton (libevent listener +
 vendored `ws.c`/`json.c` + the registration/login/bridge state machine
