@@ -29,6 +29,15 @@ struct http_response {
  * CLAUDE.md §3.3's "grappa not reachable" case, not a credentials one. */
 bool https_post_login(const char *grappa_url, const char *json_body, struct http_response *out);
 
+/* Blocking authenticated HTTPS GET of `<grappa_url><path>`, bearer auth.
+ * Same return-value contract as https_post_login. Used for the
+ * post-login bootstrap discovery calls (WIRE.md §1.5): GET /networks and
+ * GET /networks/:slug/channels — both blocking, both one-shot, no
+ * connection reuse between them (WIRE.md §2.5: nothing here is frequent
+ * enough to need it). */
+bool https_get_bearer(const char *grappa_url, const char *path, const char *bearer_token,
+                       struct http_response *out);
+
 void http_response_free(struct http_response *resp);
 
 #endif /* BICCHIERINO_HTTP_H */
