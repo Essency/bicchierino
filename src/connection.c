@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp — slug matching is case-insensitive */
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -13,6 +14,9 @@
 #include "json.h"
 
 #define IRC_LINE_MAX 512
+#define MAX_CHANNELS 128 /* KeelBot's own scale doc uses ~70 channels as
+                           * its reference point; this is a hostile-
+                           * response backstop, not a real ceiling */
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
 
@@ -143,6 +147,20 @@ struct registration {
     bool got_nick;
 };
 
+/* Everything learned about this session across login (WIRE.md §1) and
+ * the bootstrap discovery calls (WIRE.md §1.5), before the websocket
+ * even opens. Lives on connection_run's stack — one per connection
+ * thread, never shared (CLAUDE.md §3: zero state shared between
+ * connections). */
+struct grappa_session {
+    char token[512];
+    char subject_name[128];
+    char network_slug[64];
+    long network_id;
+    char channels[MAX_CHANNELS][128];
+    size_t channel_count;
+};
+
 static void handle_registration_message(const struct irc_message *msg, struct registration *reg) {
     if (strcmp(msg->command, "PASS") == 0) {
         if (msg->param_count >= 1) {
@@ -242,11 +260,11 @@ static void build_login_body(const char *account, const char *password, char *bo
  * credentials" vs a malformed-response case are different bugs to chase
  * and must not look identical in a log.
  *
- * TODO(next): on success, this only logs the token/subject — the actual
- * WS connect + topic joins (WIRE.md §3-4) are the next piece, not here
- * yet. */
+ * The token/subject are copied out (not left as pointers into the parsed
+ * `json_doc`) because the doc is freed before this returns — a
+ * `json_string()` result is only valid as long as its document is. */
 static bool attempt_grappa_login(int fd, const char *account, const char *password,
-                                  const struct config *cfg) {
+                                  const struct config *cfg, struct grappa_session *sess) {
     char body[LOGIN_BODY_MAX];
     build_login_body(account, password, body, sizeof(body));
 
@@ -271,11 +289,10 @@ static bool attempt_grappa_login(int fd, const char *account, const char *passwo
             const char *subject_name = NULL;
             if (json_str_req(root, "token", &token) && subject &&
                 json_str_req(subject, "name", &subject_name)) {
-                fprintf(stderr, "bicchierino: grappa login OK, subject=%s\n", subject_name);
-                /* TODO(next): stash token + subject_name, move on to the
-                 * WS connect (WIRE.md §2, §4) instead of stopping here. */
-                send_line(fd, "ERROR :bicchierino: login OK, websocket bridge not "
-                              "implemented yet");
+                snprintf(sess->token, sizeof(sess->token), "%s", token);
+                snprintf(sess->subject_name, sizeof(sess->subject_name), "%s", subject_name);
+                fprintf(stderr, "bicchierino: grappa login OK, subject=%s\n",
+                        sess->subject_name);
                 ok = true;
             } else {
                 fprintf(stderr, "bicchierino: grappa login: 200 response missing "
@@ -295,6 +312,165 @@ static bool attempt_grappa_login(int fd, const char *account, const char *passwo
 
     http_response_free(&resp);
     return ok;
+}
+
+/* Percent-encodes everything except RFC 3986 unreserved characters —
+ * conservative on purpose (shottino's own url_encode does the same for
+ * this exact path), even though a network slug in practice is unlikely
+ * to need it. */
+static void url_encode(const char *src, char *dst, size_t dst_sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t di = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && di + 1 < dst_sz; p++) {
+        bool unreserved =
+            isalnum(*p) || *p == '-' || *p == '.' || *p == '_' || *p == '~';
+        if (unreserved) {
+            dst[di++] = (char)*p;
+        } else {
+            if (di + 3 >= dst_sz) break;
+            dst[di++] = '%';
+            dst[di++] = hex[*p >> 4];
+            dst[di++] = hex[*p & 0xF];
+        }
+    }
+    dst[di] = '\0';
+}
+
+/* WIRE.md §1.5: GET /networks, then resolve PASS's `network` segment
+ * against the real list — named-and-found, named-and-missing, unnamed-
+ * with-exactly-one, unnamed-with-several, or the zero-networks dead end.
+ * Five outcomes, and only one of them is success. */
+static bool resolve_network(int fd, const struct config *cfg, const char *want_network,
+                             struct grappa_session *sess) {
+    struct http_response resp;
+    if (!https_get_bearer(cfg->grappa_url, "/networks", sess->token, &resp)) {
+        fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
+        send_line(fd, "ERROR :bicchierino: grappa not reachable");
+        return false;
+    }
+    if (resp.status != 200) {
+        fprintf(stderr, "bicchierino: GET /networks: unexpected HTTP status %d\n", resp.status);
+        send_line(fd, "ERROR :bicchierino: could not list grappa networks (%d)", resp.status);
+        http_response_free(&resp);
+        return false;
+    }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    if (!doc) {
+        fprintf(stderr, "bicchierino: GET /networks: malformed JSON: %s\n", err);
+        send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+        http_response_free(&resp);
+        return false;
+    }
+
+    const json_value *root = json_root(doc);
+    size_t count = json_len(root);
+
+    if (count == 0) {
+        fprintf(stderr, "bicchierino: account has zero networks bound\n");
+        send_line(fd, "ERROR :bicchierino: no networks bound to this account");
+        json_free(doc);
+        http_response_free(&resp);
+        return false;
+    }
+
+    char available[512] = {0};
+    size_t avail_len = 0;
+    bool found = false;
+
+    for (size_t i = 0; i < count; i++) {
+        const json_value *entry = json_at(root, i);
+        const char *slug = NULL;
+        long id = 0;
+        if (!json_str_req(entry, "slug", &slug) || !json_long_req(entry, "id", &id)) continue;
+
+        int written = snprintf(available + avail_len, sizeof(available) - avail_len, "%s%s",
+                                avail_len ? " " : "", slug);
+        if (written > 0 && (size_t)written < sizeof(available) - avail_len)
+            avail_len += (size_t)written;
+
+        bool matches = want_network[0] ? strcasecmp(slug, want_network) == 0 : count == 1;
+        if (matches) {
+            snprintf(sess->network_slug, sizeof(sess->network_slug), "%s", slug);
+            sess->network_id = id;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        if (want_network[0]) {
+            fprintf(stderr, "bicchierino: no such network '%s' — this account has: %s\n",
+                    want_network, available);
+            send_line(fd, "ERROR :bicchierino: no such network %s — this account has: %s",
+                      want_network, available);
+        } else {
+            fprintf(stderr, "bicchierino: PASS named no network and this account has "
+                            "several: %s\n",
+                    available);
+            send_line(fd,
+                      "ERROR :bicchierino: PASS network:password — this account has: %s",
+                      available);
+        }
+    }
+
+    json_free(doc);
+    http_response_free(&resp);
+    return found;
+}
+
+/* WIRE.md §1.5: GET /networks/:slug/channels for the ONE network already
+ * resolved — bicchierino, unlike shottino, never bridges more than one
+ * network per connection, so there is only ever one of these calls per
+ * session. Only `joined: true` entries matter here (the channels to
+ * present as JOIN lines to the downstream client at registration). */
+static bool fetch_joined_channels(int fd, const struct config *cfg, struct grappa_session *sess) {
+    char encoded_slug[192];
+    url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
+    char path[256];
+    snprintf(path, sizeof(path), "/networks/%s/channels", encoded_slug);
+
+    struct http_response resp;
+    if (!https_get_bearer(cfg->grappa_url, path, sess->token, &resp)) {
+        fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
+        send_line(fd, "ERROR :bicchierino: grappa not reachable");
+        return false;
+    }
+    if (resp.status != 200) {
+        fprintf(stderr, "bicchierino: GET %s: unexpected HTTP status %d\n", path, resp.status);
+        send_line(fd, "ERROR :bicchierino: could not list channels (%d)", resp.status);
+        http_response_free(&resp);
+        return false;
+    }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    if (!doc) {
+        fprintf(stderr, "bicchierino: GET %s: malformed JSON: %s\n", path, err);
+        send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+        http_response_free(&resp);
+        return false;
+    }
+
+    const json_value *root = json_root(doc);
+    size_t count = json_len(root);
+    sess->channel_count = 0;
+
+    for (size_t i = 0; i < count && sess->channel_count < MAX_CHANNELS; i++) {
+        const json_value *entry = json_at(root, i);
+        const char *name = NULL;
+        bool joined = false;
+        if (!json_str_req(entry, "name", &name)) continue;
+        if (!json_bool_req(entry, "joined", &joined)) continue;
+        if (!joined) continue;
+        snprintf(sess->channels[sess->channel_count], sizeof(sess->channels[0]), "%s", name);
+        sess->channel_count++;
+    }
+
+    json_free(doc);
+    http_response_free(&resp);
+    return true;
 }
 
 void *connection_run(void *arg) {
@@ -320,14 +496,27 @@ void *connection_run(void *arg) {
             char network[IRC_LINE_MAX], password[IRC_LINE_MAX];
             split_network_password(reg.got_pass ? reg.pass_raw : "", network, sizeof(network),
                                     password, sizeof(password));
-            /* `network` is not part of the login call at all (WIRE.md §1:
-             * only account+password go in the REST body) — it picks which
-             * grappa:user:{subject}/network:{net}/... topic to join,
-             * which is the very next piece after login succeeds. Computed
-             * here and not yet used past this point; TODO(next) carries
-             * it into the WS join stage instead of dropping it. */
-            (void)network;
-            attempt_grappa_login(fd, reg.account, password, cfg);
+
+            struct grappa_session sess = {0};
+            /* Three blocking calls, in this one thread, in sequence — the
+             * whole reason connections are threads (CLAUDE.md §3): none
+             * of this stalls any other connection. Each step's own ERROR
+             * is already sent to the client by the function that failed;
+             * this loop just decides whether to keep going. */
+            if (attempt_grappa_login(fd, reg.account, password, cfg, &sess) &&
+                resolve_network(fd, cfg, network, &sess) &&
+                fetch_joined_channels(fd, cfg, &sess)) {
+                fprintf(stderr,
+                        "bicchierino: bootstrap OK: subject=%s network=%s(%ld) "
+                        "joined_channels=%zu\n",
+                        sess.subject_name, sess.network_slug, sess.network_id,
+                        sess.channel_count);
+                /* TODO(next): WS connect + topic joins (WIRE.md §2-5),
+                 * using sess.token/network_slug/channels — this is as far
+                 * as the bootstrap goes today. */
+                send_line(fd, "ERROR :bicchierino: bootstrap OK, websocket bridge not "
+                              "implemented yet");
+            }
             break;
         }
     }

@@ -11,8 +11,10 @@
 
 #define GRAPPA_URL_PREFIX "https://"
 #define HTTP_READ_CHUNK 4096
-#define HTTP_MAX_RESPONSE (4 * 1024 * 1024) /* a login response is a few
-                                              * hundred bytes; this is a
+#define HTTP_REQUEST_MAX 8192
+#define HTTP_MAX_RESPONSE (4 * 1024 * 1024) /* any of bicchierino's own
+                                              * responses are a few KB at
+                                              * most; this is a
                                               * hostile-server backstop,
                                               * not a real limit */
 
@@ -106,13 +108,19 @@ static bool parse_status_line(const char *response, int *status) {
     return *status >= 100 && *status < 600;
 }
 
-bool https_post_login(const char *grappa_url, const char *json_body, struct http_response *out) {
-    memset(out, 0, sizeof(*out));
-
-    struct parsed_url pu;
-    if (!parse_grappa_url(grappa_url, &pu)) return false;
-
-    int fd = tcp_connect(pu.host, pu.port);
+/* The shared mechanics: connect, TLS handshake (verified — both chain of
+ * trust and hostname, ARCHITECTURE.md's "OpenSSL, two distinct roles",
+ * this is the client role), send a fully-formed request, read until the
+ * peer closes (every request here sends Connection: close, so this is
+ * always correct — no Content-Length/chunked parsing needed on our own
+ * traffic, and grappa's JSON responses are fully-buffered non-streamed
+ * bodies, so the assumption holds there too — see WIRE.md §2.5), split
+ * headers from body, parse the status line. One exchange per call, no
+ * connection reuse — matches WIRE.md §2.5's "no repeated HTTP traffic to
+ * optimize" finding exactly. */
+static bool https_exchange(const struct parsed_url *pu, const char *request, size_t request_len,
+                            struct http_response *out) {
+    int fd = tcp_connect(pu->host, pu->port);
     if (fd < 0) return false;
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
@@ -136,32 +144,15 @@ bool https_post_login(const char *grappa_url, const char *json_body, struct http
     /* Both SNI (which server sends its cert) and hostname verification
      * (which cert we'll accept) need the hostname — they are not the
      * same OpenSSL call and it's easy to set one and forget the other. */
-    SSL_set_tlsext_host_name(ssl, pu.host);
-    SSL_set1_host(ssl, pu.host);
+    SSL_set_tlsext_host_name(ssl, pu->host);
+    SSL_set1_host(ssl, pu->host);
     SSL_set_fd(ssl, fd);
 
-    bool ok = true;
-    if (SSL_connect(ssl) != 1) ok = false;
+    bool ok = SSL_connect(ssl) == 1;
 
     struct growbuf response = {0};
 
-    if (ok) {
-        char request[HTTP_READ_CHUNK];
-        int req_len = snprintf(request, sizeof(request),
-                                "POST /auth/login HTTP/1.1\r\n"
-                                "Host: %s\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Content-Length: %zu\r\n"
-                                "Connection: close\r\n"
-                                "\r\n"
-                                "%s",
-                                pu.host, strlen(json_body), json_body);
-        if (req_len < 0 || (size_t)req_len >= sizeof(request)) {
-            ok = false;
-        } else if (SSL_write(ssl, request, req_len) <= 0) {
-            ok = false;
-        }
-    }
+    if (ok && SSL_write(ssl, request, (int)request_len) <= 0) ok = false;
 
     if (ok) {
         char chunk[HTTP_READ_CHUNK];
@@ -181,26 +172,13 @@ bool https_post_login(const char *grappa_url, const char *json_body, struct http
     SSL_CTX_free(ctx);
     close(fd);
 
-    if (!ok || response.len == 0) {
-        free(response.data);
-        return false;
-    }
-
-    /* NUL-terminate so string functions below can work on it directly —
-     * the body may legitimately contain no embedded NULs (it's grappa's
-     * own JSON, per WIRE.md's own contract that this wire is text). */
-    if (!growbuf_append(&response, "", 1)) {
+    if (!ok || response.len == 0 || !growbuf_append(&response, "", 1)) {
         free(response.data);
         return false;
     }
 
     char *sep = strstr(response.data, "\r\n\r\n");
-    if (!sep) {
-        free(response.data);
-        return false;
-    }
-
-    if (!parse_status_line(response.data, &out->status)) {
+    if (!sep || !parse_status_line(response.data, &out->status)) {
         free(response.data);
         return false;
     }
@@ -218,6 +196,47 @@ bool https_post_login(const char *grappa_url, const char *json_body, struct http
 
     free(response.data);
     return true;
+}
+
+bool https_post_login(const char *grappa_url, const char *json_body, struct http_response *out) {
+    memset(out, 0, sizeof(*out));
+
+    struct parsed_url pu;
+    if (!parse_grappa_url(grappa_url, &pu)) return false;
+
+    char request[HTTP_REQUEST_MAX];
+    int req_len = snprintf(request, sizeof(request),
+                            "POST /auth/login HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: %zu\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            "%s",
+                            pu.host, strlen(json_body), json_body);
+    if (req_len < 0 || (size_t)req_len >= sizeof(request)) return false;
+
+    return https_exchange(&pu, request, (size_t)req_len, out);
+}
+
+bool https_get_bearer(const char *grappa_url, const char *path, const char *bearer_token,
+                       struct http_response *out) {
+    memset(out, 0, sizeof(*out));
+
+    struct parsed_url pu;
+    if (!parse_grappa_url(grappa_url, &pu)) return false;
+
+    char request[HTTP_REQUEST_MAX];
+    int req_len = snprintf(request, sizeof(request),
+                            "GET %s HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "Authorization: Bearer %s\r\n"
+                            "Connection: close\r\n"
+                            "\r\n",
+                            path, pu.host, bearer_token);
+    if (req_len < 0 || (size_t)req_len >= sizeof(request)) return false;
+
+    return https_exchange(&pu, request, (size_t)req_len, out);
 }
 
 void http_response_free(struct http_response *resp) {
