@@ -77,6 +77,64 @@ static int tcp_connect(const char *host, const char *port) {
     return fd;
 }
 
+/* TLS connect + verify (chain of trust + hostname — ARCHITECTURE.md's
+ * "OpenSSL, two distinct roles" client role, never skipped). Shared by
+ * every caller in this file, and by ws_client.c via https_tls_connect
+ * below — the persistent websocket connection needs the exact same
+ * verification posture as a one-shot REST call, only what happens to
+ * the connection afterwards differs. On success the caller owns
+ * *ssl_out, *ctx_out and *fd_out, and must tear all three down. */
+static bool tls_connect(const struct parsed_url *pu, SSL_CTX **ctx_out, SSL **ssl_out,
+                         int *fd_out) {
+    int fd = tcp_connect(pu->host, pu->port);
+    if (fd < 0) return false;
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        close(fd);
+        return false;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_default_verify_paths(ctx);
+    /* TLS 1.2 minimum — matches what any grappa deployment worth talking
+     * to will negotiate anyway, and refuses to silently downgrade. */
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        SSL_CTX_free(ctx);
+        close(fd);
+        return false;
+    }
+
+    /* Both SNI (which server sends its cert) and hostname verification
+     * (which cert we'll accept) need the hostname — they are not the
+     * same OpenSSL call and it's easy to set one and forget the other. */
+    SSL_set_tlsext_host_name(ssl, pu->host);
+    SSL_set1_host(ssl, pu->host);
+    SSL_set_fd(ssl, fd);
+
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        close(fd);
+        return false;
+    }
+
+    *ctx_out = ctx;
+    *ssl_out = ssl;
+    *fd_out = fd;
+    return true;
+}
+
+bool https_tls_connect(const char *grappa_url, SSL_CTX **ctx_out, SSL **ssl_out, int *fd_out,
+                        char *host_out, size_t host_out_sz) {
+    struct parsed_url pu;
+    if (!parse_grappa_url(grappa_url, &pu)) return false;
+    if (host_out && host_out_sz > 0) snprintf(host_out, host_out_sz, "%s", pu.host);
+    return tls_connect(&pu, ctx_out, ssl_out, fd_out);
+}
+
 /* Growing buffer, same shape as connection.c's line reader: a read() call
  * is not a message, keep appending until the peer closes. */
 struct growbuf {
@@ -120,36 +178,12 @@ static bool parse_status_line(const char *response, int *status) {
  * optimize" finding exactly. */
 static bool https_exchange(const struct parsed_url *pu, const char *request, size_t request_len,
                             struct http_response *out) {
-    int fd = tcp_connect(pu->host, pu->port);
-    if (fd < 0) return false;
+    SSL_CTX *ctx;
+    SSL *ssl;
+    int fd;
+    if (!tls_connect(pu, &ctx, &ssl, &fd)) return false;
 
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) {
-        close(fd);
-        return false;
-    }
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-    SSL_CTX_set_default_verify_paths(ctx);
-    /* TLS 1.2 minimum — matches what any grappa deployment worth talking
-     * to will negotiate anyway, and refuses to silently downgrade. */
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-
-    SSL *ssl = SSL_new(ctx);
-    if (!ssl) {
-        SSL_CTX_free(ctx);
-        close(fd);
-        return false;
-    }
-
-    /* Both SNI (which server sends its cert) and hostname verification
-     * (which cert we'll accept) need the hostname — they are not the
-     * same OpenSSL call and it's easy to set one and forget the other. */
-    SSL_set_tlsext_host_name(ssl, pu->host);
-    SSL_set1_host(ssl, pu->host);
-    SSL_set_fd(ssl, fd);
-
-    bool ok = SSL_connect(ssl) == 1;
-
+    bool ok = true;
     struct growbuf response = {0};
 
     if (ok && SSL_write(ssl, request, (int)request_len) <= 0) ok = false;

@@ -12,6 +12,7 @@
 #ifndef BICCHIERINO_HTTP_H
 #define BICCHIERINO_HTTP_H
 
+#include <openssl/ssl.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -52,6 +53,23 @@ bool https_get_bearer(const char *grappa_url, const char *path, const char *bear
  * this fails, the connection is already tearing down either way. */
 bool https_delete_bearer(const char *grappa_url, const char *path, const char *bearer_token,
                           struct http_response *out);
+
+/* Opens a verified TLS connection (same posture as every call above —
+ * chain of trust + hostname, never skipped) to `<grappa_url>`'s host:port
+ * and leaves it OPEN — unlike every function above, which owns the whole
+ * request/response exchange and tears the connection down before
+ * returning. For ws_client.c: the websocket connection is persistent
+ * (WIRE.md §2), so it needs the TLS setup without the one-shot
+ * request/close lifecycle. Caller owns *ssl_out, *ctx_out and *fd_out,
+ * and must tear down all three (SSL_shutdown, SSL_free, SSL_CTX_free,
+ * close) when done.
+ *
+ * `host_out` receives the parsed hostname (NUL-terminated, truncated to
+ * `host_out_sz` in the pathological case) — a caller building its own
+ * request needs it for the `Host:` header, and this is the one place
+ * the URL is parsed, not duplicated per caller. */
+bool https_tls_connect(const char *grappa_url, SSL_CTX **ctx_out, SSL **ssl_out, int *fd_out,
+                        char *host_out, size_t host_out_sz);
 
 void http_response_free(struct http_response *resp);
 
