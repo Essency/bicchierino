@@ -239,6 +239,26 @@ bool https_get_bearer(const char *grappa_url, const char *path, const char *bear
     return https_exchange(&pu, request, (size_t)req_len, out);
 }
 
+bool https_delete_bearer(const char *grappa_url, const char *path, const char *bearer_token,
+                          struct http_response *out) {
+    memset(out, 0, sizeof(*out));
+
+    struct parsed_url pu;
+    if (!parse_grappa_url(grappa_url, &pu)) return false;
+
+    char request[HTTP_REQUEST_MAX];
+    int req_len = snprintf(request, sizeof(request),
+                            "DELETE %s HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "Authorization: Bearer %s\r\n"
+                            "Connection: close\r\n"
+                            "\r\n",
+                            path, pu.host, bearer_token);
+    if (req_len < 0 || (size_t)req_len >= sizeof(request)) return false;
+
+    return https_exchange(&pu, request, (size_t)req_len, out);
+}
+
 void http_response_free(struct http_response *resp) {
     free(resp->body);
     resp->body = NULL;

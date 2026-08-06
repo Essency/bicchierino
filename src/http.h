@@ -1,10 +1,13 @@
-/* http.h — the one HTTPS call bicchierino ever makes: POST /auth/login.
+/* http.h — the small, fixed set of HTTPS calls bicchierino ever makes:
+ * login, the bootstrap discovery GETs (WIRE.md §1.5), and logout.
  *
- * Not a general HTTP client. WIRE.md §2.5: after login, a session never
- * makes another HTTP request — everything else is a push on the already-
- * open websocket. So this only needs to do one thing, blocking, once per
- * connection thread (CLAUDE.md §3: that's exactly why connections are
- * threads, not multiplexed on one poll() loop).
+ * Not a general HTTP client. WIRE.md §2.5: once bootstrap is done, a
+ * session never makes another HTTP request — everything else is a push
+ * on the already-open websocket. Every call here is blocking, one-shot,
+ * no connection reuse between them — that's fine precisely because none
+ * of this repeats within a session (CLAUDE.md §3: it's also why
+ * connections are threads, not multiplexed on one poll() loop — a
+ * blocking call here only ever stalls its own connection).
  */
 #ifndef BICCHIERINO_HTTP_H
 #define BICCHIERINO_HTTP_H
@@ -37,6 +40,18 @@ bool https_post_login(const char *grappa_url, const char *json_body, struct http
  * enough to need it). */
 bool https_get_bearer(const char *grappa_url, const char *path, const char *bearer_token,
                        struct http_response *out);
+
+/* Blocking authenticated HTTPS DELETE of `<grappa_url><path>`, bearer
+ * auth. Same return-value contract as https_post_login. Used for
+ * `DELETE /auth/logout` when the downstream client goes away — revokes
+ * bicchierino's own token. Confirmed safe for a registered-user session
+ * (WIRE.md, auth_controller.ex's own #126 comment): this detaches, it
+ * does NOT tear down the real upstream IRC connection — that lives in
+ * grappa's own Session.Server, keyed by (user, network), independent of
+ * any WS client. Best-effort by the caller: nothing meaningful to do if
+ * this fails, the connection is already tearing down either way. */
+bool https_delete_bearer(const char *grappa_url, const char *path, const char *bearer_token,
+                          struct http_response *out);
 
 void http_response_free(struct http_response *resp);
 
