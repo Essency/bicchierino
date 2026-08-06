@@ -169,23 +169,46 @@ Marcello Barnaba / `vjt/grappa-irc`, MIT, alongside the vendored files.
 Worth a heads-up to vjt when this starts for real, even though the license
 doesn't require it.
 
-## Connection lifecycle (draft)
+## Connection lifecycle
+
+Superseded by `WIRE.md` for the exact request/response shapes — this is
+just the sequencing, kept here because it's the shape the code follows,
+not the wire detail. `WIRE.md` §1-4 is authoritative; this diagram was
+wrong on two points in an earlier draft (bearer via query string, a
+single generic network join, no bootstrap REST calls) and has been
+corrected against it, not the other way around.
 
 ```
 downstream IRC client                bicchierino                    grappa
         |                                |                             |
-        |--- CAP LS / PASS network:pw / NICK / USER ->                 |
+        |--- CAP LS / PASS net:pw / NICK / USER ->                     |
         |                                | (buffered until NICK+USER)  |
         |                                |--- POST /auth/login ------->|
-        |                                |    {account, password}      |
-        |                                |<-- 200 {token} -------------|
-        |                                |   (or 401 -> IRC 464, close)|
-        |                                |--- WS connect /socket ----->|
-        |                                |    ?token=...                |
-        |                                |<-- phx_reply ok -------------|
-        |                                |--- phx_join <network> ------>|
-        |                                |<-- channels/state ------------|
-        |<-- 001..005, MOTD, JOINs, replay -|                             |
+        |                                |    {identifier, password}   |
+        |                                |<-- 200 {token, subject} ----|
+        |                                |   (401 / unreachable: bare  |
+        |                                |    ERROR, close — §3.3)     |
+        |                                |--- GET /networks ----------->|
+        |                                |<-- [{slug, id, ...}] --------|
+        |                                | (resolve PASS's network      |
+        |                                |  against this list; zero     |
+        |                                |  or unmatched: ERROR, close) |
+        |                                |--- GET /networks/:slug/     ->|
+        |                                |    channels                  |
+        |                                |<-- [{name, joined, ...}] ----|
+        |                                |--- WS connect /socket ------>|
+        |                                |    (bearer via              |
+        |                                |    Sec-WebSocket-Protocol,   |
+        |                                |    not query string)         |
+        |                                |--- phx_join                 ->|
+        |                                |    grappa:user:{subject}     |
+        |                                |<-- snapshot (DM windows,     |
+        |                                |    topic/modes) -------------|
+        |                                |--- phx_join per joined       ->|
+        |                                |    channel + own-nick DM     |
+        |                                |    listener (WIRE.md §4-5)   |
+        |                                |--- push visibility:true     ->|
+        |<-- 001..005, MOTD, JOINs -------|                             |
         |                                |                             |
         |--- PRIVMSG #chan :hi --------->|--- push message ----------->|
         |                                |<-- event (echo/others) ------|

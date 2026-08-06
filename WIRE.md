@@ -50,6 +50,49 @@ account string bicchierino was given — `Subject.topic_label/1` is the single
 source of truth for that value server-side, and assuming it's an unmodified
 echo of the input is exactly the kind of guess this doc exists to avoid making.
 
+## 1.5 Network + channel discovery — `GET /networks`, `GET /networks/:slug/channels`
+
+**Correction to an earlier version of this doc's §2.5**: login is not the
+only REST call a session makes. shottino's own `seed_state`
+(`shottino.c:6275-6316`) calls two more, right after login and before ever
+opening the websocket — bicchierino needs the same two, for the same
+reason: **there is no other way to learn which networks and channels
+exist before joining any topic.** The WS after-join snapshot (§4 below)
+tells you about topics/modes for channels you're *already subscribed to*
+— it can't tell you which channels to subscribe to in the first place.
+
+- **`GET /networks`** (bearer auth) → JSON array, one entry per network
+  bound to this account: `{kind: "user", id, slug, nick, connection_state,
+  ...}` (`Grappa.Networks.Wire.network_with_nick_json`,
+  `lib/grappa/networks/wire.ex:90-104`). This is where `PASS`'s `network`
+  segment gets validated against reality:
+  - `PASS network:password` named a network → check it's in this list
+    (case-insensitive on `slug`); not found → the same "no such network,
+    this account has: ..." shape shottino's own `ircd_register` already
+    uses (`ARCHITECTURE.md`'s identity section).
+  - `PASS password` named none → exactly one network in the list → use
+    it. More than one → same "which network?" listing. **Zero** → dead
+    end, see below.
+- **`GET /networks/<url-encoded-slug>/channels`** (bearer auth) → JSON
+  array for the *one* resolved network: `{name, joined, source}`
+  (`channel_json`, `wire.ex:150-164`) — `joined: true` entries are exactly
+  the channels bicchierino needs to open a channel-level topic for and
+  present as `JOIN` lines to the downstream client at registration,
+  mirroring shottino's own `ircd_present_channel` step. Unlike shottino
+  (which fetches this for every network it bridges, being single-process
+  multi-network), bicchierino only ever needs it for the one network the
+  connection resolved to.
+
+**Zero networks bound is a dead end, not an edge case to route around.**
+shottino's own bootstrap treats it as fatal (`die("no networks
+available")` right after the `GET /networks` call) because there is
+nothing left to bridge to — no network-level or channel-level topic can
+even be named. bicchierino's equivalent, consistent with `CLAUDE.md` §3.3
+(bare `ERROR`, pre-registration, no numeric — `001` was never sent):
+`ERROR :bicchierino: no networks bound to this account` and close. This
+is a real case, not a hypothetical — confirmed directly against a real
+test account (`SonicTest`) that has a valid login but zero networks.
+
 ## 2. WebSocket connect — `/socket/websocket`
 
 **Auth token rides the `Sec-WebSocket-Protocol` subprotocol header**, not the
@@ -70,15 +113,18 @@ the moduledoc's DESIGN_NOTES reference). Absent or unparseable is treated as
 first — shottino and cicchetto both do, and the failure mode for omitting it
 is "treated as current," never a rejection.
 
-## 2.5 After login, HTTP is done — everything else is a WS push
+## 2.5 After bootstrap, HTTP is done — everything else is a WS push
 
-Worth stating outright, since it's easy to miss even having read §1-2: **the
-login POST is the only REST call a live session makes.** Every action —
-`PRIVMSG`, `JOIN`, `MODE`, `KICK`, whatever — is a `phx_push` frame on the
-already-open channel websocket (`ws_push_user`/`ws_send_frame_locked` in
-shottino), not a new HTTP request. There is no per-message HTTP round trip to
-optimize, batch or keep-alive; the WS connection carries the entire session
-after the one login call that opened it.
+**Corrected**: not "after login" as an earlier version of this doc said —
+after the **bootstrap REST calls** (§1: login, then §1.5: `GET /networks` +
+`GET /networks/:slug/channels`, all blocking, all in the same connection
+thread, all before the websocket even opens). Once that's done, every
+action — `PRIVMSG`, `JOIN`, `MODE`, `KICK`, whatever — is a `phx_push`
+frame on the already-open channel websocket
+(`ws_push_user`/`ws_send_frame_locked` in shottino), not a new HTTP
+request. There is no per-message HTTP round trip to optimize, batch or
+keep-alive for the *steady-state* traffic — the original point of this
+section stands, it just started one step too late.
 
 The one exception is optional `CHATHISTORY` backfill (shottino's
 `--ircd-archive`) — a REST query issued when a client scrolls back past what
