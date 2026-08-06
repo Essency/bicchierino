@@ -12,6 +12,7 @@
 
 #include "http.h"
 #include "json.h"
+#include "ws_client.h"
 
 #define IRC_LINE_MAX 512
 #define MAX_CHANNELS 128 /* a comparable production bouncer's own scale doc uses ~70 channels as
@@ -702,8 +703,20 @@ void *connection_run(void *arg) {
         fprintf(stderr,
                 "bicchierino: bootstrap OK: subject=%s network=%s(%ld) joined_channels=%zu\n",
                 sess.subject_name, sess.network_slug, sess.network_id, sess.channel_count);
-        /* TODO(next): WS connect + topic joins (WIRE.md §2-5) is the
-         * real next piece — this NOTICE is where that starts. */
+
+        /* TODO(next): this only proves the handshake works — it closes
+         * the websocket right back up. Topic joins (WIRE.md §3-4) and
+         * the poll()-on-two-fds restructure (CLAUDE.md §3) are the next
+         * piece; this is deliberately isolated so a handshake bug and a
+         * join-sequence bug are never the same failed test. */
+        struct ws_client wsc;
+        if (ws_client_connect(cfg->grappa_url, sess.token, &wsc)) {
+            fprintf(stderr, "bicchierino: websocket handshake OK\n");
+            ws_client_close(&wsc);
+        } else {
+            fprintf(stderr, "bicchierino: websocket handshake FAILED\n");
+        }
+
         send_line(fd,
                   ":%s NOTICE %s :Login successful, but the websocket bridge isn't "
                   "implemented yet — messages will not be delivered",
