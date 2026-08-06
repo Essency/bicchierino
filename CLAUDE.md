@@ -85,6 +85,52 @@ Dettaglio completo in `ARCHITECTURE.md`. Digest:
   parta (mono-utente per costruzione); bicchierino fa login per ogni nuova
   connessione mentre altre sono già vive, quindi non è lo stesso caso.
 
+  **Precisazione**: "un thread per connessione" non dice come si scoprono le
+  connessioni nuove quando i listener sono più di uno (§3.1). Un thread (o
+  il main) fa `poll()` sui socket in ascolto — pochi, fissi, uno per bind
+  configurato — e a ogni `accept()` lancia il thread dedicato a quel client.
+
+### 3.1 Configurazione: file a direttive, un bind è una tupla
+
+Formato: **una direttiva per riga**, stile `sshd_config`/nginx — non JSON,
+non libconfig (scartati: vedi `example.config` in radice per lo schema
+completo e commentato, non duplicato qui). Path di default
+`./bicchierino.config` (CWD), override con `--config <path>`.
+
+Tre direttive, non di più:
+
+- `grappa-url <url>` — obbligatoria, una sola. Config di processo (§3 sopra).
+- `bind <ip> <porta> plain` / `bind <ip> <porta> tls <cert> <key>` —
+  **ripetibile**: un processo può ascoltare su più `(ip, porta, tls)`
+  indipendenti insieme (es. loopback in chiaro per test + pubblico TLS).
+- `log-file <path>` — opzionale, vedi §3.2.
+
+**Un bind non-loopback con `plain` rifiuta l'avvio per default.** Ogni
+connessione a valle manda la password grappa dentro `PASS`: in chiaro fuori
+da loopback è un secret vero esposto in rete. Non è un errore silenzioso né
+un warning — il processo non parte. Si scavalca **solo** con `--insecure`
+sulla riga di comando: scelta consapevole di chi lancia il processo, mai
+nel file di config (dove qualcuno potrebbe lasciarla dimenticata).
+
+### 3.2 Logging: un sink, N writer — l'unica eccezione a "zero lock"
+
+- **Traffico IRC/JSON**: mai loggato in una build di release. Il codice che
+  lo farebbe **non esiste nel binario** — dietro un `#ifdef` di build
+  attivo solo in una variante di debug, non un flag runtime disattivabile.
+  È privato, non è un livello di verbosità da poter accendere per sbaglio.
+- **Tutto il resto** (connect/disconnect/errori): un solo file configurato
+  (`log-file`, §3.1). Assente → solo stderr. Gli errori vanno **sempre**
+  anche su stderr, file configurato o meno.
+- **Il file di log è l'unico stato condiviso tra thread di connessioni
+  diverse in tutto bicchierino.** Ogni altra parte del disegno vale "zero
+  lock perché zero stato condiviso" (§3) — qui no: N thread scrivono sullo
+  stesso file, serve un mutex minimo attorno alla scrittura o le righe si
+  intrecciano a metà. Costo trascurabile (logging non è hot-path), ma
+  un'eccezione reale da non dimenticare, non un'estensione della regola.
+- Nessuna rotazione gestita da bicchierino — è compito di `logrotate(8)`
+  esterno; riapertura del file su `SIGHUP` se serve supportarlo (stesso
+  pattern del logger diagnostico di KeelBot).
+
 ---
 
 ## 4. Wire protocol grappa — leggi `WIRE.md`, non indovinare
@@ -117,19 +163,19 @@ Il catalogo completo verbo-per-verbo (`op`, `kick`, `mode`, `whois`, ...) **non*
 
 ~~Modello di concorrenza.~~ **Risolto** — vedi §3, thread per connessione.
 
-### 5.1 Configurazione e logging
+~~Configurazione e logging.~~ **Risolto** — vedi §3.1 e §3.2.
 
-Solo "URL grappa è config di processo" è deciso (§3). Non deciso: forma
-esatta (argv posizionale come shottino, env var, file?), se bicchierino
-logga qualcosa a runtime e dove (stderr? file? niente affatto, coerente con
-"stupido"?).
+### 5.1 Cosa succede se la websocket verso grappa cade a metà sessione
 
-### 5.2 Cosa succede se la websocket verso grappa cade a metà sessione
-
-Mai discusso. Coerente con la sezione "stateless" di `ARCHITECTURE.md` la
-risposta ovvia sarebbe: si chiude anche la connessione IRC a valle (niente
-riconnessione silenziosa, niente stato da preservare), ma non è stato scritto
-da nessuna parte come decisione — va confermato, non assunto.
+**L'unica cosa ancora davvero aperta.** Proposta sul tavolo (non confermata):
+chiudere anche la connessione IRC a valle (`ERROR` + close), lasciando che
+sia il client IRC vero a riconnettersi con la propria logica — coerente con
+"stateless", zero stato di retry da scrivere dentro bicchierino. Alternativa
+scartabile: resume trasparente (re-login + re-join silenzioso, il client a
+valle non si accorge di nulla) — più comodo ma reintroduce dentro
+bicchierino esattamente lo stato che la filosofia "stupido" voleva evitare.
+Il silenzio non è consenso: finché non è confermata esplicitamente resta
+TBD, non assumere la prima opzione solo perché è quella proposta.
 
 ---
 
@@ -146,13 +192,16 @@ da nessuna parte come decisione — va confermato, non assunto.
 | Copiare da shottino la logica GUI/LLM/media | fuori scope per definizione (§1) |
 | Un unico loop `poll()` condiviso da tutte le connessioni | richiederebbe un client HTTP non bloccante scritto a mano solo per non bloccare tutti durante un login altrui — complessità reale per un problema che il modello a thread elimina gratis (§3) |
 | Ottimizzare/tenere vivo un client HTTP tra le richieste | non esiste traffico HTTP ripetuto da ottimizzare: dopo il login è tutto push sulla websocket già aperta (§4) |
+| JSON o libconfig per la configurazione | JSON è più verboso di righe ripetute per i bind multipli; libconfig è una dipendenza nuova non vendorizzabile. Il formato a direttive costa meno codice di entrambi (§3.1) |
+| Un flag runtime per disattivare il rifiuto di bind non-loopback in chiaro | dev'essere una scelta cosciente per-avvio (`--insecure`), mai qualcosa che sopravvive in un file di config dimenticato (§3.1) |
+| Log del traffico dietro un flag runtime | deve sparire dal binario di release, non solo essere disattivabile — un flag si accende per sbaglio, un `#ifdef` no (§3.2) |
 
 ---
 
 ## 7. Prossimo passo
 
-Il modello di concorrenza (la decisione che contava di più) è chiuso. I due
-TBD rimasti (§5.1, §5.2) non bloccano l'inizio della scrittura ma vanno
-chiusi prima del primo commit di codice funzionante. Si può iniziare lo
-scheletro: accept loop → thread per connessione → parsing registrazione IRC
+Resta **una sola** domanda aperta: §5.1, cosa fare se la websocket verso
+grappa cade a metà sessione — da confermare esplicitamente, non assumere.
+Tutto il resto è chiuso. Si può iniziare lo scheletro: accept loop → thread
+per connessione → parsing registrazione IRC
 → login REST → join WS (§4, `WIRE.md`).
