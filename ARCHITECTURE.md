@@ -221,6 +221,41 @@ was named.
 This resolves former open question 3 outright — no longer a fork, it's
 the design.
 
+### OpenSSL, in two distinct roles — don't conflate them
+
+TLS is needed on **both legs**, but they are not the same job and the code
+must not pretend they are:
+
+- **Client role** (bicchierino → grappa): `SSL_connect`, verifying
+  *grappa's* server certificate (chain of trust, hostname check) for the
+  REST login (`https://`) and the Phoenix Channels socket (`wss://`). No
+  local certificate needed on our side for this leg.
+- **Server role** (downstream IRC client → bicchierino): `SSL_accept`,
+  presenting **bicchierino's own** certificate + private key to whatever
+  connects to the `ircs://` listener. This is the leg that needs a cert to
+  provision/renew (self-signed or real, per how it's deployed — same
+  the same kind of question a TLS-terminating reverse-proxy front answers once, not a new problem to solve from scratch).
+
+Same library (direct OpenSSL, no bufferevent — see "Event loop" above),
+two different `SSL_CTX` setups, two different handshake directions. Both
+sides matter independently: loopback-only downstream deployments can skip
+the server-role cert (plaintext on `127.0.0.1`, same reasoning shottino's
+`--ircd` already uses for `SHOTTINO_IRCD_PASS`), but the client role
+towards grappa is not optional — grappa is presumably always behind TLS.
+
+### Horizontal scaling is free, because there's no state to coordinate
+
+Direct consequence of "Guiding principle" above: since no state survives a
+disconnect and the only per-connection state (the WHOIS/NAMES mirror) is
+private to that one connection, **nothing needs to be shared between
+bicchierino processes**. N instances behind a plain TCP load balancer (or
+even bare DNS round-robin — an IRC client reconnecting to a different IP
+is normal) need zero coordination: no sticky sessions, no shared cache, no
+cluster protocol. Relevant if this ever fronts more than a personal/small-
+group deployment (a small IRC network's worth of users) — `poll()`'s O(n)
+cost per process stays irrelevant by keeping each instance's connection
+count low, rather than by switching to `epoll`/`kqueue`.
+
 ## Open questions — decide before writing code
 
 ~~1. Session persistence on disconnect.~~ **Resolved** — see "Guiding
@@ -228,20 +263,17 @@ principle" above. No persistence, no reattach.
 
 ~~2. Reattach identity.~~ **Moot** — no reattach path exists to need one.
 
+~~3. TLS.~~ **Resolved** — see "OpenSSL, in two distinct roles" above.
+
 1. **grappa base URL**: one bicchierino process → one grappa deployment,
    configured at daemon startup (matches how you'd actually run it against
    e.g. your own grappa instance), or does it need to be per-connection
    too? Leaning toward daemon-level config — the account/password varying
    per-connection is the actual ask, the target deployment isn't.
-2. **TLS**: both legs need it eventually (downstream for real clients off
-   loopback, upstream because grappa is presumably HTTPS/WSS). Direct
-   OpenSSL on both sides, matching shottino's own approach (`conn_write_all`
-   / `conn_close` wrapping an `SSL*` directly, per "Event loop" above) — no
-   new decision needed here, just confirming before implementation.
 
 ## Next step
 
-Once (1) above is answered, the actual work is: read
+Once the last open question above is answered, the actual work is: read
 `GrappaWeb.UserSocket`/`UserChannel` to pin the exact connect-param and
 channel-topic shape, then write the skeleton (`poll()`-based listener +
 direct OpenSSL + vendored `ws.c`/`json.c` + the registration/login/bridge
