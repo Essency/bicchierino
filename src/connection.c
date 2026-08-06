@@ -612,6 +612,35 @@ static void send_network_reminder(int fd, const char *nick, const struct grappa_
               IRCD_SERVER, nick, available);
 }
 
+/* Best-effort `DELETE /auth/logout`, fire-and-forget — same shape as
+ * shottino's own logout_grappa. A no-op if login never succeeded
+ * (sess->token empty), otherwise revokes bicchierino's own token.
+ *
+ * This does NOT disconnect the user from the real IRC network: for a
+ * registered-user session (the only kind bicchierino ever creates,
+ * WIRE.md §1) logout is a detach, not a teardown —
+ * auth_controller.ex's own #126 comment says so explicitly, and
+ * https_delete_bearer's doc has the quote. grappa's Session.Server owns
+ * the actual upstream connection, keyed by (user, network), independent
+ * of any WS client — closing bicchierino's own session here has no more
+ * effect on it than closing a cicchetto browser tab would. */
+static void logout_grappa(const struct config *cfg, const struct grappa_session *sess) {
+    if (sess->token[0] == '\0') return;
+
+    struct http_response resp;
+    if (!https_delete_bearer(cfg->grappa_url, "/auth/logout", sess->token, &resp)) {
+        fprintf(stderr, "bicchierino: logout: grappa not reachable\n");
+        return;
+    }
+    if (resp.status == 204 || (resp.status >= 200 && resp.status < 300)) {
+        fprintf(stderr, "bicchierino: grappa session terminated (subject=%s)\n",
+                sess->subject_name);
+    } else {
+        fprintf(stderr, "bicchierino: logout failed, HTTP %d\n", resp.status);
+    }
+    http_response_free(&resp);
+}
+
 void *connection_run(void *arg) {
     struct connection_args *args = arg;
     int fd = args->client_fd;
@@ -647,28 +676,27 @@ void *connection_run(void *arg) {
     split_network_password(reg.got_pass ? reg.pass_raw : "", network, sizeof(network), password,
                             sizeof(password));
 
+    /* Everything from here on may obtain a grappa token, so every exit
+     * path funnels through `cleanup` — logout_grappa() is a no-op if
+     * sess.token was never populated, and a real DELETE /auth/logout
+     * otherwise. This is what guarantees a client's QUIT (or any other
+     * teardown: EOF, a bootstrap step failing) revokes bicchierino's own
+     * token instead of abandoning it — safe for the real IRC connection,
+     * see logout_grappa's own doc. */
     struct grappa_session sess = {0};
+
     /* Two blocking calls, in this one thread, in sequence — the whole
      * reason connections are threads (CLAUDE.md §3): none of this stalls
      * any other connection. Each step's own ERROR is already sent to the
      * client by the function that failed (fetch_networks covers the
-     * zero-networks dead end itself — Case A, no recovery, connection
-     * ends here exactly as before). */
-    if (!attempt_grappa_login(fd, reg.account, password, cfg, &sess) ||
-        !fetch_networks(fd, cfg, &sess)) {
-        close(fd);
-        free(args);
-        return NULL;
-    }
+     * zero-networks dead end itself — Case A, no recovery). */
+    if (!attempt_grappa_login(fd, reg.account, password, cfg, &sess)) goto cleanup;
+    if (!fetch_networks(fd, cfg, &sess)) goto cleanup;
 
     pick_network(&sess, network); /* sets sess.network_resolved on a match */
 
     if (sess.network_resolved) {
-        if (!fetch_joined_channels(fd, cfg, &sess)) {
-            close(fd);
-            free(args);
-            return NULL;
-        }
+        if (!fetch_joined_channels(fd, cfg, &sess)) goto cleanup;
         send_welcome(fd, reg.nick, sess.subject_name);
         present_channels(fd, reg.nick, &sess);
         fprintf(stderr,
@@ -725,6 +753,8 @@ void *connection_run(void *arg) {
          * where real command dispatch (PRIVMSG, JOIN, MODE...) goes. */
     }
 
+cleanup:
+    logout_grappa(cfg, &sess);
     close(fd);
     free(args);
     return NULL;
