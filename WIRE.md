@@ -26,6 +26,25 @@ sent as `USER@shottino.local` specifically to force the email branch.
 turned into `<account>@<anything>` before it goes in `identifier`, or login
 silently takes the visitor path instead of the registered-user path.
 
+**This isn't just a mode preference — it's what keeps a nonexistent account
+from silently becoming a visitor session.** Read `mode1_login`/`account_login`
+directly (`auth_controller.ex:365-405`): the email path takes the local part
+before `@` as the account name and calls `authenticate_mode1/3` — real
+account+password verification, **zero visitor fallback in this path at
+all**. A wrong password and a nonexistent account both fail the exact same
+way: `{:error, :invalid_credentials}` → HTTP **401**,
+`{"error": "invalid_credentials"}` (`fallback_controller.ex:384-388`), no
+oracle distinguishing the two (uniform failure, same posture as
+`Plugs.Authn`). Map this straight to IRC `464` (`ERR_PASSWDMISMATCH`),
+matching shottino's own `ircd_register` for its bad-password case.
+
+The visitor auto-provisioning that exists on grappa lives **only** in the
+other branch, `nick_login` (a bare, non-email identifier): if
+`Accounts.get_user_by_name/1` finds no such account, it falls through to
+`visitor_login` — an anonymous session gets minted with no password check
+at all. bicchierino must never take this path; forcing the email shape is
+exactly what keeps it out.
+
 **Use `subject.name` from the response as the topic subject**, not the raw
 account string bicchierino was given — `Subject.topic_label/1` is the single
 source of truth for that value server-side, and assuming it's an unmodified
