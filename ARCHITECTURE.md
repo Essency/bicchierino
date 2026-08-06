@@ -106,7 +106,7 @@ doesn't require it.
 ```
 downstream IRC client                bicchierino                    grappa
         |                                |                             |
-        |--- CAP LS / PASS / NICK / USER ->                            |
+        |--- CAP LS / PASS network:pw / NICK / USER ->                 |
         |                                | (buffered until NICK+USER)  |
         |                                |--- POST /auth/login ------->|
         |                                |    {account, password}      |
@@ -115,7 +115,7 @@ downstream IRC client                bicchierino                    grappa
         |                                |--- WS connect /socket ----->|
         |                                |    ?token=...                |
         |                                |<-- phx_reply ok -------------|
-        |                                |--- phx_join user:<id> ----->|
+        |                                |--- phx_join <network> ------>|
         |                                |<-- channels/state ------------|
         |<-- 001..005, MOTD, JOINs, replay -|                             |
         |                                |                             |
@@ -127,39 +127,59 @@ downstream IRC client                bicchierino                    grappa
         |                                |     teardown or detach?)    |
 ```
 
+## Decided
+
+### Identity has three fronts, not two: user, password, network
+
+grappa is multi-user **and** multi-network — an account can have several
+networks bound, same as shottino's own `--ircd` had to handle. So
+authentication needs three pieces of information, not two, and IRC's
+registration handshake only gives us two fields to carry them in:
+
+- `USER`'s first param → grappa **account** (already decided).
+- `PASS` → **`network:password`** (shottino's own convention, kept
+  as-is — no reason to invent a new separator when one already exists and
+  every existing shottino user already knows it).
+
+So `PASS azzurra:hunter2` means: log into grappa as the account from
+`USER`, with password `hunter2`, and bridge the `azzurra` network bound to
+that account. A `PASS` with no colon is tried as a bare password against
+the account's only network first (single-network accounts don't need to
+name one — same fallback shottino already has in `ircd_register`), and
+answered with the network list if that account has more than one and none
+was named.
+
+This resolves former open question 3 outright — no longer a fork, it's
+the design.
+
 ## Open questions — decide before writing code
 
 1. **Session persistence on disconnect.** Does the grappa session die with
    the IRC socket (simplest, but loses "offline while client is away"
    bouncer behavior — the whole point of a bouncer), or does it persist
    detached and reattach on the next connection with matching
-   account+password (real bouncer behavior, needs a session cache keyed by
-   grappa account, closer to what scbnc already does for real IRC
-   servers)? This is the single biggest architectural fork — decides
+   account+network+password (real bouncer behavior, needs a session cache
+   keyed by (account, network), closer to what scbnc already does for real
+   IRC servers)? This is the single biggest architectural fork — decides
    whether bicchierino needs any persistent state at all.
 2. **grappa base URL**: one bicchierino process → one grappa deployment,
    configured at daemon startup (matches how you'd actually run it against
    e.g. your own grappa instance), or does it need to be per-connection
    too? Leaning toward daemon-level config — the account/password varying
    per-connection is the actual ask, the target deployment isn't.
-3. **Multi-network per account**: keep shottino's `PASS
-   network:password` convention so one account can pick among several
-   grappa-bound networks, or assume one network per account and drop the
-   prefix entirely? Depends on whether your actual grappa accounts have
-   more than one network bound.
-4. **TLS**: both legs need it eventually (downstream for real clients off
+3. **TLS**: both legs need it eventually (downstream for real clients off
    loopback, upstream because grappa is presumably HTTPS/WSS). libevent's
    `bufferevent_openssl` on both sides, matching scbnc's existing approach
    — no new decision needed here, just confirming before implementation.
-5. **Reattach identity**: if (1) picks persistence, how is "same session"
-   decided — account name alone, or account+password re-checked each
-   time? Re-checking is safer (a revoked/changed password should kick a
-   stale session) but means every reconnect is a fresh `/auth/login` call
-   even for a session that never actually died.
+4. **Reattach identity**: if (1) picks persistence, how is "same session"
+   decided — (account, network) alone, or password re-checked each time?
+   Re-checking is safer (a revoked/changed password should kick a stale
+   session) but means every reconnect is a fresh `/auth/login` call even
+   for a session that never actually died.
 
 ## Next step
 
-Once (1)-(3) above are answered, the actual work is: read
+Once (1)-(2) above are answered, the actual work is: read
 `GrappaWeb.UserSocket`/`UserChannel` to pin the exact connect-param and
 channel-topic shape, then write the skeleton (libevent listener +
 vendored `ws.c`/`json.c` + the registration/login/bridge state machine
