@@ -79,10 +79,10 @@ different auth lifecycle (per-connection login vs. per-process login).
 ### scbnc (`irc/scbnc`) — pattern reference, no code copied
 C bouncer already running in this infra. Relevant
 architecture to imitate:
-- **libevent** event loop instead of hand-rolled `select`/`poll`.
 - Per-user session triggered by the client's own `PASS` at registration —
   the multi-tenant shape we want, just against a real ircd instead of
-  grappa.
+  grappa. (scbnc itself uses libevent for its reactor — see "Event loop"
+  below for why we don't follow it there.)
 - SSL/TLS on both the client-facing and server-facing side.
 
 ### shottino `--ircd` (`frontends/shottino/shottino.c:20780-21209`) — logic reference
@@ -118,6 +118,35 @@ reads `c->user`). We give it a job: it's the grappa login identifier.
   USER topic") need to be read out of `GrappaWeb.UserSocket` +
   `GrappaWeb.UserChannel` directly when we get to implementation — not
   guessed.
+
+## Event loop: `poll()`, no library
+
+Checked directly: shottino itself does **not** use libevent, or any event
+library — plain `poll()` (`shottino.c:21462-21493`), direct OpenSSL for
+TLS. Final runtime deps are just `libssl, libcrypto, libm, libc, libz,
+libzstd`. Considered and rejected in favor of this:
+
+- **libevent** (what scbnc uses) — the one thing it buys over raw `poll()`
+  is `bufferevent_openssl` (TLS wired into the reactor). Against that:
+  some discomfort with the library itself (not universal, but real), and
+  every event library still leaves you writing the OpenSSL BIO plumbing
+  by hand for anything beyond the simple client-role case anyway.
+- **epoll directly** — considered and dropped. `epoll` is **Linux-only**;
+  vjt develops on BSD, which is presumably exactly why shottino uses
+  `poll()` and not `epoll` — `poll()` is POSIX (POSIX.1-2001), identical
+  behavior on Linux, FreeBSD, OpenBSD, NetBSD, macOS. `epoll`'s O(1) vs.
+  `poll()`'s O(n) fd-scan is not a real difference at bicchierino's scale
+  (tens of connections, not tens of thousands) — so there is no upside to
+  the Linux lock-in and a real downside (can't build/run alongside vjt's
+  own toolchain).
+- **libuv** — modern, actively maintained, MIT, nicer API than libevent.
+  Still doesn't include TLS (same OpenSSL wiring either way), so the
+  actual win over raw `poll()` is thinner than it looks — and it's still a
+  dependency to justify.
+
+**Decided: `poll()` + direct OpenSSL, matching shottino exactly.** One
+fewer dependency, portable to whatever vjt's own machine is, and proven at
+this exact scale by the very codebase we're vendoring pieces of.
 
 ## Vendoring (MIT, no restriction — confirmed)
 
@@ -205,14 +234,15 @@ principle" above. No persistence, no reattach.
    too? Leaning toward daemon-level config — the account/password varying
    per-connection is the actual ask, the target deployment isn't.
 2. **TLS**: both legs need it eventually (downstream for real clients off
-   loopback, upstream because grappa is presumably HTTPS/WSS). libevent's
-   `bufferevent_openssl` on both sides, matching scbnc's existing approach
-   — no new decision needed here, just confirming before implementation.
+   loopback, upstream because grappa is presumably HTTPS/WSS). Direct
+   OpenSSL on both sides, matching shottino's own approach (`conn_write_all`
+   / `conn_close` wrapping an `SSL*` directly, per "Event loop" above) — no
+   new decision needed here, just confirming before implementation.
 
 ## Next step
 
 Once (1) above is answered, the actual work is: read
 `GrappaWeb.UserSocket`/`UserChannel` to pin the exact connect-param and
-channel-topic shape, then write the skeleton (libevent listener +
-vendored `ws.c`/`json.c` + the registration/login/bridge state machine
-sketched above).
+channel-topic shape, then write the skeleton (`poll()`-based listener +
+direct OpenSSL + vendored `ws.c`/`json.c` + the registration/login/bridge
+state machine sketched above).
