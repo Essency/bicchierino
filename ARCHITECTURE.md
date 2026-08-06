@@ -256,25 +256,30 @@ group deployment (a small IRC network's worth of users) — `poll()`'s O(n)
 cost per process stays irrelevant by keeping each instance's connection
 count low, rather than by switching to `epoll`/`kqueue`.
 
+### grappa base URL is daemon-level config, not per-connection
+
+One bicchierino process → one grappa deployment, given at daemon startup
+(CLI arg, matching shottino's own positional
+`https://grappa.example.net`). The thing that varies per-connection is
+*who's* logging in (account/password/network, from `USER`/`PASS`) — the
+deployment it's logging into is an infrastructure choice, fixed for the
+life of the process, not something a random downstream IRC client should
+be able to redirect. It also composes cleanly with horizontal scaling
+(above): every instance behind the load balancer points at the same
+`--grappa-url`, no per-connection routing logic needed anywhere.
+
 ## Open questions — decide before writing code
 
-~~1. Session persistence on disconnect.~~ **Resolved** — see "Guiding
-principle" above. No persistence, no reattach.
-
-~~2. Reattach identity.~~ **Moot** — no reattach path exists to need one.
-
-~~3. TLS.~~ **Resolved** — see "OpenSSL, in two distinct roles" above.
-
-1. **grappa base URL**: one bicchierino process → one grappa deployment,
-   configured at daemon startup (matches how you'd actually run it against
-   e.g. your own grappa instance), or does it need to be per-connection
-   too? Leaning toward daemon-level config — the account/password varying
-   per-connection is the actual ask, the target deployment isn't.
+None left. All four are resolved above:
+~~1. Session persistence~~, ~~2. Reattach identity~~, ~~3. TLS~~,
+~~4. grappa base URL~~.
 
 ## Next step
 
-Once the last open question above is answered, the actual work is: read
-`GrappaWeb.UserSocket`/`UserChannel` to pin the exact connect-param and
-channel-topic shape, then write the skeleton (`poll()`-based listener +
+Nothing left to decide at the architecture level — implementation can
+start. First real step: read `GrappaWeb.UserSocket`/`UserChannel` to pin
+the exact connect-param and channel-topic shape (the one piece of the
+design that was deliberately left "read the code when we get there"
+rather than guessed), then write the skeleton (`poll()`-based listener +
 direct OpenSSL + vendored `ws.c`/`json.c` + the registration/login/bridge
 state machine sketched above).
