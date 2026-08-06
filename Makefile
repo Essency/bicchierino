@@ -18,7 +18,7 @@ BINDIR ?= $(PREFIX)/bin
 LDLIBS := -lssl -lcrypto -lpthread
 
 BIN := bicchierino
-OBJS := src/main.o src/config.o src/connection.o src/ws.o src/json.o
+OBJS := src/main.o src/config.o src/connection.o src/http.o src/ws.o src/json.o
 
 .PHONY: all clean install
 
