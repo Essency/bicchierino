@@ -67,6 +67,16 @@ regola che KeelBot applica al proprio codice — coerenza tra i progetti
 dell'ecosistema, e i messaggi `ERROR` finiscono nel client IRC di chiunque,
 non solo nostro.
 
+**I messaggi `ERROR` verso il client non portano un prefisso interno**
+(niente `bicchierino: ` davanti). Sono testo per un umano che deve capire
+cosa è successo ed eventualmente agire (`"...please contact the admin"`),
+non un log — il prefisso di debug ha senso in `fprintf(stderr, ...)` (§3.2,
+quello sì può restare `bicchierino: ...`), non su un socket IRC. Deciso
+esplicitamente dopo aver scritto i primi messaggi con il prefisso ovunque
+per abitudine e averli poi tolti tutti insieme per coerenza — un solo
+messaggio "pulito" in mezzo ad altri con prefisso sarebbe stato peggio di
+nessuno.
+
 Questo documento (`CLAUDE.md`) resta in italiano, come il `CLAUDE.md` di
 KeelBot — è un documento di processo per chi lavora al progetto, non
 superficie che l'utente finale vede. `ARCHITECTURE.md` e `WIRE.md` sono già

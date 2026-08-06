@@ -271,7 +271,7 @@ static bool attempt_grappa_login(int fd, const char *account, const char *passwo
     struct http_response resp;
     if (!https_post_login(cfg->grappa_url, body, &resp)) {
         fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
-        send_line(fd, "ERROR :bicchierino: grappa not reachable");
+        send_line(fd, "ERROR :Could not reach the grappa server, please try again");
         return false;
     }
 
@@ -281,7 +281,8 @@ static bool attempt_grappa_login(int fd, const char *account, const char *passwo
         json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
         if (!doc) {
             fprintf(stderr, "bicchierino: grappa login: malformed JSON response: %s\n", err);
-            send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+            send_line(fd, "ERROR :The grappa server sent back something unexpected, "
+                          "please contact the admin");
         } else {
             const json_value *root = json_root(doc);
             const char *token = NULL;
@@ -297,17 +298,21 @@ static bool attempt_grappa_login(int fd, const char *account, const char *passwo
             } else {
                 fprintf(stderr, "bicchierino: grappa login: 200 response missing "
                                 "token/subject.name\n");
-                send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+                send_line(fd, "ERROR :The grappa server sent back something unexpected, "
+                              "please contact the admin");
             }
             json_free(doc);
         }
     } else if (resp.status == 401) {
         fprintf(stderr, "bicchierino: grappa login: invalid credentials for account=%s\n",
                 account);
-        send_line(fd, "ERROR :bicchierino: invalid grappa credentials");
+        send_line(fd, "ERROR :Invalid account name or password");
     } else {
         fprintf(stderr, "bicchierino: grappa login: unexpected HTTP status %d\n", resp.status);
-        send_line(fd, "ERROR :bicchierino: unexpected response from grappa (%d)", resp.status);
+        send_line(fd,
+                  "ERROR :The grappa server returned an unexpected error (%d), please "
+                  "contact the admin",
+                  resp.status);
     }
 
     http_response_free(&resp);
@@ -345,12 +350,15 @@ static bool resolve_network(int fd, const struct config *cfg, const char *want_n
     struct http_response resp;
     if (!https_get_bearer(cfg->grappa_url, "/networks", sess->token, &resp)) {
         fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
-        send_line(fd, "ERROR :bicchierino: grappa not reachable");
+        send_line(fd, "ERROR :Could not reach the grappa server, please try again");
         return false;
     }
     if (resp.status != 200) {
         fprintf(stderr, "bicchierino: GET /networks: unexpected HTTP status %d\n", resp.status);
-        send_line(fd, "ERROR :bicchierino: could not list grappa networks (%d)", resp.status);
+        send_line(fd,
+                  "ERROR :Could not retrieve your networks from grappa (%d), please "
+                  "contact the admin",
+                  resp.status);
         http_response_free(&resp);
         return false;
     }
@@ -359,7 +367,8 @@ static bool resolve_network(int fd, const struct config *cfg, const char *want_n
     json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
     if (!doc) {
         fprintf(stderr, "bicchierino: GET /networks: malformed JSON: %s\n", err);
-        send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+        send_line(fd, "ERROR :The grappa server sent back something unexpected, please "
+                      "contact the admin");
         http_response_free(&resp);
         return false;
     }
@@ -369,7 +378,8 @@ static bool resolve_network(int fd, const struct config *cfg, const char *want_n
 
     if (count == 0) {
         fprintf(stderr, "bicchierino: account has zero networks bound\n");
-        send_line(fd, "ERROR :bicchierino: no networks bound to this account");
+        send_line(fd, "ERROR :You don't have any network configured, please contact "
+                      "the admin");
         json_free(doc);
         http_response_free(&resp);
         return false;
@@ -403,14 +413,15 @@ static bool resolve_network(int fd, const struct config *cfg, const char *want_n
         if (want_network[0]) {
             fprintf(stderr, "bicchierino: no such network '%s' — this account has: %s\n",
                     want_network, available);
-            send_line(fd, "ERROR :bicchierino: no such network %s — this account has: %s",
-                      want_network, available);
+            send_line(fd, "ERROR :Unknown network '%s' — this account has: %s", want_network,
+                      available);
         } else {
             fprintf(stderr, "bicchierino: PASS named no network and this account has "
                             "several: %s\n",
                     available);
             send_line(fd,
-                      "ERROR :bicchierino: PASS network:password — this account has: %s",
+                      "ERROR :Please select a network in PASS (network:password) — this "
+                      "account has: %s",
                       available);
         }
     }
@@ -434,12 +445,15 @@ static bool fetch_joined_channels(int fd, const struct config *cfg, struct grapp
     struct http_response resp;
     if (!https_get_bearer(cfg->grappa_url, path, sess->token, &resp)) {
         fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
-        send_line(fd, "ERROR :bicchierino: grappa not reachable");
+        send_line(fd, "ERROR :Could not reach the grappa server, please try again");
         return false;
     }
     if (resp.status != 200) {
         fprintf(stderr, "bicchierino: GET %s: unexpected HTTP status %d\n", path, resp.status);
-        send_line(fd, "ERROR :bicchierino: could not list channels (%d)", resp.status);
+        send_line(fd,
+                  "ERROR :Could not retrieve channels for that network (%d), please "
+                  "contact the admin",
+                  resp.status);
         http_response_free(&resp);
         return false;
     }
@@ -448,7 +462,8 @@ static bool fetch_joined_channels(int fd, const struct config *cfg, struct grapp
     json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
     if (!doc) {
         fprintf(stderr, "bicchierino: GET %s: malformed JSON: %s\n", path, err);
-        send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+        send_line(fd, "ERROR :The grappa server sent back something unexpected, please "
+                      "contact the admin");
         http_response_free(&resp);
         return false;
     }
@@ -514,7 +529,7 @@ void *connection_run(void *arg) {
                 /* TODO(next): WS connect + topic joins (WIRE.md §2-5),
                  * using sess.token/network_slug/channels — this is as far
                  * as the bootstrap goes today. */
-                send_line(fd, "ERROR :bicchierino: bootstrap OK, websocket bridge not "
+                send_line(fd, "ERROR :Login successful, but the websocket bridge isn't "
                               "implemented yet");
             }
             break;
