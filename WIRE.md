@@ -51,6 +51,21 @@ the moduledoc's DESIGN_NOTES reference). Absent or unparseable is treated as
 first — shottino and cicchetto both do, and the failure mode for omitting it
 is "treated as current," never a rejection.
 
+## 2.5 After login, HTTP is done — everything else is a WS push
+
+Worth stating outright, since it's easy to miss even having read §1-2: **the
+login POST is the only REST call a live session makes.** Every action —
+`PRIVMSG`, `JOIN`, `MODE`, `KICK`, whatever — is a `phx_push` frame on the
+already-open channel websocket (`ws_push_user`/`ws_send_frame_locked` in
+shottino), not a new HTTP request. There is no per-message HTTP round trip to
+optimize, batch or keep-alive; the WS connection carries the entire session
+after the one login call that opened it.
+
+The one exception is optional `CHATHISTORY` backfill (shottino's
+`--ircd-archive`) — a REST query issued when a client scrolls back past what
+the live session has already seen. Infrequent and user-triggered, not part
+of the steady-state message path.
+
 ## 3. Channel topics — three shapes, one channel module
 
 All routed through `GrappaWeb.GrappaChannel` via the single subscription

@@ -70,6 +70,20 @@ Dettaglio completo in `ARCHITECTURE.md`. Digest:
 - **Scalabilità orizzontale gratuita**: zero stato condiviso tra connessioni
   → zero stato condiviso tra istanze → N processi dietro un load balancer TCP
   puro, senza sticky session né coordinamento.
+- **Un thread per connessione** (chiude il TBD §5.1 di prima). Motivo
+  decisivo: dopo il login REST (l'unica POST della sessione — vedi §4, ogni
+  altra azione è push sulla websocket già aperta), quel thread passa in
+  `poll()` su **due soli fd** per tutta la vita della connessione. Il login
+  bloccante blocca solo se stesso, nessun altro client se ne accorge.
+  Nessun lock necessario: le connessioni non condividono mai memoria (è la
+  premessa "stateless" qui sopra), quindi non c'è niente da sincronizzare
+  tra thread. Un unico loop `poll()` condiviso da tutte le connessioni
+  avrebbe richiesto un client HTTP non bloccante scritto a mano solo per
+  evitare che un login fermi tutti gli altri — complessità reale per un
+  problema che il modello a thread elimina gratis. shottino usa un loop
+  singolo perché il suo login avviene una volta sola *prima* che il loop
+  parta (mono-utente per costruzione); bicchierino fa login per ogni nuova
+  connessione mentre altre sono già vive, quindi non è lo stesso caso.
 
 ---
 
@@ -80,10 +94,15 @@ dei topic) letto **dal sorgente reale** di grappa, non dedotto dal
 comportamento di shottino. Due cose che rompono tutto silenziosamente se
 sbagliate, ripetute qui perché costano care da dimenticare:
 
-1. **Ogni push su un topic deve portare il `join_ref` di QUEL join.** Phoenix
+1. **Dopo il login, niente più HTTP.** L'unica POST della sessione è
+   `/auth/login`; ogni azione successiva (`PRIVMSG`, `JOIN`, `MODE`, ...) è
+   un push sulla websocket già aperta, mai una nuova richiesta HTTP. Nessun
+   keep-alive da gestire, nessun round-trip da ottimizzare — semplicemente
+   non esiste traffico HTTP ripetuto.
+2. **Ogni push su un topic deve portare il `join_ref` di QUEL join.** Phoenix
    scarta silenziosamente un frame con `join_ref` sbagliato — nessun errore,
    il messaggio semplicemente sparisce.
-2. **Le DM in arrivo si ricevono solo iscrivendosi al topic del proprio nick**
+3. **Le DM in arrivo si ricevono solo iscrivendosi al topic del proprio nick**
    (`grappa:user:{subject}/network:{net}/channel:{ownNick}`), non a quello
    del interlocutore — altrimenti si vede solo la propria metà della
    conversazione. Bug reale, già preso una volta da shottino.
@@ -96,27 +115,16 @@ Il catalogo completo verbo-per-verbo (`op`, `kick`, `mode`, `whois`, ...) **non*
 
 ## 5. TBD — decisioni aperte, non improvvisare
 
-### 5.1 Modello di concorrenza — **il più importante, blocca lo scheletro**
+~~Modello di concorrenza.~~ **Risolto** — vedi §3, thread per connessione.
 
-Non deciso: un unico loop `poll()` che multiplexa i fd di **tutte** le
-connessioni in un thread solo (coerente con "stupido", ma il login REST è
-bloccante — fermerebbe ogni altra connessione mentre una fa login), oppure
-**un thread per connessione** (il login bloccante blocca solo se stesso, e il
-`poll()` di quel thread ha solo 2 fd — il socket IRC a valle e la websocket
-verso grappa). shottino fa il primo perché è mono-utente per costruzione;
-bicchierino è multi-tenant per definizione, quindi non è la stessa domanda.
-Propendo per **thread per connessione** — più semplice da ragionare, il
-costo di N thread bloccati su I/O è irrilevante alla scala di un bouncer
-personale/di piccolo gruppo — ma è una proposta, non ancora deciso.
-
-### 5.2 Configurazione e logging
+### 5.1 Configurazione e logging
 
 Solo "URL grappa è config di processo" è deciso (§3). Non deciso: forma
 esatta (argv posizionale come shottino, env var, file?), se bicchierino
 logga qualcosa a runtime e dove (stderr? file? niente affatto, coerente con
 "stupido"?).
 
-### 5.3 Cosa succede se la websocket verso grappa cade a metà sessione
+### 5.2 Cosa succede se la websocket verso grappa cade a metà sessione
 
 Mai discusso. Coerente con la sezione "stateless" di `ARCHITECTURE.md` la
 risposta ovvia sarebbe: si chiude anche la connessione IRC a valle (niente
@@ -136,11 +144,15 @@ da nessuna parte come decisione — va confermato, non assunto.
 | Login/URL grappa per-connessione | l'account varia per connessione, il deployment no — sono domande diverse |
 | Rispondere a `WHOIS`/`NAMES`/`WHO` con una chiamata REST dedicata invece dello specchio in-memory | round-trip HTTP inutile per dati che si hanno già dall'inoltro eventi |
 | Copiare da shottino la logica GUI/LLM/media | fuori scope per definizione (§1) |
+| Un unico loop `poll()` condiviso da tutte le connessioni | richiederebbe un client HTTP non bloccante scritto a mano solo per non bloccare tutti durante un login altrui — complessità reale per un problema che il modello a thread elimina gratis (§3) |
+| Ottimizzare/tenere vivo un client HTTP tra le richieste | non esiste traffico HTTP ripetuto da ottimizzare: dopo il login è tutto push sulla websocket già aperta (§4) |
 
 ---
 
 ## 7. Prossimo passo
 
-Risolvere §5.1 (modello di concorrenza) — è quello che decide la forma dello
-scheletro. Gli altri due TBD (§5.2, §5.3) non bloccano l'inizio della
-scrittura ma vanno chiusi prima del primo commit di codice funzionante.
+Il modello di concorrenza (la decisione che contava di più) è chiuso. I due
+TBD rimasti (§5.1, §5.2) non bloccano l'inizio della scrittura ma vanno
+chiusi prima del primo commit di codice funzionante. Si può iniziare lo
+scheletro: accept loop → thread per connessione → parsing registrazione IRC
+→ login REST → join WS (§4, `WIRE.md`).
