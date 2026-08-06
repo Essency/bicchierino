@@ -17,6 +17,8 @@
 #define MAX_CHANNELS 128 /* a comparable production bouncer's own scale doc uses ~70 channels as
                            * its reference point; this is a hostile-
                            * response backstop, not a real ceiling */
+#define MAX_NETWORKS 64  /* generous — real accounts bind a handful */
+#define IRCD_SERVER "bicchierino"
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
 
@@ -147,16 +149,29 @@ struct registration {
     bool got_nick;
 };
 
+struct network_entry {
+    char slug[64];
+    long id;
+};
+
 /* Everything learned about this session across login (WIRE.md §1) and
  * the bootstrap discovery calls (WIRE.md §1.5), before the websocket
  * even opens. Lives on connection_run's stack — one per connection
  * thread, never shared (CLAUDE.md §3: zero state shared between
- * connections). */
+ * connections).
+ *
+ * `networks[]` is the full list from GET /networks, kept around (not
+ * just the one PASS resolved to) so Case B's `GRAPPA NETWORK <slug>`
+ * can validate against it later without a second round trip to grappa
+ * (CLAUDE.md §3, §1's "IRC-side admin commands" note). */
 struct grappa_session {
     char token[512];
     char subject_name[128];
+    struct network_entry networks[MAX_NETWORKS];
+    size_t network_count;
     char network_slug[64];
     long network_id;
+    bool network_resolved;
     char channels[MAX_CHANNELS][128];
     size_t channel_count;
 };
@@ -341,12 +356,17 @@ static void url_encode(const char *src, char *dst, size_t dst_sz) {
     dst[di] = '\0';
 }
 
-/* WIRE.md §1.5: GET /networks, then resolve PASS's `network` segment
- * against the real list — named-and-found, named-and-missing, unnamed-
- * with-exactly-one, unnamed-with-several, or the zero-networks dead end.
- * Five outcomes, and only one of them is success. */
-static bool resolve_network(int fd, const struct config *cfg, const char *want_network,
-                             struct grappa_session *sess) {
+/* WIRE.md §1.5: GET /networks. Fills sess->networks[] with everything
+ * this account has bound — matching a requested slug against that list
+ * is pick_network()'s job, kept separate so Case B's later
+ * `GRAPPA NETWORK <slug>` can reuse the same list without a second round
+ * trip to grappa.
+ *
+ * Zero networks is a dead end handled here, not deferred — there is no
+ * recovery from it (this account has no credential for any network at
+ * all, confirmed against the real TestUser test account), unlike an
+ * unmatched-but-nonempty list, which is Case B and stays recoverable. */
+static bool fetch_networks(int fd, const struct config *cfg, struct grappa_session *sess) {
     struct http_response resp;
     if (!https_get_bearer(cfg->grappa_url, "/networks", sess->token, &resp)) {
         fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
@@ -385,50 +405,54 @@ static bool resolve_network(int fd, const struct config *cfg, const char *want_n
         return false;
     }
 
-    char available[512] = {0};
-    size_t avail_len = 0;
-    bool found = false;
-
-    for (size_t i = 0; i < count; i++) {
+    sess->network_count = 0;
+    for (size_t i = 0; i < count && sess->network_count < MAX_NETWORKS; i++) {
         const json_value *entry = json_at(root, i);
         const char *slug = NULL;
         long id = 0;
         if (!json_str_req(entry, "slug", &slug) || !json_long_req(entry, "id", &id)) continue;
-
-        int written = snprintf(available + avail_len, sizeof(available) - avail_len, "%s%s",
-                                avail_len ? " " : "", slug);
-        if (written > 0 && (size_t)written < sizeof(available) - avail_len)
-            avail_len += (size_t)written;
-
-        bool matches = want_network[0] ? strcasecmp(slug, want_network) == 0 : count == 1;
-        if (matches) {
-            snprintf(sess->network_slug, sizeof(sess->network_slug), "%s", slug);
-            sess->network_id = id;
-            found = true;
-            break;
-        }
-    }
-
-    if (!found) {
-        if (want_network[0]) {
-            fprintf(stderr, "bicchierino: no such network '%s' — this account has: %s\n",
-                    want_network, available);
-            send_line(fd, "ERROR :Unknown network '%s' — this account has: %s", want_network,
-                      available);
-        } else {
-            fprintf(stderr, "bicchierino: PASS named no network and this account has "
-                            "several: %s\n",
-                    available);
-            send_line(fd,
-                      "ERROR :Please select a network in PASS (network:password) — this "
-                      "account has: %s",
-                      available);
-        }
+        snprintf(sess->networks[sess->network_count].slug, sizeof(sess->networks[0].slug), "%s",
+                 slug);
+        sess->networks[sess->network_count].id = id;
+        sess->network_count++;
     }
 
     json_free(doc);
     http_response_free(&resp);
-    return found;
+    return true;
+}
+
+/* Pure matching logic, no I/O — named-and-found, named-and-missing,
+ * unnamed-with-exactly-one, unnamed-with-several. Reused by both the
+ * initial PASS-driven resolution and Case B's `GRAPPA NETWORK <slug>`
+ * (CLAUDE.md §1's "IRC-side admin commands", arriving earlier than
+ * planned) against the same already-fetched list. Sets
+ * sess->network_slug/id/resolved on success; leaves them untouched
+ * (caller must not assume they're cleared) on failure. */
+static bool pick_network(struct grappa_session *sess, const char *want_network) {
+    for (size_t i = 0; i < sess->network_count; i++) {
+        bool matches = want_network[0] ? strcasecmp(sess->networks[i].slug, want_network) == 0
+                                        : sess->network_count == 1;
+        if (matches) {
+            snprintf(sess->network_slug, sizeof(sess->network_slug), "%s",
+                     sess->networks[i].slug);
+            sess->network_id = sess->networks[i].id;
+            sess->network_resolved = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void format_available_networks(const struct grappa_session *sess, char *buf,
+                                       size_t buf_sz) {
+    size_t len = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < sess->network_count; i++) {
+        int written =
+            snprintf(buf + len, buf_sz - len, "%s%s", len ? " " : "", sess->networks[i].slug);
+        if (written > 0 && (size_t)written < buf_sz - len) len += (size_t)written;
+    }
 }
 
 /* WIRE.md §1.5: GET /networks/:slug/channels for the ONE network already
@@ -488,6 +512,106 @@ static bool fetch_joined_channels(int fd, const struct config *cfg, struct grapp
     return true;
 }
 
+/* Registration numerics — 001-005 + MOTD (375/372/376), same shape as
+ * shottino's own ircd_register.
+ *
+ * The 005 CHANMODES/PREFIX/CASEMAPPING/STATUSMSG values are NOT
+ * fabricated: the real, live ISUPPORT table only exists as a websocket
+ * push (`isupport_changed`, seeded on channel join —
+ * `grappa_channel.ex:1437-1455`, `push_isupport_if_live/3`) — not built
+ * yet (WIRE.md §2-5). grappa's own official web client hits the exact
+ * same gap and solves it the same way: these are copied verbatim from
+ * `Grappa.Session.ISupport.default/0` (`lib/grappa/session/isupport.ex:
+ * 117-158`) — the pre-005 bahamut/Azzurra fallback grappa itself uses as
+ * `Session.Server`'s initial state, and that cicchetto's own
+ * `DEFAULT_ISUPPORT` (`cicchetto/src/lib/isupport.ts:36-44`) is required
+ * to stay "in lockstep with" per its own comment. Not a guess, not
+ * bicchierino's own default — grappa's, for CHANMODES/PREFIX/CASEMAPPING/
+ * STATUSMSG. `CHANTYPES=#` is the one exception: grappa's own ISupport
+ * struct doesn't track it at all (checked directly — no `chantypes`
+ * field anywhere in `isupport.ex`), so that one token genuinely is
+ * bicchierino's own reasonable default, not a sourced one.
+ *
+ * TODO(next): once the websocket bridge exists, an `isupport_changed`
+ * event that disagrees with this should send a corrected 005 — a real
+ * IRC server re-advertising ISUPPORT after it changes is normal, and
+ * these values are only ever right for a bahamut-shaped network (the
+ * common case here, but not a promise for every network an account
+ * might have bound). */
+static void send_welcome(int fd, const char *nick, const char *subject_name) {
+    send_line(fd, ":%s 001 %s :Welcome to grappa via bicchierino, %s", IRCD_SERVER, nick,
+              subject_name);
+    send_line(fd, ":%s 002 %s :Your host is %s, running bicchierino", IRCD_SERVER, nick,
+              IRCD_SERVER);
+    send_line(fd, ":%s 003 %s :This server has no particular birthday", IRCD_SERVER, nick);
+    send_line(fd, ":%s 004 %s %s bicchierino-0.1 o o", IRCD_SERVER, nick, IRCD_SERVER);
+    send_line(fd,
+              ":%s 005 %s CHANTYPES=# PREFIX=(ohv)@%%+ CHANMODES=beI,k,l,imnpstrRcCDd "
+              "CASEMAPPING=ascii STATUSMSG=@+ :are supported by this server",
+              IRCD_SERVER, nick);
+    send_line(fd, ":%s 375 %s :- %s message of the day -", IRCD_SERVER, nick, IRCD_SERVER);
+    send_line(fd, ":%s 372 %s :- bicchierino is bridging this connection to grappa.", IRCD_SERVER,
+              nick);
+    send_line(fd, ":%s 376 %s :End of /MOTD command.", IRCD_SERVER, nick);
+}
+
+/* Presents channels already known-joined on grappa as JOIN lines, same
+ * spirit as shottino's ircd_present_channel: the client sees them
+ * without having to ask. No TOPIC/NAMES yet — that only exists once the
+ * websocket join snapshot does (WIRE.md §3-4, not built yet); the
+ * channel LIST itself is real (GET /networks/:slug/channels, WIRE.md
+ * §1.5), so presenting it now is accurate, just incomplete. */
+static void present_channels(int fd, const char *nick, const struct grappa_session *sess) {
+    for (size_t i = 0; i < sess->channel_count; i++) {
+        send_line(fd, ":%s!bicchierino@bicchierino JOIN :%s", nick, sess->channels[i]);
+    }
+}
+
+/* Case B's in-band selector, `GRAPPA NETWORK <slug>` — CLAUDE.md §1's
+ * "IRC-side admin commands" note, arriving earlier than planned because
+ * a PASS with no (or an unmatched) network name turned out to have a
+ * real, recoverable next step instead of just a dead end. Validates
+ * against `sess->networks[]`, already fetched once by fetch_networks()
+ * — never a second GET /networks for the same connection. */
+static void handle_grappa_network(int fd, const char *nick, const struct config *cfg,
+                                   const struct irc_message *msg, struct grappa_session *sess) {
+    const char *want = msg->params[1];
+    if (!pick_network(sess, want)) {
+        char available[512];
+        format_available_networks(sess, available, sizeof(available));
+        send_line(fd, ":%s NOTICE %s :Unknown network '%s'. Available: %s", IRCD_SERVER, nick,
+                  want, available);
+        return;
+    }
+
+    if (!fetch_joined_channels(fd, cfg, sess)) {
+        /* fetch_joined_channels already sent its own ERROR. pick_network
+         * set network_resolved=true as a side effect of matching — undo
+         * it, so this connection stays in "awaiting selection" rather
+         * than silently pretending the selection succeeded. */
+        sess->network_resolved = false;
+        return;
+    }
+
+    present_channels(fd, nick, sess);
+    fprintf(stderr,
+            "bicchierino: network selected: subject=%s network=%s(%ld) joined_channels=%zu\n",
+            sess->subject_name, sess->network_slug, sess->network_id, sess->channel_count);
+    send_line(fd,
+              ":%s NOTICE %s :Network %s selected, but the websocket bridge isn't "
+              "implemented yet — messages will not be delivered",
+              IRCD_SERVER, nick, sess->network_slug);
+}
+
+static void send_network_reminder(int fd, const char *nick, const struct grappa_session *sess) {
+    char available[512];
+    format_available_networks(sess, available, sizeof(available));
+    send_line(fd,
+              ":%s NOTICE %s :You are not connected to any network. Available: %s. Use "
+              "/quote GRAPPA NETWORK <name> to select one.",
+              IRCD_SERVER, nick, available);
+}
+
 void *connection_run(void *arg) {
     struct connection_args *args = arg;
     int fd = args->client_fd;
@@ -497,43 +621,108 @@ void *connection_run(void *arg) {
     struct registration reg = {0};
     char line[IRC_LINE_MAX];
 
+    /* Phase 1: IRC registration (PASS/NICK/USER) — unchanged. */
+    bool registered = false;
     for (;;) {
         int r = next_line(fd, &lb, line, sizeof(line));
-        if (r == NEXT_LINE_EOF) break;
-        if (r == NEXT_LINE_ERROR) break;
+        if (r == NEXT_LINE_EOF || r == NEXT_LINE_ERROR) break;
 
         struct irc_message msg;
         if (!irc_parse_line(line, &msg)) continue;
 
         handle_registration_message(&msg, &reg);
-
         if (reg.got_nick && reg.got_user) {
-            char network[IRC_LINE_MAX], password[IRC_LINE_MAX];
-            split_network_password(reg.got_pass ? reg.pass_raw : "", network, sizeof(network),
-                                    password, sizeof(password));
-
-            struct grappa_session sess = {0};
-            /* Three blocking calls, in this one thread, in sequence — the
-             * whole reason connections are threads (CLAUDE.md §3): none
-             * of this stalls any other connection. Each step's own ERROR
-             * is already sent to the client by the function that failed;
-             * this loop just decides whether to keep going. */
-            if (attempt_grappa_login(fd, reg.account, password, cfg, &sess) &&
-                resolve_network(fd, cfg, network, &sess) &&
-                fetch_joined_channels(fd, cfg, &sess)) {
-                fprintf(stderr,
-                        "bicchierino: bootstrap OK: subject=%s network=%s(%ld) "
-                        "joined_channels=%zu\n",
-                        sess.subject_name, sess.network_slug, sess.network_id,
-                        sess.channel_count);
-                /* TODO(next): WS connect + topic joins (WIRE.md §2-5),
-                 * using sess.token/network_slug/channels — this is as far
-                 * as the bootstrap goes today. */
-                send_line(fd, "ERROR :Login successful, but the websocket bridge isn't "
-                              "implemented yet");
-            }
+            registered = true;
             break;
         }
+    }
+
+    if (!registered) {
+        close(fd);
+        free(args);
+        return NULL;
+    }
+
+    char network[IRC_LINE_MAX], password[IRC_LINE_MAX];
+    split_network_password(reg.got_pass ? reg.pass_raw : "", network, sizeof(network), password,
+                            sizeof(password));
+
+    struct grappa_session sess = {0};
+    /* Two blocking calls, in this one thread, in sequence — the whole
+     * reason connections are threads (CLAUDE.md §3): none of this stalls
+     * any other connection. Each step's own ERROR is already sent to the
+     * client by the function that failed (fetch_networks covers the
+     * zero-networks dead end itself — Case A, no recovery, connection
+     * ends here exactly as before). */
+    if (!attempt_grappa_login(fd, reg.account, password, cfg, &sess) ||
+        !fetch_networks(fd, cfg, &sess)) {
+        close(fd);
+        free(args);
+        return NULL;
+    }
+
+    pick_network(&sess, network); /* sets sess.network_resolved on a match */
+
+    if (sess.network_resolved) {
+        if (!fetch_joined_channels(fd, cfg, &sess)) {
+            close(fd);
+            free(args);
+            return NULL;
+        }
+        send_welcome(fd, reg.nick, sess.subject_name);
+        present_channels(fd, reg.nick, &sess);
+        fprintf(stderr,
+                "bicchierino: bootstrap OK: subject=%s network=%s(%ld) joined_channels=%zu\n",
+                sess.subject_name, sess.network_slug, sess.network_id, sess.channel_count);
+        /* TODO(next): WS connect + topic joins (WIRE.md §2-5) is the
+         * real next piece — this NOTICE is where that starts. */
+        send_line(fd,
+                  ":%s NOTICE %s :Login successful, but the websocket bridge isn't "
+                  "implemented yet — messages will not be delivered",
+                  IRCD_SERVER, reg.nick);
+    } else {
+        /* Case B: registration completes anyway — there IS a real,
+         * recoverable next step (`GRAPPA NETWORK <slug>`), unlike the
+         * zero-networks dead end fetch_networks() already closed on. */
+        send_welcome(fd, reg.nick, sess.subject_name);
+        send_network_reminder(fd, reg.nick, &sess);
+        char available[512];
+        format_available_networks(&sess, available, sizeof(available));
+        fprintf(stderr, "bicchierino: subject=%s registered, awaiting network selection: %s\n",
+                sess.subject_name, available);
+    }
+
+    /* Phase 2: post-registration. PING/PONG always; GRAPPA NETWORK only
+     * meaningful before a network is resolved; everything else is a
+     * reminder (unresolved — the user needs to know each time) or a
+     * silent no-op (resolved — the "not implemented yet" NOTICE above
+     * already said so once; repeating it per command would just be
+     * noise). */
+    for (;;) {
+        int r = next_line(fd, &lb, line, sizeof(line));
+        if (r == NEXT_LINE_EOF || r == NEXT_LINE_ERROR) break;
+
+        struct irc_message msg;
+        if (!irc_parse_line(line, &msg)) continue;
+
+        if (strcmp(msg.command, "PING") == 0) {
+            send_line(fd, ":%s PONG %s :%s", IRCD_SERVER, IRCD_SERVER,
+                      msg.param_count > 0 ? msg.params[0] : IRCD_SERVER);
+            continue;
+        }
+        if (strcmp(msg.command, "QUIT") == 0) break;
+
+        if (!sess.network_resolved) {
+            if (strcmp(msg.command, "GRAPPA") == 0 && msg.param_count >= 2 &&
+                strcasecmp(msg.params[0], "NETWORK") == 0) {
+                handle_grappa_network(fd, reg.nick, cfg, &msg, &sess);
+            } else {
+                send_network_reminder(fd, reg.nick, &sess);
+            }
+        }
+        /* network_resolved: everything else is a silent no-op for now —
+         * TODO(next): once the websocket bridge exists, this is exactly
+         * where real command dispatch (PRIVMSG, JOIN, MODE...) goes. */
     }
 
     close(fd);
