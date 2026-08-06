@@ -34,6 +34,14 @@ processo come shottino `--ircd`. Nessuna GUI, nessun LLM, nessun rendering
 media: solo il filo. Motivazione completa e alternative scartate in
 `ARCHITECTURE.md`.
 
+**Non ora, ma tenerlo a mente**: comandi di amministrazione **lato IRC** (un
+po' come un servizio NickServ-style, digitati al bot), non solo via web —
+così bicchierino resta configurabile anche senza passare da un pannello.
+Non specificato oltre questo — cosa esattamente si configuri così, e con
+quali permessi, è una decisione da prendere quando ci si arriva, non da
+improvvisare ora. Annotato qui perché non vada perso, non perché blocchi
+lo scheletro iniziale.
+
 ---
 
 ## 2. Stack
@@ -50,6 +58,19 @@ media: solo il filo. Motivazione completa e alternative scartate in
 vendorizzati, credito a Marcello Barnaba / `vjt/grappa-irc`, MIT.
 
 **Nessun'altra dipendenza senza passare da qui (§0).**
+
+### 2.1 Convenzioni di codice
+
+**Tutto in inglese**: identificatori, commenti nel codice, messaggi verso
+l'utente (le righe `ERROR :...` di §3.3 incluse, i log di §3.2). Stessa
+regola che KeelBot applica al proprio codice — coerenza tra i progetti
+dell'ecosistema, e i messaggi `ERROR` finiscono nel client IRC di chiunque,
+non solo nostro.
+
+Questo documento (`CLAUDE.md`) resta in italiano, come il `CLAUDE.md` di
+KeelBot — è un documento di processo per chi lavora al progetto, non
+superficie che l'utente finale vede. `ARCHITECTURE.md` e `WIRE.md` sono già
+in inglese e restano così.
 
 ---
 
