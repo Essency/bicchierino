@@ -9,6 +9,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "http.h"
+#include "json.h"
+
 #define IRC_LINE_MAX 512
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
@@ -180,20 +183,118 @@ static void split_network_password(const char *raw, char *network, size_t networ
     snprintf(password, password_sz, "%s", colon + 1);
 }
 
-/* TODO(next): the real thing — POST /auth/login (WIRE.md §1), then WS
- * connect + topic joins (WIRE.md §3-4). Stubbed so the registration path
- * above is real and testable end to end before the grappa leg exists.
- * CLAUDE.md §3.3's "grappa not reachable" ERROR is for when that call
- * genuinely fails once written — this stub says something different on
- * purpose, so the two are never confused while debugging. */
-static void attempt_grappa_login(int fd, const char *account, const char *network,
-                                  const char *password, const struct config *cfg) {
-    (void)password;
-    fprintf(stderr,
-            "bicchierino: registration parsed OK (account=%s network=%s grappa_url=%s) — "
-            "grappa login not implemented yet\n",
-            account, network[0] ? network : "(default)", cfg->grappa_url);
-    send_line(fd, "ERROR :bicchierino: grappa login not implemented yet");
+/* Minimal JSON string escaper — not a general encoder, just enough for
+ * the two string fields the login body ever carries. json.c (vendored)
+ * only reads JSON and re-serializes an already-parsed value; it has no
+ * builder API for constructing a fresh document from raw C strings, so
+ * this is the one place bicchierino writes JSON by hand rather than
+ * through the vendored library. */
+static void json_escape_into(const char *src, char *dst, size_t dst_sz) {
+    size_t di = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && di + 1 < dst_sz; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (di + 2 >= dst_sz) break;
+            dst[di++] = '\\';
+            dst[di++] = (char)*p;
+        } else if (*p == '\n' || *p == '\r' || *p == '\t') {
+            if (di + 2 >= dst_sz) break;
+            dst[di++] = '\\';
+            dst[di++] = *p == '\n' ? 'n' : (*p == '\r' ? 'r' : 't');
+        } else if (*p < 0x20) {
+            if (di + 6 >= dst_sz) break;
+            di += (size_t)snprintf(dst + di, dst_sz - di, "\\u%04x", *p);
+        } else {
+            dst[di++] = (char)*p;
+        }
+    }
+    dst[di] = '\0';
+}
+
+/* WIRE.md §1: the identifier MUST look like an email or grappa's
+ * IdentifierClassifier routes it to nick_login (visitor flow) instead of
+ * mode1_login (real account login) — confirmed against auth_controller.ex
+ * directly, not guessed. The domain half is never used for anything;
+ * "bicchierino.local" just needs to make the string email-shaped. */
+#define LOGIN_IDENTIFIER_MAX (IRC_LINE_MAX + 32) /* account + "@bicchierino.local" */
+#define LOGIN_BODY_MAX (IRC_LINE_MAX * 2 * 2 + 64) /* both escaped fields + the JSON template */
+
+static void build_login_body(const char *account, const char *password, char *body,
+                              size_t body_sz) {
+    char identifier[LOGIN_IDENTIFIER_MAX];
+    snprintf(identifier, sizeof(identifier), "%s@bicchierino.local", account);
+
+    char esc_identifier[IRC_LINE_MAX * 2];
+    char esc_password[IRC_LINE_MAX * 2];
+    json_escape_into(identifier, esc_identifier, sizeof(esc_identifier));
+    json_escape_into(password, esc_password, sizeof(esc_password));
+
+    snprintf(body, body_sz, "{\"identifier\":\"%s\",\"password\":\"%s\"}", esc_identifier,
+             esc_password);
+}
+
+/* POST /auth/login (WIRE.md §1) and report what happened on the IRC
+ * socket. Returns true only on a genuine 200 with a usable token+subject
+ * — false covers everything else (bad credentials, grappa unreachable,
+ * a malformed response), and the caller's response is the same either
+ * way at this point in the connection (CLAUDE.md §3.3: bare ERROR, no
+ * 001 was ever sent, so no numeric). The three failure messages stay
+ * textually distinct on purpose — "not reachable" vs "invalid
+ * credentials" vs a malformed-response case are different bugs to chase
+ * and must not look identical in a log.
+ *
+ * TODO(next): on success, this only logs the token/subject — the actual
+ * WS connect + topic joins (WIRE.md §3-4) are the next piece, not here
+ * yet. */
+static bool attempt_grappa_login(int fd, const char *account, const char *password,
+                                  const struct config *cfg) {
+    char body[LOGIN_BODY_MAX];
+    build_login_body(account, password, body, sizeof(body));
+
+    struct http_response resp;
+    if (!https_post_login(cfg->grappa_url, body, &resp)) {
+        fprintf(stderr, "bicchierino: grappa not reachable at %s\n", cfg->grappa_url);
+        send_line(fd, "ERROR :bicchierino: grappa not reachable");
+        return false;
+    }
+
+    bool ok = false;
+    if (resp.status == 200) {
+        char err[128];
+        json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+        if (!doc) {
+            fprintf(stderr, "bicchierino: grappa login: malformed JSON response: %s\n", err);
+            send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+        } else {
+            const json_value *root = json_root(doc);
+            const char *token = NULL;
+            const json_value *subject = json_get(root, "subject");
+            const char *subject_name = NULL;
+            if (json_str_req(root, "token", &token) && subject &&
+                json_str_req(subject, "name", &subject_name)) {
+                fprintf(stderr, "bicchierino: grappa login OK, subject=%s\n", subject_name);
+                /* TODO(next): stash token + subject_name, move on to the
+                 * WS connect (WIRE.md §2, §4) instead of stopping here. */
+                send_line(fd, "ERROR :bicchierino: login OK, websocket bridge not "
+                              "implemented yet");
+                ok = true;
+            } else {
+                fprintf(stderr, "bicchierino: grappa login: 200 response missing "
+                                "token/subject.name\n");
+                send_line(fd, "ERROR :bicchierino: malformed response from grappa");
+            }
+            json_free(doc);
+        }
+    } else if (resp.status == 401) {
+        fprintf(stderr, "bicchierino: grappa login: invalid credentials for account=%s\n",
+                account);
+        send_line(fd, "ERROR :bicchierino: invalid grappa credentials");
+    } else {
+        fprintf(stderr, "bicchierino: grappa login: unexpected HTTP status %d\n", resp.status);
+        send_line(fd, "ERROR :bicchierino: unexpected response from grappa (%d)", resp.status);
+    }
+
+    http_response_free(&resp);
+    return ok;
 }
 
 void *connection_run(void *arg) {
@@ -219,7 +320,14 @@ void *connection_run(void *arg) {
             char network[IRC_LINE_MAX], password[IRC_LINE_MAX];
             split_network_password(reg.got_pass ? reg.pass_raw : "", network, sizeof(network),
                                     password, sizeof(password));
-            attempt_grappa_login(fd, reg.account, network, password, cfg);
+            /* `network` is not part of the login call at all (WIRE.md §1:
+             * only account+password go in the REST body) — it picks which
+             * grappa:user:{subject}/network:{net}/... topic to join,
+             * which is the very next piece after login succeeds. Computed
+             * here and not yet used past this point; TODO(next) carries
+             * it into the WS join stage instead of dropping it. */
+            (void)network;
+            attempt_grappa_login(fd, reg.account, password, cfg);
             break;
         }
     }
