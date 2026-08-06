@@ -131,6 +131,33 @@ nel file di config (dove qualcuno potrebbe lasciarla dimenticata).
   esterno; riapertura del file su `SIGHUP` se serve supportarlo (stesso
   pattern del logger diagnostico di KeelBot).
 
+### 3.3 Non si raggiunge grappa — una regola sola, due momenti in cui si applica
+
+**Qualunque impossibilità di raggiungere grappa produce lo stesso
+trattamento: `ERROR :<motivo>` sul socket IRC a valle, poi si chiude.
+Nessun retry interno — è il client IRC vero a riconnettersi con la propria
+logica**, esattamente come già deciso per §1 sopra (websocket caduta a metà
+sessione). Non sono due decisioni, sono la stessa applicata in due punti del
+ciclo di vita:
+
+- **Al connect, prima della registrazione**: la POST di login fallisce per
+  irraggiungibilità (non per credenziali sbagliate — quello resta un caso
+  diverso, già coperto: bare `ERROR` prima del 464/simile, come fa già
+  `ircd_register` di shottino per gli altri fallimenti pre-registrazione),
+  oppure la websocket non si apre/non completa il join dopo un login
+  riuscito. In nessuno di questi casi il client a valle ha mai ricevuto
+  `001`: `ERROR :grappa non raggiungibile` (testo esatto da rifinire in
+  implementazione) e chiusura, senza numerici — stesso pattern già
+  osservato in `ircd_register` per `ERROR :bad password` e simili.
+- **A metà sessione, dopo la registrazione**: la websocket cade.
+  `ERROR :lost grappa connection` e chiusura.
+
+**Non c'è distinzione di codice tra i due casi**: entrambi finiscono nella
+stessa funzione — "questa connessione non può continuare, dillo e chiudi" —
+cambia solo il messaggio e se `001` era già stato mandato. Non serve un
+meccanismo di retry, non serve uno stato "sto ritentando": semplicemente
+quella connessione muore e il client vero, se vuole, ne apre una nuova.
+
 ---
 
 ## 4. Wire protocol grappa — leggi `WIRE.md`, non indovinare
@@ -159,23 +186,7 @@ Il catalogo completo verbo-per-verbo (`op`, `kick`, `mode`, `whois`, ...) **non*
 
 ---
 
-## 5. TBD — decisioni aperte, non improvvisare
-
-~~Modello di concorrenza.~~ **Risolto** — vedi §3, thread per connessione.
-
-~~Configurazione e logging.~~ **Risolto** — vedi §3.1 e §3.2.
-
-### 5.1 Cosa succede se la websocket verso grappa cade a metà sessione
-
-**L'unica cosa ancora davvero aperta.** Proposta sul tavolo (non confermata):
-chiudere anche la connessione IRC a valle (`ERROR` + close), lasciando che
-sia il client IRC vero a riconnettersi con la propria logica — coerente con
-"stateless", zero stato di retry da scrivere dentro bicchierino. Alternativa
-scartabile: resume trasparente (re-login + re-join silenzioso, il client a
-valle non si accorge di nulla) — più comodo ma reintroduce dentro
-bicchierino esattamente lo stato che la filosofia "stupido" voleva evitare.
-Il silenzio non è consenso: finché non è confermata esplicitamente resta
-TBD, non assumere la prima opzione solo perché è quella proposta.
+## 5. TBD — nessuna. Tutte le domande aperte sono chiuse (vedi §3.3)
 
 ---
 
@@ -195,13 +206,14 @@ TBD, non assumere la prima opzione solo perché è quella proposta.
 | JSON o libconfig per la configurazione | JSON è più verboso di righe ripetute per i bind multipli; libconfig è una dipendenza nuova non vendorizzabile. Il formato a direttive costa meno codice di entrambi (§3.1) |
 | Un flag runtime per disattivare il rifiuto di bind non-loopback in chiaro | dev'essere una scelta cosciente per-avvio (`--insecure`), mai qualcosa che sopravvive in un file di config dimenticato (§3.1) |
 | Log del traffico dietro un flag runtime | deve sparire dal binario di release, non solo essere disattivabile — un flag si accende per sbaglio, un `#ifdef` no (§3.2) |
+| Retry interno (login o websocket) quando grappa non si raggiunge | reintroduce esattamente lo stato che "stateless" vuole evitare; il client IRC vero sa già riconnettersi (§3.3) |
+| Un percorso di codice diverso per "grappa irraggiungibile al connect" vs "caduta a metà sessione" | stesso fallimento, stesso trattamento (`ERROR` + close) — differenziarlo raddoppia la logica per zero guadagno (§3.3) |
 
 ---
 
 ## 7. Prossimo passo
 
-Resta **una sola** domanda aperta: §5.1, cosa fare se la websocket verso
-grappa cade a metà sessione — da confermare esplicitamente, non assumere.
-Tutto il resto è chiuso. Si può iniziare lo scheletro: accept loop → thread
-per connessione → parsing registrazione IRC
-→ login REST → join WS (§4, `WIRE.md`).
+Nessun TBD residuo. Si può iniziare lo scheletro: accept loop → thread per
+connessione → parsing registrazione IRC → login REST → join WS (§4,
+`WIRE.md`), con §3.3 già a definire il trattamento di ogni fallimento verso
+grappa lungo tutto il percorso.
