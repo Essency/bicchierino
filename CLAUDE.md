@@ -1068,3 +1068,44 @@ davvero cifrato stavolta; (2) bind `plain` esistente riprovato dopo il
 fix → nessuna regressione, comportamento identico a prima (`next_line`/
 `send_line` toccati da questo fix, quindi la riprova non era
 opzionale).
+
+## 9. Primo test con un client IRC vero (irssi, via `bicchierino-preprod`) —
+trovato un bug reale al primo giro
+
+**`bicchierino-preprod`** (`~/progetti/bicchierino-preprod`, LAN IP
+`192.168.2.54:4688`, TLS, certificato self-signed) è stato messo su per
+far testare l'utente con irssi vero — la prima volta in assoluto che
+bicchierino viene toccato da un client IRC reale invece che dai miei
+script Python. Ha trovato SUBITO un bug genuino.
+
+**Bug: `/names` non mostrava MAI un sigillo (@/%/+), nemmeno per
+`SonicTest`, op confermato in `#essency` (visto più volte questa sessione
+via WHOIS's 319: `@#essency`).** Causa, confermata leggendo il sorgente
+reale di grappa (`event_router.ex:2908-2912`, `split_mode_prefix/1`): il
+campo `modes` di un member in `members_seeded`/`names_reply` contiene
+GIÀ il carattere sigillo grezzo (`@`/`%`/`+`), MAI una lettera di modo
+(`o`/`h`/`v`) — `split_mode_prefix` lo costruisce direttamente dal primo
+byte di un token 353 RPL_NAMREPLY (`<<prefix, rest::binary>> when prefix
+in [?@, ?%, ?+] -> {rest, [<<prefix>>]}`), nessuna traduzione a lettera
+avviene MAI lato grappa. Il codice di `render_names_353_366` invece
+cercava `letter[0] == 'o'` — un'assunzione MAI verificata contro il
+sorgente reale (il campo `modes` di WHO è davvero fatto di lettere,
+un evento DIVERSO con lo stesso nome di campo — probabile origine della
+confusione), quindi non ha MAI trovato una corrispondenza, in silenzio,
+per tutta la sessione. Fix: legge direttamente `modes[0]` come sigillo
+(al massimo un elemento — grappa/bahamut mandano un solo sigillo
+principale per token NAMES, mai una forma multi-prefix `@+nick`, coerente
+col fatto che questo codice non annuncia nemmeno `multi-prefix`),
+validato contro l'insieme noto di sigilli invece di fidarsi alla cieca.
+**Più semplice del codice sbagliato precedente, non più complesso.**
+
+**Provato live**: riconnessione pulita dopo il fix → `353 ... :@Sonic
+@SonicTest GameBot Hypnotize tromBOTic` — entrambi gli op reali mostrano
+correttamente `@`.
+
+Bug separato, risolto dall'utente stesso lato client prima che potessi
+indagare: il primo tentativo di connessione irssi ha prodotto
+`SSL routines::wrong version number` lato server (bicchierino riceveva
+byte non-TLS su una porta TLS) — sintomo tipico di un client che non ha
+davvero attivato TLS nella sua invocazione, non un bug di bicchierino.
+L'utente ha risolto da solo la sintassi lato irssi.
