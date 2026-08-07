@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -40,6 +42,113 @@
  * at all — it exists for the client that's actually gone. */
 #define CLIENT_PING_THRESHOLD 180 /* seconds of client silence before WE ping */
 #define CLIENT_PING_TIMEOUT 60    /* seconds to wait for a reply before giving up */
+
+/* ── Client transport: plain or TLS, transparent to every caller ────────
+ *
+ * Exactly two functions ever touch the client socket directly — this
+ * one pair, `next_line`'s `recv()` and `send_line`'s `write()` (grepped
+ * to confirm: nothing else in this file does). A `bind ... tls` entry
+ * means the accepted fd gets wrapped in a real `SSL_accept` handshake
+ * before Phase 1 registration even starts (`connection_run`'s own
+ * setup, below) — found live as a genuine, pre-existing gap: `main.c`
+ * had carried an honest TODO ("TLS listeners accept plaintext for now
+ * and never wrap the socket in SSL_accept") that nobody had come back
+ * to, and a real `openssl s_client`/Python TLS handshake against a
+ * `tls` bind just hung forever — bicchierino was reading raw
+ * ClientHello bytes as if they were plain IRC text.
+ *
+ * Thread-local rather than a new parameter threaded through every
+ * function that (transitively) calls `send_line` — which is nearly all
+ * of them, dozens of call sites across this file. Sound specifically
+ * BECAUSE this codebase's own concurrency model is one thread per
+ * connection with zero shared state (CLAUDE.md §3): thread-local
+ * storage naturally scopes to exactly one client's SSL session, same
+ * guarantee a `struct` parameter would give, without the mechanical
+ * signature-threading cost across a file this size. Set once at the
+ * top of `connection_run` (NULL for a plain bind — every plain-bind
+ * connection's `next_line`/`send_line` calls behave byte-identically to
+ * before this fix), cleared and torn down at every exit path. */
+static _Thread_local SSL *g_client_ssl = NULL;
+
+/* SSL_read/SSL_write don't share plain recv/write's simple 0-or-negative
+ * error signaling — a negative return can mean "clean shutdown", "the
+ * peer reset the connection", or (only relevant for non-blocking
+ * sockets, which this codebase never uses for the client fd) "try
+ * again". `SSL_get_error` is the only way to tell them apart. Maps onto
+ * the same OK/EOF/ERROR trichotomy `next_line`/`send_line` already
+ * expect from plain `recv`/`write`, so neither has to branch on
+ * TLS-vs-plain beyond calling this. */
+static ssize_t client_recv(int fd, void *buf, size_t len) {
+    if (!g_client_ssl) return recv(fd, buf, len, 0);
+    int n = SSL_read(g_client_ssl, buf, (int)len);
+    if (n > 0) return n;
+    int err = SSL_get_error(g_client_ssl, n);
+    if (err == SSL_ERROR_ZERO_RETURN) return 0; /* clean TLS close_notify — EOF */
+    return -1;
+}
+
+static ssize_t client_write(int fd, const void *buf, size_t len) {
+    if (!g_client_ssl) return write(fd, buf, len);
+    int n = SSL_write(g_client_ssl, buf, (int)len);
+    return n > 0 ? n : -1;
+}
+
+/* Loads `bind ... tls <cert> <key>`'s pair fresh per connection (a
+ * small, infrequent cost for what is fundamentally a low-connection-
+ * count personal bouncer facade — a shared SSL_CTX across every
+ * connection to one bind would need its own thread-safety story this
+ * isn't worth building yet) and performs the actual `SSL_accept`
+ * handshake, setting `g_client_ssl` on success so `next_line`/
+ * `send_line` transparently pick it up for the rest of this thread's
+ * life. Returns false on ANY failure (cert/key load, or a client that
+ * doesn't actually speak TLS at all hitting a `tls` bind) — the caller
+ * closes the connection, same as every other unrecoverable pre-
+ * registration failure in this file. `*ctx_out` is always set (even on
+ * failure, if it got that far) so the caller can free it either way. */
+static bool client_tls_accept(int fd, const struct bind_config *listener, SSL_CTX **ctx_out) {
+    *ctx_out = NULL;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        fprintf(stderr, "bicchierino: TLS: SSL_CTX_new failed\n");
+        return false;
+    }
+    *ctx_out = ctx;
+    if (SSL_CTX_use_certificate_file(ctx, listener->cert_path, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx, listener->key_path, SSL_FILETYPE_PEM) != 1) {
+        fprintf(stderr, "bicchierino: TLS: failed to load cert/key (%s / %s): %s\n",
+                listener->cert_path, listener->key_path,
+                ERR_error_string(ERR_get_error(), NULL));
+        return false;
+    }
+    g_client_ssl = SSL_new(ctx);
+    if (!g_client_ssl) {
+        fprintf(stderr, "bicchierino: TLS: SSL_new failed\n");
+        return false;
+    }
+    SSL_set_fd(g_client_ssl, fd);
+    if (SSL_accept(g_client_ssl) != 1) {
+        fprintf(stderr, "bicchierino: TLS handshake failed: %s\n",
+                ERR_error_string(ERR_get_error(), NULL));
+        SSL_free(g_client_ssl);
+        g_client_ssl = NULL;
+        return false;
+    }
+    fprintf(stderr, "bicchierino: TLS handshake OK (%s, %s)\n", SSL_get_version(g_client_ssl),
+            SSL_get_cipher(g_client_ssl));
+    return true;
+}
+
+/* Mirror of `client_tls_accept` — every exit path from `connection_run`
+ * past that point calls this, plain-bind connections included (a no-op
+ * for them, `g_client_ssl` was never set). */
+static void client_tls_close(SSL_CTX *ctx) {
+    if (g_client_ssl) {
+        SSL_shutdown(g_client_ssl);
+        SSL_free(g_client_ssl);
+        g_client_ssl = NULL;
+    }
+    if (ctx) SSL_CTX_free(ctx);
+}
 
 /* ── Line reader ───────────────────────────────────────────────────────
  *
@@ -79,7 +188,7 @@ static int next_line(int fd, struct linebuf *lb, char *line, size_t line_sz) {
             return NEXT_LINE_ERROR;
         }
 
-        ssize_t n = recv(fd, lb->data + lb->len, sizeof(lb->data) - lb->len, 0);
+        ssize_t n = client_recv(fd, lb->data + lb->len, sizeof(lb->data) - lb->len);
         if (n == 0) return NEXT_LINE_EOF;
         if (n < 0) return NEXT_LINE_ERROR;
         lb->len += (size_t)n;
@@ -152,7 +261,7 @@ static void send_line(int fd, const char *fmt, ...) {
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
      * the caller is about to close it anyway. */
-    ssize_t unused = write(fd, buf, (size_t)n);
+    ssize_t unused = client_write(fd, buf, (size_t)n);
     (void)unused;
 }
 
@@ -2998,6 +3107,18 @@ void *connection_run(void *arg) {
     int fd = args->client_fd;
     const struct config *cfg = args->cfg;
 
+    /* `client_ssl_ctx` is scoped to the whole function (not just the
+     * setup block) because `client_tls_close` needs it at every exit
+     * path from here on, including the ones below Phase 1. NULL for a
+     * plain bind — `client_tls_close` is a no-op in that case. */
+    SSL_CTX *client_ssl_ctx = NULL;
+    if (args->listener->tls && !client_tls_accept(fd, args->listener, &client_ssl_ctx)) {
+        client_tls_close(client_ssl_ctx);
+        close(fd);
+        free(args);
+        return NULL;
+    }
+
     struct linebuf lb = {0};
     struct registration reg = {0};
     char line[IRC_LINE_MAX];
@@ -3019,6 +3140,7 @@ void *connection_run(void *arg) {
     }
 
     if (!registered) {
+        client_tls_close(client_ssl_ctx);
         close(fd);
         free(args);
         return NULL;
@@ -3325,6 +3447,7 @@ cleanup:
     if (br_connected) bridge_close(&br);
     logout_grappa(&hc, cfg, &sess);
     http_client_close(&hc);
+    client_tls_close(client_ssl_ctx);
     close(fd);
     free(args);
     return NULL;
