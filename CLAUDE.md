@@ -1192,18 +1192,67 @@ broadcast sul topic utente dopo il persist+broadcast, per-#422) è un
 no-op deliberato in `handle_grappa_message_event` (connection.c
 ~3208-3211) — mai implementato.
 
-Questo NON è un bug introdotto dal lavoro di oggi: è un limite
-pre-esistente del modello di sottoscrizione DM di bicchierino, mai
-notato prima perché nessuna DM in uscita era mai stata testata contro
-un peer nuovo con un secondo client in ascolto. Serve una feature vera
-(iscriversi dinamicamente a `channel:<peer>` per ogni DM mandata/
-ricevuta, o fetchare la lista `query_windows` esistente al bootstrap e
-joinarle tutte, specchiando cosa fa cic) — non una one-liner fix,
-quindi rimandato a una sessione dedicata invece di espandere lo scope
-di questa.
+Questo NON era un bug introdotto dal lavoro di questa sezione: era un
+limite pre-esistente del modello di sottoscrizione DM di bicchierino,
+mai notato prima perché nessuna DM in uscita era mai stata testata
+contro un peer nuovo con un secondo client in ascolto. **Riprodotto di
+nuovo dall'utente stesso** con un target REALE (`PRIVMSG Sonic`, non
+solo GameBot) via 2 client veri connessi a `bicchierino-preprod` —
+confermando che il gap era generale, non specifico di GameBot.
+
+**FIXATO** nella stessa sessione: grappa pusha già `query_windows_list`
+(la lista completa delle DM window correnti, una entry per peer mai
+DMato) sul topic utente — sia come snapshot after-join sia LIVE a ogni
+apertura di una nuova finestra (#422, `QueryWindows.open/4`). Ogni
+connessione bicchierino è GIÀ iscritta al topic utente, quindi questo è
+delivery gratis, zero sottoscrizioni aggiuntive per SAPERE di un nuovo
+peer. Payload confermato via un dump raw temporaneo del wire (non
+indovinato): `{"kind":"query_windows_list","windows":{"1":[{"network_id":
+1,"target_nick":"Sonic","opened_at":"..."},...]}}` — chiave
+`network_id` COME STRINGA (le chiavi JSON sono sempre stringhe, anche se
+lato Elixir il tipo è `integer()`).
+
+`handle_grappa_query_windows_list_event` (nuovo) legge
+`windows[str(sess->network_id)]`, e per ogni `target_nick` MAI visto
+prima (foldato, confrontato sia contro `dm_peer_names` già joinati sia
+contro `pending_dm_peer_names` ancora in coda) lo mette in coda in
+`pending_dm_peer_names` su `struct grappa_session`. L'`bridge_join`
+vero e proprio è DEFERITO al loop principale di Fase 2 — stessa
+identica ragione di `dm_needs_rejoin`: questo handler può girare
+NIDIFICATO dentro il ciclo di attesa di un ALTRO `bridge_join` (via
+`bridge_event_dispatch`, es. durante il bootstrap) — un `bridge_join`
+nidificato rischia di rubare la risposta di quello ESTERNO (rischio già
+documentato e mai violato prima d'ora). Verificato SICURO: il payload
+after-join di un topic DM-peer (`push_channel_snapshot` lato grappa)
+usa `_if_cached`/`_if_seeded` per topic/modes/members — per un
+"canale" a forma di nick (mai realmente joinato come canale IRC) non
+c'è nulla in cache, quindi zero eventi spuri (NO JOIN/NAMES/MODE fasulli
+per il peer) — solo i veri eventi `message` del thread DM, una volta
+joinato.
+
+**Verificato live, sia il path bootstrap che quello live**: un peer già
+noto (finestra pre-esistente) si joina al bootstrap di ENTRAMBE le
+connessioni gemelle; un peer MAI DMato prima (`trombotic3-clean`, nome
+inventato apposta per questo test) genera un `query_windows_list` LIVE
+che ENTRAMBE le connessioni ricevono (stesso topic utente condiviso) e
+joinano dinamicamente a metà sessione — poi il messaggio arriva
+correttamente sul client B, mittente rifasato come il peer (stessa
+convenzione del Bug 1 sopra), mentre A (il mittente) non vede nulla
+(proprio eco correttamente soppresso via `pending_self_msg_ids`).
+
+**Effetto collaterale trovato e fixato nella stessa sessione, spottato
+dall'utente in diretta**: con 5-10+ topic DM-peer joinati invece dei
+soliti 1-2 canali, `isupport_changed` (che grappa pusha una volta per
+OGNI topic a forma di canale joinato, DM-peer inclusi — vedi il commento
+già esistente su `handle_grappa_isupport_changed_event`) ha iniziato a
+far ri-mandare lo STESSO 005 identico 5-10 volte di fila invece di 1-2 —
+prima solo fastidioso, ora chiaramente rumore. Fix: `sess-
+>isupport_005_sent` — mandato una volta sola per connessione, ogni push
+successivo è uno skip. Il contenuto è sempre lo stesso entro una
+sessione (una sola rete, `chanmodes`/`prefix` non cambiano davvero a
+runtime), quindi inviarlo una sola volta è corretto, non solo più
+silenzioso.
 
 `bicchierino-preprod` NON è ancora stato ricompilato/ridistribuito con
-i fix di questa sezione — build attuale = HEAD di `feature/chathistory`
-prima di questo lavoro (CAP negotiation + TLS fix + sigilli NAMES, non
-i fix multi-client). Serve un rebase di `feature/chathistory` su
+i fix di questa sezione — serve un rebase di `feature/chathistory` su
 `develop` e un redeploy prima che l'utente possa ritestare con irssi.
