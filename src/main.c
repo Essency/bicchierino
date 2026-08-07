@@ -74,13 +74,19 @@ int main(int argc, char **argv) {
     struct config cfg;
     if (!config_load_from_args(argc, argv, &cfg)) return 1;
 
-    /* TODO(next): TLS listeners (bind ... tls) accept plaintext for now
-     * and never wrap the socket in an SSL_accept — CLAUDE.md §2's "OpenSSL
-     * in two distinct roles" server side isn't wired up yet. Every bind
-     * that reached here already passed the plaintext-must-be-loopback
-     * check in config.c, so this is not yet a safety gap for the default
-     * config, but a `bind ... tls` entry silently NOT getting TLS is a
-     * real one — fix before using a tls bind for anything real. */
+    /* `bind ... tls` listeners still `accept()` a plain TCP socket
+     * here — the actual `SSL_accept` handshake happens inside
+     * `connection_run` (connection.c), gated on `args->listener->tls`,
+     * not here. Found live as a real, previously-undetected gap this
+     * TODO used to describe: nothing before that fix ever wrapped the
+     * accepted fd in TLS at all, so a `tls` bind silently served
+     * plaintext while claiming otherwise in its own startup log line —
+     * a real TLS client's handshake against it just hung forever
+     * (confirmed with both a Python `ssl` client and raw `openssl
+     * s_client`), never a working connection, so this was never
+     * silently INSECURE in practice — no genuine TLS client could ever
+     * have connected successfully — but the promise itself was false
+     * for as long as this TODO existed. */
     struct listener listeners[CONFIG_MAX_BINDS];
     size_t listener_count = 0;
     for (size_t i = 0; i < cfg.bind_count; i++) {

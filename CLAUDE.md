@@ -1013,3 +1013,58 @@ La lista "smaller gaps" è ora COMPLETAMENTE chiusa.
 `ensure_network_connected` non ancora confermato contro un account
 genuinamente mai connesso (`Testone` — l'utente testerà da un client
 reale).
+
+## 8. `bind ... tls` era finto — mai provato live, l'utente l'ha beccato
+
+**L'utente ha insistito per mesi/sessioni che un listener non-loopback
+DEVE essere TLS (password grappa dentro PASS, in chiaro fuori da TLS è
+un secret vero), al punto da doversi inventare `--insecure` come
+workaround per lo sviluppo locale — e poi ha chiesto direttamente: ma
+il listener TLS stesso, l'hai MAI provato per davvero?** Risposta
+onesta: no. Ogni singolo test di questa sessione (e a giudicare dal
+codice, anche di sessioni precedenti) ha usato `bind 127.0.0.1 ... plain`
+— il path TLS lato listener non era MAI stato esercitato.
+
+**La cosa peggiore possibile NON era vera, ma per un pelo**: `main.c`
+portava già un TODO onesto ("TLS listeners accept plaintext for now and
+never wrap the socket in an SSL_accept") — MAI sistemato. Un vero
+client TLS (Python `ssl`, `openssl s_client`) che si connette a un bind
+`tls` restava con l'handshake appeso per sempre (bicchierino leggeva i
+byte grezzi del ClientHello come se fossero testo IRC in chiaro) — quindi
+in pratica nessun client TLS reale avrebbe MAI potuto connettersi con
+successo. Non era un buco di sicurezza SFRUTTABILE (nessuno stava
+davvero mandando password in chiaro su quella porta, perché nessuna
+connessione TLS reale funzionava affatto), ma la promessa del `bind ...
+tls` era comunque falsa — esattamente la classe di bug ("asserire
+qualcosa non vero") che questo progetto ha sempre trattato come serio.
+
+**Fix, sul branch principale (`develop`), non su `feature/chathistory`
+dove stava girando il lavoro del momento — deliberatamente, su
+richiesta esplicita.** Grep mirato ha confermato: SOLO due punti in
+tutto `connection.c` toccano il socket client direttamente (`recv()`
+dentro `next_line`, `write()` dentro `send_line`) — nessun altro punto
+fa I/O grezzo sul client. Invece di far passare un nuovo parametro SSL
+attraverso decine di funzioni che chiamano `send_line` (quasi tutto il
+file), la SSL è thread-local (`static _Thread_local SSL *g_client_ssl`)
+— sound proprio perché il modello di concorrenza di questo codebase è
+già un thread per connessione con zero stato condiviso (CLAUDE.md §3):
+lo storage thread-local si scopa naturalmente a esattamente la sessione
+SSL di un client, stessa garanzia di un parametro `struct`, senza il
+costo meccanico di rifare la firma di ogni funzione in un file di
+questa taglia. `client_tls_accept`/`client_tls_close` fanno il vero
+`SSL_accept` handshake in cima a `connection_run` (usando `cert_path`/
+`key_path` già presenti in `struct bind_config`, mai serviti prima
+d'ora) e il teardown a OGNI exit path (il ritorno anticipato pre-Phase-1
+E il `cleanup:` esistente). Un bind `plain` non tocca per niente questo
+codice — `g_client_ssl` resta NULL, `client_recv`/`client_write`
+degradano esattamente al vecchio `recv`/`write`.
+
+**Provato live, entrambi i path**: (1) client TLS reale (Python `ssl`,
+TLS 1.3, `TLS_AES_256_GCM_SHA384`) contro un bind `tls` con lo stesso
+certificato self-signed già generato per `bicchierino-preprod` →
+handshake riuscito, registrazione completa, bootstrap reale contro
+grappa, round-trip WHOIS — tutto identico a un client plain, ma
+davvero cifrato stavolta; (2) bind `plain` esistente riprovato dopo il
+fix → nessuna regressione, comportamento identico a prima (`next_line`/
+`send_line` toccati da questo fix, quindi la riprova non era
+opzionale).
