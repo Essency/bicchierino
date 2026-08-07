@@ -48,14 +48,26 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
  * (phx_join, pushes) is small JSON, never worth fragmenting. */
 bool ws_client_send_text(struct ws_client *wsc, const char *text);
 
-/* One blocking SSL_read, fed into the reader, then one ws_reader_take.
- * Meant to be called after poll() reports the fd readable — a single
- * call may or may not yield a complete message (TCP framing, again),
- * so the caller loops on WS_NEED_MORE at the poll() level, not by
- * spinning here. Answers a PING with a PONG internally (the reader
- * surfaces WS_PING so the caller COULD, but grappa doesn't need
- * anything else observed about it, and answering here means every
- * caller gets it right instead of every caller having to remember). */
+/* Encodes and sends `payload`/`len` as a single masked PONG frame (RFC
+ * 6455 §5.5.2/§5.3) — the required reply to a WS_PING the reader
+ * surfaced. `payload` must be echoed byte-for-byte from the PING that
+ * prompted it (the RFC's own requirement), so this takes an explicit
+ * length rather than assuming a NUL-terminated C string the way
+ * `ws_client_send_text` does. */
+bool ws_client_send_pong(struct ws_client *wsc, const char *payload, size_t len);
+
+/* First tries a pure buffer peek (never touches the network); only if
+ * that yields WS_NEED_MORE does this fall through to one blocking
+ * SSL_read, fed into the reader, then one more peek. Meant to be called
+ * ONCE per poll()-reported-readable wakeup on the fd — that first
+ * network read is safe to block on (poll() promised data is coming),
+ * but a caller wanting to drain several already-buffered frames from
+ * the same wakeup should re-peek the reader directly rather than call
+ * this again, which could trigger a second SSL_read poll() never
+ * promised would return promptly. Does NOT answer PING with PONG
+ * automatically — the reader surfaces WS_PING, left for the caller
+ * (`connection.c`'s Phase 2 drain loop calls `ws_client_send_pong`
+ * itself the moment it sees one). */
 ws_result ws_client_recv(struct ws_client *wsc, char **payload, size_t *len);
 
 void ws_client_close(struct ws_client *wsc);
