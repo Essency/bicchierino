@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Build release binary
+        run: |
+          make clean
+          make CFLAGS="-O2 -Werror"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C . -czf "dist/bicchierino-${{ github.ref_name }}-linux-x86_64.tar.gz" \
+            bicchierino example.config README.md LICENSE THIRD_PARTY_LICENSES
+
+      - name: Create GitHub release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/bicchierino-${{ github.ref_name }}-linux-x86_64.tar.gz \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
