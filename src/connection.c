@@ -2403,19 +2403,30 @@ static void render_names_353_366(int fd, const char *nick, const char *channel,
         const char *mnick = NULL;
         if (!json_str_req(m, "nick", &mnick)) continue;
 
+        /* `modes[0]` is ALREADY the raw prefix SIGIL character (`@`/`%`/
+         * `+`), not a mode letter (`o`/`h`/`v`) — confirmed reading
+         * grappa's own `split_mode_prefix/1`
+         * (`event_router.ex:2908-2912`), which builds this exact array
+         * straight from a 353 RPL_NAMREPLY token's leading byte
+         * (`<<prefix, rest::binary>> when prefix in [?@, ?%, ?+] ->
+         * {rest, [<<prefix>>]}`) — it never translates to a letter at
+         * all. An earlier version of this function assumed letters
+         * (matching WHO's own `modes` field, which genuinely IS
+         * letters — a different event, different shape, same field
+         * name) and so never matched anything, silently dropping every
+         * sigil — found live: `TestUser`, a confirmed real op in
+         * `#testchannel` (per WHOIS's own 319 channel list showing
+         * `@#testchannel`), rendered with no `@` in `/names` at all. At
+         * most one element (grappa/bahamut send a single leading
+         * sigil per NAMES token, never a multi-prefix `@+nick` form —
+         * matches this codebase not advertising `multi-prefix`
+         * either), so just read it directly; still validated against
+         * the known sigil set rather than trusted blindly. */
         char sigil = '\0';
         const json_value *modes = json_get(m, "modes");
-        if (modes && json_type_of(modes) == JSON_ARRAY) {
-            size_t mcount = json_len(modes);
-            bool has_o = false, has_h = false, has_v = false;
-            for (size_t j = 0; j < mcount; j++) {
-                const char *letter = json_string(json_at(modes, j));
-                if (!letter) continue;
-                if (letter[0] == 'o') has_o = true;
-                else if (letter[0] == 'h') has_h = true;
-                else if (letter[0] == 'v') has_v = true;
-            }
-            sigil = has_o ? '@' : has_h ? '%' : has_v ? '+' : '\0';
+        if (modes && json_type_of(modes) == JSON_ARRAY && json_len(modes) > 0) {
+            const char *first = json_string(json_at(modes, 0));
+            if (first && (first[0] == '@' || first[0] == '%' || first[0] == '+')) sigil = first[0];
         }
 
         char token[80];
