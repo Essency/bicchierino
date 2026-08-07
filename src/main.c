@@ -1,11 +1,10 @@
 /* main.c — listener setup and the accept loop.
  *
  * poll() over the (few, fixed) listening sockets — one per configured
- * bind — and a pthread spawned per accepted client. See CLAUDE.md §3 for
- * why: the blocking grappa login only stalls its own thread, and poll()
- * over a handful of listeners has nothing to do with poll() vs epoll for
- * thousands of connections (that debate is about per-client fds, not
- * this).
+ * bind — and a pthread spawned per accepted client: the blocking grappa
+ * login only stalls its own thread, and poll() over a handful of
+ * listeners has nothing to do with poll() vs epoll for thousands of
+ * connections (that debate is about per-client fds, not this).
  */
 #include <arpa/inet.h>
 #include <errno.h>

@@ -54,8 +54,8 @@ void http_client_init(struct http_client *hc);
  * true when an HTTP exchange actually completed (the caller checks
  * `out->status` — 401/404/429/etc. are normal outcomes here, not
  * transport failures); false only when grappa could not be reached at
- * all even after the one retry — CLAUDE.md §3.3's "grappa not
- * reachable" case. */
+ * all even after the one retry — the "grappa not reachable" case,
+ * reported to the downstream client and never retried internally. */
 bool http_client_request(struct http_client *hc, const char *grappa_url, const char *method,
                           const char *path, const char *bearer_token, const char *json_body,
                           struct http_response *out);

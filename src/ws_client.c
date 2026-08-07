@@ -12,9 +12,10 @@
 #include "http.h"
 
 /* Hand-rolled instead of the GNU extension `memmem`: not declared under
- * strict POSIX feature-test macros everywhere, and portability to BSD
- * (CLAUDE.md's own reason for `poll()` over `epoll`) is exactly the kind
- * of thing worth not gambling on for five lines of code. */
+ * strict POSIX feature-test macros everywhere, and BSD portability
+ * (the same reason this codebase uses `poll()` over `epoll`, which is
+ * Linux-only) is exactly the kind of thing worth not gambling on for
+ * five lines of code. */
 static const void *buf_find(const void *haystack, size_t haystack_len, const void *needle,
                              size_t needle_len) {
     if (needle_len == 0 || needle_len > haystack_len) return NULL;

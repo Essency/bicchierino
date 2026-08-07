@@ -87,8 +87,9 @@ tells you about topics/modes for channels you're *already subscribed to*
 shottino's own bootstrap treats it as fatal (`die("no networks
 available")` right after the `GET /networks` call) because there is
 nothing left to bridge to — no network-level or channel-level topic can
-even be named. bicchierino's equivalent, consistent with `CLAUDE.md` §3.3
-(bare `ERROR`, pre-registration, no numeric — `001` was never sent):
+even be named. bicchierino's equivalent (bare `ERROR`, pre-registration,
+no numeric — `001` was never sent, same treatment as every other
+"grappa unreachable at connect" case):
 `ERROR :bicchierino: no networks bound to this account` and close. This
 is a real case, not a hypothetical — confirmed directly against a real
 test account (`TestUser`) that has a valid login but zero networks.

@@ -39,8 +39,10 @@ struct ws_client {
  * discarded.
  *
  * Returns false on any failure — TLS, HTTP-level, or a handshake that
- * didn't verify. CLAUDE.md §3.3's "grappa not reachable" territory,
- * same as every other connect failure in this codebase. */
+ * didn't verify. This is "grappa not reachable" territory, same as
+ * every other connect failure in this codebase: the caller reports
+ * `ERROR :...` to the downstream client and closes, never retries
+ * internally. */
 bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct ws_client *out);
 
 /* Encodes and sends `text` as a single masked text frame (RFC 6455

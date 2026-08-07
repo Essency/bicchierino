@@ -9,11 +9,11 @@
 #define DEFAULT_CONFIG_PATH "./bicchierino.config"
 
 /* 127.0.0.0/8 and ::1 only — a string check, not a real prefix parse.
- * Deliberately narrow: this gates a safety default (CLAUDE.md §3.1), so a
- * false negative (calling something loopback that isn't) would be the
- * dangerous direction. "localhost" is not accepted here on purpose — it
- * depends on resolver configuration, which is not a fact this function
- * can see. */
+ * Deliberately narrow: this gates whether a `plain` (non-TLS) bind is
+ * allowed to start at all, so a false negative (calling something
+ * loopback that isn't) would be the dangerous direction. "localhost" is
+ * not accepted here on purpose — it depends on resolver configuration,
+ * which is not a fact this function can see. */
 static bool is_loopback(const char *ip) {
     if (strncmp(ip, "127.", 4) == 0) return true;
     if (strcmp(ip, "::1") == 0) return true;

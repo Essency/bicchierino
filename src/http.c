@@ -29,8 +29,7 @@ struct parsed_url {
 
 /* grappa_url is config, not attacker input, but the parse still fails
  * closed on anything unexpected — a malformed config should error out
- * loudly (CLAUDE.md's own "no silent-swallow" spirit), not connect to
- * whatever str[8..] happened to contain. */
+ * loudly, not connect to whatever str[8..] happened to contain. */
 static bool parse_grappa_url(const char *url, struct parsed_url *out) {
     size_t prefix_len = strlen(GRAPPA_URL_PREFIX);
     if (strncmp(url, GRAPPA_URL_PREFIX, prefix_len) != 0) return false;

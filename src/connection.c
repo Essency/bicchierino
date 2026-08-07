@@ -64,7 +64,7 @@
  * function that (transitively) calls `send_line` — which is nearly all
  * of them, dozens of call sites across this file. Sound specifically
  * BECAUSE this codebase's own concurrency model is one thread per
- * connection with zero shared state (CLAUDE.md §3): thread-local
+ * connection with zero shared state: thread-local
  * storage naturally scopes to exactly one client's SSL session, same
  * guarantee a `struct` parameter would give, without the mechanical
  * signature-threading cost across a file this size. Set once at the
@@ -328,13 +328,14 @@ struct network_entry {
 /* Everything learned about this session across login (WIRE.md §1) and
  * the bootstrap discovery calls (WIRE.md §1.5), before the websocket
  * even opens. Lives on connection_run's stack — one per connection
- * thread, never shared (CLAUDE.md §3: zero state shared between
- * connections).
+ * thread, never shared: this codebase's whole concurrency model relies
+ * on zero state being shared between connections.
  *
  * `networks[]` is the full list from GET /networks, kept around (not
  * just the one PASS resolved to) so Case B's `GRAPPA NETWORK <slug>`
  * can validate against it later without a second round trip to grappa
- * (CLAUDE.md §3, §1's "IRC-side admin commands" note). */
+ * — the same list also backs any future IRC-side admin command that
+ * needs to enumerate bound networks. */
 struct grappa_session {
     char token[512];
     char subject_name[128];
@@ -362,7 +363,7 @@ struct grappa_session {
     /* WS join_refs (WIRE.md §4) — every later push on a topic must carry
      * the join_ref that topic's own phx_join returned, or Phoenix
      * silently drops the frame. Populated by the join sequence, consumed
-     * by the eventual poll()-based dispatch (TODO(next), CLAUDE.md §3). */
+     * by the poll()-based dispatch in connection_run's Phase 2 loop. */
     unsigned long user_join_ref;
     unsigned long channel_join_refs[MAX_CHANNELS]; /* parallel to channels[] */
     unsigned long dm_join_ref;
@@ -663,8 +664,8 @@ static void handle_registration_message(int fd, const struct irc_message *msg,
 }
 
 /* Splits "network:password" on the first ':'. No colon → network is
- * empty (resolved against the account's networks once login exists —
- * CLAUDE.md §3, WIRE.md's PASS convention) and the whole string is the
+ * empty (resolved against the account's networks once login exists,
+ * per WIRE.md's PASS convention) and the whole string is the
  * password. */
 static void split_network_password(const char *raw, char *network, size_t network_sz,
                                     char *password, size_t password_sz) {
@@ -707,8 +708,8 @@ static void build_login_body(const char *account, const char *password, char *bo
  * socket. Returns true only on a genuine 200 with a usable token+subject
  * — false covers everything else (bad credentials, grappa unreachable,
  * a malformed response), and the caller's response is the same either
- * way at this point in the connection (CLAUDE.md §3.3: bare ERROR, no
- * 001 was ever sent, so no numeric). The three failure messages stay
+ * way at this point in the connection: bare ERROR, no 001 was ever
+ * sent, so no numeric. The three failure messages stay
  * textually distinct on purpose — "not reachable" vs "invalid
  * credentials" vs a malformed-response case are different bugs to chase
  * and must not look identical in a log.
@@ -897,8 +898,8 @@ static bool fetch_networks(int fd, struct http_client *hc, const struct config *
 /* Pure matching logic, no I/O — named-and-found, named-and-missing,
  * unnamed-with-exactly-one, unnamed-with-several. Reused by both the
  * initial PASS-driven resolution and Case B's `GRAPPA NETWORK <slug>`
- * (CLAUDE.md §1's "IRC-side admin commands", arriving earlier than
- * planned) against the same already-fetched list. Sets
+ * (an IRC-side admin-style command, arriving earlier than planned)
+ * against the same already-fetched list. Sets
  * sess->network_slug/id/resolved on success; leaves them untouched
  * (caller must not assume they're cleared) on failure. */
 static bool pick_network(struct grappa_session *sess, const char *want_network) {
@@ -1055,10 +1056,9 @@ static bool ensure_network_connected(struct http_client *hc, const struct config
  * first real `isupport_changed` arrived) — and CHANMODES/PREFIX are
  * only ever right for a bahamut-shaped network to begin with, not a
  * promise for every network an account might have bound. Asserting a
- * value bicchierino has not actually verified for THIS network is
- * exactly the failure mode CLAUDE.md's own "no silent-swallow" spirit
- * warns against, just inverted — a confidently WRONG numeric instead of
- * a missing one. So: only `CHANTYPES=#` here (bicchierino's own
+ * value bicchierino has not actually verified for THIS network is a
+ * confidently WRONG numeric — worse than a missing one, since a client
+ * will act on it. So: only `CHANTYPES=#` here (bicchierino's own
  * decision, not network-sourced — grappa's ISupport struct doesn't even
  * track it) and `CASEMAPPING=ascii` (grappa's own pre-005
  * `Session.Server` fallback, `ISupport.default/0` — NOT corrected by
@@ -1104,8 +1104,8 @@ static void present_channels(int fd, const char *nick, const struct grappa_sessi
 static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
                                 struct grappa_session *sess);
 
-/* Case B's in-band selector, `GRAPPA NETWORK <slug>` — CLAUDE.md §1's
- * "IRC-side admin commands" note, arriving earlier than planned because
+/* Case B's in-band selector, `GRAPPA NETWORK <slug>` — an IRC-side
+ * admin-style command, arriving earlier than planned because
  * a PASS with no (or an unmatched) network name turned out to have a
  * real, recoverable next step instead of just a dead end. Validates
  * against `sess->networks[]`, already fetched once by fetch_networks()
@@ -1194,11 +1194,9 @@ static void send_network_reminder(int fd, const char *nick, const struct grappa_
  * never makes one).
  *
  * Best-effort throughout, matching the existing precedent from the
- * user-topic-only smoke test this replaces: the websocket bridge isn't
- * wired into the IRC client yet (TODO(next): poll()-based dispatch,
- * CLAUDE.md §3), so a failure here is logged, never sent to the IRC
- * client as an ERROR — the client already got its one NOTICE saying the
- * bridge isn't live yet. */
+ * user-topic-only smoke test this replaces: a failure here is logged,
+ * never sent to the IRC client as an ERROR — the client already got
+ * its one NOTICE saying the bridge isn't live yet. */
 
 /* Forward declaration: handle_grappa_event is defined later in this
  * file (it needs the individual event-kind handlers above it), but
@@ -1290,9 +1288,9 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
  * as literal `\x01ACTION ...\x01` bytes in `body` from the IRC client,
  * and `Session.send_privmsg/4` classifies privmsg-vs-action itself from
  * that same framing, so the raw body is passed through unchanged.
- * Best-effort: a failed send is logged, never torn down as a
- * CLAUDE.md §3.3 "lost grappa" case — that rule is for the CONNECTION
- * being unreachable, not one rejected/failed line (rate-limited, empty
+ * Best-effort: a failed send is logged, never torn down as a "lost
+ * grappa" case — that treatment is for the CONNECTION being
+ * unreachable, not one rejected/failed line (rate-limited, empty
  * body, no session, ...), which a real IRC server also wouldn't drop a
  * whole connection over. */
 /* Splits `*cursor` on the next comma, writing the token into `out` and
@@ -3663,10 +3661,11 @@ void *connection_run(void *arg) {
     bool br_connected = false;
 
     /* Two blocking calls, in this one thread, in sequence — the whole
-     * reason connections are threads (CLAUDE.md §3): none of this stalls
-     * any other connection. Each step's own ERROR is already sent to the
-     * client by the function that failed (fetch_networks covers the
-     * zero-networks dead end itself — Case A, no recovery). */
+     * reason connections are threads, not one shared event loop: none
+     * of this stalls any other connection. Each step's own ERROR is
+     * already sent to the client by the function that failed
+     * (fetch_networks covers the zero-networks dead end itself — Case
+     * A, no recovery). */
     if (!attempt_grappa_login(fd, &hc, reg.account, password, cfg, &sess)) goto cleanup;
     if (!fetch_networks(fd, &hc, cfg, &sess)) goto cleanup;
 
@@ -3691,14 +3690,13 @@ void *connection_run(void *arg) {
                 "bicchierino: bootstrap OK: subject=%s network=%s(%ld) joined_channels=%zu\n",
                 sess.subject_name, sess.network_slug, sess.network_id, sess.channel_count);
 
-        /* TODO(next): the join sequence below proves every topic's reply
-         * is "ok" and pushes visibility, but still doesn't consume the
-         * after-join snapshot pushes (query_windows_list, topic_changed,
-         * ...) that arrive as separate frames right after — those stay
-         * buffered in the OS socket until the poll()-on-two-fds
-         * restructure reads them (CLAUDE.md §3). Isolated the same way
-         * the handshake was: a join failing here means the join
-         * sequence is broken, never the handshake. */
+        /* The join sequence below proves every topic's reply is "ok" and
+         * pushes visibility, but doesn't itself consume the after-join
+         * snapshot pushes (query_windows_list, topic_changed, ...) that
+         * arrive as separate frames right after — those stay buffered
+         * in the OS socket until Phase 2's poll()-on-two-fds loop reads
+         * them. Isolated the same way the handshake was: a join failing
+         * here means the join sequence is broken, never the handshake. */
         br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
         if (br_connected) {
             join_grappa_topics(fd, sess.network_nick, &br, &sess);
@@ -3722,8 +3720,8 @@ void *connection_run(void *arg) {
                 sess.subject_name, available);
     }
 
-    /* Phase 2: poll() on both fds for the rest of the connection's life
-     * (CLAUDE.md §3) — the IRC client always, the grappa websocket
+    /* Phase 2: poll() on both fds for the rest of the connection's
+     * life — the IRC client always, the grappa websocket
      * whenever `br_connected` (Case B, network never resolved, never
      * opens one). `pfds[1].fd` is re-armed to -1 the moment br_connected
      * goes false so poll() simply ignores that slot from then on — no
@@ -3739,8 +3737,9 @@ void *connection_run(void *arg) {
      * nothing at all once the join sequence finished unless the IRC
      * client itself triggered a command — a genuinely idle IRC client
      * (connected, not typing) would silently lose the grappa bridge
-     * after a minute, tripping CLAUDE.md §3.3's "lost grappa
-     * connection" teardown for no fault of the user's. Matches
+     * after a minute, tripping the same "lost grappa connection"
+     * teardown used for a genuine network failure, for no fault of the
+     * user's. Matches
      * shottino's own `ws_pump` cadence exactly: a heartbeat every 25s
      * (comfortably inside the 60s window) on topic "phoenix" (never
      * joined — `bridge_push`'s `join_ref == 0` sentinel, WIRE.md/
@@ -3946,9 +3945,9 @@ void *connection_run(void *arg) {
                     continue;
                 }
                 /* WS_CLOSED or WS_ERROR: the bridge is gone mid-session.
-                 * CLAUDE.md §3.3 — same treatment as any other loss of
-                 * grappa: ERROR + close, no retry (the real IRC client
-                 * reconnects on its own). */
+                 * Same treatment as any other loss of grappa: ERROR +
+                 * close, no retry (the real IRC client reconnects on
+                 * its own). */
                 fprintf(stderr, "bicchierino: grappa websocket closed mid-session (result=%d)\n",
                         r);
                 free(payload);
