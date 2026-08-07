@@ -103,6 +103,6 @@ process the way a single-account bouncer front-end would have one.
 
 ## License
 
-The vendored WebSocket/JSON code carries its own MIT license (see
-[`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES)). Licensing for the rest
-of this codebase is not yet finalized.
+MIT — see [`LICENSE`](LICENSE). The vendored WebSocket/JSON code carries
+its own MIT license from its original author; see
+[`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
