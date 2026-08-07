@@ -1256,3 +1256,43 @@ silenzioso.
 `bicchierino-preprod` NON è ancora stato ricompilato/ridistribuito con
 i fix di questa sezione — serve un rebase di `feature/chathistory` su
 `develop` e un redeploy prima che l'utente possa ritestare con irssi.
+
+## 12. `/me` (ACTION) rendeva doppio-framed — trovato dall'utente su irssi reale
+
+L'utente ha riportato, incollando l'output reale di irssi:
+
+```
+18:02  * Hypnotize AACTION accarezza cdcA
+```
+
+invece del normale `* Hypnotize accarezza cdc`. Il pattern "A" prima di
+"ACTION" e "A" alla fine è la firma di un `\x01` (SOH) non riconosciuto
+come framing CTCP e mostrato dal terminale come lettera invertita — un
+DOPPIO framing, non un singolo `\x01` corrotto (se fosse stato un solo
+frame malformato, irssi non avrebbe mai mostrato il prefisso `* Hypnotize`
+che dipende dal riconoscere l'ACTION in primo luogo).
+
+Causa, confermata leggendo `event_router.ex` reale (non indovinata):
+`privmsg_default/3` passa `body` a `build_persist` INVARIATO,
+indipendentemente dal kind — per un `/me`, `body` porta GIÀ il frame CTCP
+grezzo `\x01ACTION testo\x01` (confermato anche da `CTCP.action?/1`, che
+classifica leggendo `<<0x01, "ACTION ", _::binary>>` — cioè opera SUL
+frame ancora presente). bicchierino avvolgeva `body` in un SECONDO
+`\x01ACTION ... \x01`, producendo `\x01ACTION \x01ACTION testo\x01\x01`:
+irssi strippa il frame ESTERNO (da cui il corretto `* Hypnotize`) ma
+mostra alla lettera il frame INTERNO non strippato.
+
+Fix: per `kind=="action"`, `body` va mandato VERBATIM (come già succede
+per `privmsg`/`notice`) — il framing c'è già. Il branch separato
+`if (action) {...} else {...}` collassa in un unico invio (CTCP viaggia
+sempre su PRIVMSG, mai NOTICE, quindi `verb` resta corretto anche per
+action). Per il caso "DM da connessione gemella" (§10, marcatura
+`<nick>`): il marcatore ora va INFILATO dentro il frame, subito dopo
+`"ACTION "`, non davanti a tutta la stringa — altrimenti `\x01` non è
+più il primo byte e nessun client lo riconoscerebbe come CTCP.
+
+Verificato live, byte per byte (non solo a occhio): un ACTION di canale
+normale arriva con esattamente 2 byte `\x01` (uno in apertura, uno in
+chiusura); un ACTION in una DM da gemello arriva con lo stesso conteggio
+E col marcatore `<nick>` correttamente dentro il frame, subito dopo
+`ACTION `.
