@@ -315,8 +315,6 @@ struct registration {
     bool cap_done;
     bool cap_server_time;
     bool cap_message_tags;
-    bool cap_batch;
-    bool cap_chathistory;
 };
 
 struct network_entry {
@@ -353,15 +351,13 @@ struct grappa_session {
     /* Copied from `struct registration`'s own cap_* flags once Phase 1
      * completes — CAP negotiation is a Phase-1-only wire exchange, but
      * what got negotiated needs to outlive it: every later Phase 2 line
-     * this connection sends (message-tags, server-time, batch framing)
-     * has to know whether the client actually asked for that
-     * decoration. `cap_negotiating`/`cap_done` themselves don't need to
-     * survive the copy — they're pure Phase-1 gating state, meaningless
-     * once registration has already completed. */
+     * this connection sends (message-tags/server-time framing) has to
+     * know whether the client actually asked for that decoration.
+     * `cap_negotiating`/`cap_done` themselves don't need to survive the
+     * copy — they're pure Phase-1 gating state, meaningless once
+     * registration has already completed. */
     bool cap_server_time;
     bool cap_message_tags;
-    bool cap_batch;
-    bool cap_chathistory;
 
     /* WS join_refs (WIRE.md §4) — every later push on a topic must carry
      * the join_ref that topic's own phx_join returned, or Phoenix
@@ -480,19 +476,101 @@ struct grappa_session {
     size_t pending_dm_peer_count;
 };
 
+/* Current wall-clock time as unix milliseconds — the fallback
+ * `send_tagged_line` uses when no better (grappa-sourced) timestamp is
+ * available for an event. `CLOCK_REALTIME` (not MONOTONIC): the tag is
+ * meant to be a real wall-clock instant a client can compare against
+ * other timestamps, same reason `server_time` on grappa's own wire is a
+ * real epoch value, not a monotonic counter. */
+static long now_unix_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Unix ms -> IRCv3 `server-time` tag value (`YYYY-MM-DDTHH:MM:SS.sssZ`,
+ * always UTC per the spec). Via `gmtime_r` — POSIX.1-2001, unlike
+ * `timegm()` (a glibc/BSD extension `utc_to_unix`'s own doc, further
+ * down this file, avoids for the same `_POSIX_C_SOURCE=200809L`
+ * reason) — `gmtime_r` has no such issue, it's plain POSIX and does the
+ * inverse of what `utc_to_unix` does by hand. */
+static void format_server_time_tag(long unix_ms, char *out, size_t out_sz) {
+    time_t secs = (time_t)(unix_ms / 1000);
+    long msec = unix_ms % 1000;
+    if (msec < 0) msec += 1000; /* defensive: unix_ms is never negative in practice */
+    struct tm tm_buf;
+    gmtime_r(&secs, &tm_buf);
+    snprintf(out, out_sz, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ", tm_buf.tm_year + 1900,
+             tm_buf.tm_mon + 1, tm_buf.tm_mday, tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msec);
+}
+
+/* IRCv3 `message-tags` + `server-time` — a client that negotiated BOTH
+ * (server-time depends on message-tags for its wire syntax, per the
+ * server-time spec) gets an `@time=...` tag prepended to every line
+ * this is used for; a client that negotiated neither gets the exact
+ * same line `send_line` would have sent. `server_time_ms <= 0` means
+ * "no authoritative timestamp for this event" (a locally-generated
+ * line, not one carrying grappa's own `server_time`) — falls back to
+ * `now_unix_ms()`, matching the spec's own guidance ("if no other time
+ * is available, the server SHOULD use the current time").
+ *
+ * Scope: applied to `handle_grappa_message_event`'s whole kind-switch
+ * (privmsg/notice/action/join/part/quit/nick_change/mode/kick/topic —
+ * every kind sharing grappa's one `Scrollback.Message` wire shape,
+ * confirmed against `Grappa.Scrollback.Wire.to_json/1`: `server_time`
+ * is a non-optional field on EVERY kind, not just privmsg) and to
+ * `handle_grappa_umode_changed_event`'s self-MODE line (a genuine live
+ * event with no persisted timestamp, hence the `now` fallback there).
+ * Deliberately NOT applied to numeric replies (005/332/353/311/...) —
+ * those are direct responses to a client's own command, not
+ * asynchronously relayed events, and real ircds don't server-time-tag
+ * them either. */
+static void send_tagged_line(int fd, const struct grappa_session *sess, long server_time_ms,
+                              const char *fmt, ...) {
+    char body[IRC_LINE_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+
+    if (sess->cap_message_tags && sess->cap_server_time) {
+        char ts[64]; /* "YYYY-MM-DDTHH:MM:SS.sssZ" is 24 bytes + NUL;
+                      * generous past that so gcc's fortify checker can
+                      * prove no truncation even though it can't bound
+                      * tm_year's width statically. */
+        format_server_time_tag(server_time_ms > 0 ? server_time_ms : now_unix_ms(), ts,
+                                sizeof(ts));
+        send_line(fd, "@time=%s %s", ts, body);
+    } else {
+        send_line(fd, "%s", body);
+    }
+}
+
 /* IRCv3 `cap-3.2` — CAP LS/REQ/END/LIST, the gate registration waits on
  * once a client has shown it's IRCv3-aware at all (`struct
- * registration`'s own doc explains the gating rule). bicchierino#2's
- * step 1: this is a prerequisite for message-tags/server-time/batch/
- * draft/chathistory, none of which render anything differently YET —
- * negotiating a capability here only sets a flag that later work reads.
+ * registration`'s own doc explains the gating rule).
  *
- * The advertised set mirrors shottino's own CAP LS list exactly
+ * `batch`/`draft/chathistory` were advertised here through bicchierino#2's
+ * step 1, in prep for CHATHISTORY — DROPPED (bicchierino#3): grappa's
+ * scrollback REST cursor is id-only (`?before=|after=|around=`, always
+ * an integer message id, never a timestamp — confirmed against
+ * `GrappaWeb.MessagesController`), so a `timestamp=` CHATHISTORY
+ * selector (the shape most real clients actually send on reconnect,
+ * per the spec) has no direct REST translation. Advertising
+ * `draft/chathistory` without being able to honor its most common
+ * selector would be the same class of bug as the old guessed-005
+ * issue: asserting something not true. `batch` was ONLY ever justified
+ * as CHATHISTORY's wire carrier (every `draft/chathistory` reply is
+ * batch-wrapped) — with CHATHISTORY gone, batch has no real consumer
+ * here either, so it goes too rather than sitting advertised-but-unused.
+ * `server-time`/`message-tags` remain: both are actually implemented
+ * now (see `send_tagged_line`) — see bicchierino#3 for the CHATHISTORY
+ * write-up and what would need to change on grappa's side to unblock it.
+ *
+ * The advertised set otherwise mirrors shottino's own CAP LS list
  * (`shottino.c:20944-20946`) minus the caps shottino has that
- * bicchierino doesn't implement at all (`multi-prefix`, `echo-message`)
- * — advertising a capability bicchierino can't actually honor would be
- * the same class of bug as the old guessed-005 issue: asserting
- * something not true.
+ * bicchierino doesn't implement at all (`multi-prefix`, `echo-message`).
  *
  * `REQ` is atomic per line, matching common ircd practice: if EVERY
  * token in one REQ is a capability bicchierino recognizes, the whole
@@ -508,8 +586,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
 
     if (strcasecmp(sub, "LS") == 0) {
         reg->cap_negotiating = true;
-        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory",
-                  IRCD_SERVER, target);
+        send_line(fd, ":%s CAP %s LS :server-time message-tags", IRCD_SERVER, target);
         return;
     }
 
@@ -517,10 +594,9 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         reg->cap_negotiating = true;
         char enabled[128] = "";
         size_t len = 0;
-        const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory"};
-        bool flags[] = {reg->cap_server_time, reg->cap_message_tags, reg->cap_batch,
-                        reg->cap_chathistory};
-        for (size_t i = 0; i < 4; i++) {
+        const char *names[] = {"server-time", "message-tags"};
+        bool flags[] = {reg->cap_server_time, reg->cap_message_tags};
+        for (size_t i = 0; i < 2; i++) {
             if (!flags[i]) continue;
             int written =
                 snprintf(enabled + len, sizeof(enabled) - len, "%s%s", len ? " " : "", names[i]);
@@ -534,22 +610,17 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         reg->cap_negotiating = true;
         const char *want = msg->param_count > 1 ? msg->params[1] : "";
         bool all_known = true;
-        bool want_server_time = false, want_message_tags = false, want_batch = false,
-             want_chathistory = false;
+        bool want_server_time = false, want_message_tags = false;
         const char *cursor = want;
         char tok[64];
         while (next_space_token(&cursor, tok, sizeof(tok))) {
             if (strcmp(tok, "server-time") == 0) want_server_time = true;
             else if (strcmp(tok, "message-tags") == 0) want_message_tags = true;
-            else if (strcmp(tok, "batch") == 0) want_batch = true;
-            else if (strcmp(tok, "draft/chathistory") == 0) want_chathistory = true;
             else all_known = false;
         }
         if (all_known) {
             reg->cap_server_time = reg->cap_server_time || want_server_time;
             reg->cap_message_tags = reg->cap_message_tags || want_message_tags;
-            reg->cap_batch = reg->cap_batch || want_batch;
-            reg->cap_chathistory = reg->cap_chathistory || want_chathistory;
             send_line(fd, ":%s CAP %s ACK :%s", IRCD_SERVER, target, want);
         } else {
             send_line(fd, ":%s CAP %s NAK :%s", IRCD_SERVER, target, want);
@@ -2284,6 +2355,18 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
     }
     const json_value *meta = json_get(message, "meta");
 
+    /* `server_time` is a non-optional field on EVERY kind sharing this
+     * one wire shape (`Grappa.Scrollback.Wire.to_json/1`, confirmed
+     * against the real source, not guessed) — 0 here only means THIS
+     * particular payload was malformed/missing it, in which case
+     * `send_tagged_line`'s own `now` fallback (its own doc) kicks in
+     * rather than tagging with a fabricated zero epoch. Presence isn't
+     * otherwise checked (matches this file's own established pattern
+     * for a `json_long_opt` caller that only wants the value, e.g.
+     * `handle_grappa_links_bundle_event`'s `hopcount`). */
+    long server_time_ms = 0;
+    json_long_opt(message, "server_time", &server_time_ms, NULL);
+
     /* Every nick/channel-key identity compare in this codebase mirrors
      * grappa's own rule (its CLAUDE.md: "EVERY server-side nick compare
      * routes through fold... never a bare String.downcase or =="): IRC
@@ -2427,13 +2510,14 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         }
 
         const char *verb = strcmp(kind, "notice") == 0 ? "NOTICE" : "PRIVMSG";
-        send_line(fd, ":%s %s %s :%s", effective_prefix, verb, target, effective_body);
+        send_tagged_line(fd, sess, server_time_ms, ":%s %s %s :%s", effective_prefix, verb, target,
+                          effective_body);
         return;
     }
 
     if (strcmp(kind, "join") == 0) {
         if (is_self) return;
-        send_line(fd, ":%s JOIN :%s", prefix, channel);
+        send_tagged_line(fd, sess, server_time_ms, ":%s JOIN :%s", prefix, channel);
         return;
     }
 
@@ -2442,9 +2526,9 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         const char *reason = NULL;
         json_str_opt(message, "body", &reason);
         if (reason)
-            send_line(fd, ":%s PART %s :%s", prefix, channel, reason);
+            send_tagged_line(fd, sess, server_time_ms, ":%s PART %s :%s", prefix, channel, reason);
         else
-            send_line(fd, ":%s PART %s", prefix, channel);
+            send_tagged_line(fd, sess, server_time_ms, ":%s PART %s", prefix, channel);
         return;
     }
 
@@ -2452,16 +2536,16 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         const char *reason = NULL;
         json_str_opt(message, "body", &reason);
         if (reason)
-            send_line(fd, ":%s QUIT :%s", prefix, reason);
+            send_tagged_line(fd, sess, server_time_ms, ":%s QUIT :%s", prefix, reason);
         else
-            send_line(fd, ":%s QUIT", prefix);
+            send_tagged_line(fd, sess, server_time_ms, ":%s QUIT", prefix);
         return;
     }
 
     if (strcmp(kind, "nick_change") == 0) {
         const char *new_nick = NULL;
         if (!meta || !json_str_req(meta, "new_nick", &new_nick)) return;
-        send_line(fd, ":%s NICK :%s", prefix, new_nick);
+        send_tagged_line(fd, sess, server_time_ms, ":%s NICK :%s", prefix, new_nick);
         /* Our own rename (client-initiated, or from another bouncer
          * front-end sharing this account — cicchetto, shottino). The
          * prefix above correctly names the OLD nick (standard IRC: a
@@ -2522,7 +2606,8 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
             if (written > 0 && (size_t)written < sizeof(argline) - argline_len)
                 argline_len += (size_t)written;
         }
-        send_line(fd, ":%s MODE %s %s%s", prefix, channel, modes, argline);
+        send_tagged_line(fd, sess, server_time_ms, ":%s MODE %s %s%s", prefix, channel, modes,
+                          argline);
         return;
     }
 
@@ -2532,16 +2617,17 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         const char *reason = NULL;
         json_str_opt(message, "body", &reason);
         if (reason)
-            send_line(fd, ":%s KICK %s %s :%s", prefix, channel, target, reason);
+            send_tagged_line(fd, sess, server_time_ms, ":%s KICK %s %s :%s", prefix, channel,
+                              target, reason);
         else
-            send_line(fd, ":%s KICK %s %s", prefix, channel, target);
+            send_tagged_line(fd, sess, server_time_ms, ":%s KICK %s %s", prefix, channel, target);
         return;
     }
 
     if (strcmp(kind, "topic") == 0) {
         const char *text = NULL;
         if (!json_str_req(message, "body", &text)) return;
-        send_line(fd, ":%s TOPIC %s :%s", prefix, channel, text);
+        send_tagged_line(fd, sess, server_time_ms, ":%s TOPIC %s :%s", prefix, channel, text);
         return;
     }
 
@@ -2914,8 +3000,8 @@ static void handle_grappa_join_failed_event(int fd, const char *nick, struct gra
  * real change REMOVED a mode (unrepresentable from a snapshot alone),
  * but never asserts a mode that isn't actually active, matching the
  * same "never send things that are not true" posture as the 005 fix. */
-static void handle_grappa_umode_changed_event(int fd, const char *nick,
-                                               const json_value *payload) {
+static void handle_grappa_umode_changed_event(int fd, const struct grappa_session *sess,
+                                               const char *nick, const json_value *payload) {
     const json_value *modes = json_get(payload, "modes");
     if (!modes || json_type_of(modes) != JSON_ARRAY) return;
 
@@ -2930,7 +3016,10 @@ static void handle_grappa_umode_changed_event(int fd, const char *nick,
     }
     if (!len) return;
 
-    send_line(fd, ":%s!bicchierino@bicchierino MODE %s :+%s", nick, nick, letters);
+    /* No persisted timestamp for this event (unlike
+     * `handle_grappa_message_event`'s kinds) — `send_tagged_line`'s own
+     * `now` fallback (`server_time_ms <= 0`) applies. */
+    send_tagged_line(fd, sess, 0, ":%s!bicchierino@bicchierino MODE %s :+%s", nick, nick, letters);
 }
 
 /* WIRE.md §6: `away_confirmed` payload is `{kind, network, state:
@@ -3454,7 +3543,7 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "banlist_bundle") == 0) {
         handle_grappa_banlist_bundle_event(fd, nick, inner);
     } else if (strcmp(kind, "umode_changed") == 0) {
-        handle_grappa_umode_changed_event(fd, nick, inner);
+        handle_grappa_umode_changed_event(fd, sess, nick, inner);
     } else if (strcmp(kind, "links_bundle") == 0) {
         handle_grappa_links_bundle_event(fd, nick, inner);
     } else if (strcmp(kind, "whowas_bundle") == 0) {
@@ -3556,8 +3645,6 @@ void *connection_run(void *arg) {
      * meaningless once registration has already completed. */
     sess.cap_server_time = reg.cap_server_time;
     sess.cap_message_tags = reg.cap_message_tags;
-    sess.cap_batch = reg.cap_batch;
-    sess.cap_chathistory = reg.cap_chathistory;
 
     /* One persistent HTTP/1.1 connection for every REST call this
      * session makes (login, both bootstrap GETs, every PRIVMSG send,
