@@ -268,19 +268,41 @@ static void send_line(int fd, const char *fmt, ...) {
     (void)unused;
 }
 
+/* IRC's own whitespace-token convention (mirrors `irc_parse_line`'s own
+ * `while (*p == ' ') p++` param-skipping above) — for `CAP REQ`'s
+ * space-separated capability list, not comma-separated like a JOIN
+ * channel list (`next_csv_token`, defined later where its own callers
+ * are). Skips leading spaces so consecutive delimiters don't yield
+ * empty tokens. */
+static bool next_space_token(const char **cursor, char *out, size_t out_sz) {
+    if (!*cursor) return false;
+    while (**cursor == ' ') (*cursor)++;
+    if (!**cursor) return false;
+    const char *space = strchr(*cursor, ' ');
+    size_t len = space ? (size_t)(space - *cursor) : strlen(*cursor);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, *cursor, len);
+    out[len] = '\0';
+    *cursor = space ? space + 1 : *cursor + strlen(*cursor);
+    return true;
+}
+
 /* ── Registration state ───────────────────────────────────────────────
  *
  * Buffered until both NICK and USER arrive, same pattern as shottino's
- * ircd_maybe_register — clients send these in either order. CAP is
- * tolerated (parsed, never errors) but not negotiated: bicchierino does
- * not offer any IRCv3 capabilities yet, so there is nothing to LS/REQ.
+ * ircd_maybe_register — clients send these in either order.
  *
- * TODO: a client that sends `CAP LS` and waits for a reply before `CAP
- * END` may stall here — we never reply to CAP at all yet. Real clients
- * generally time out and proceed, but this is a known gap, not a design
- * decision (CLAUDE.md §1's IRC-side admin commands note is unrelated;
- * this is plain protocol negotiation, worth fixing before this is used
- * with anything other than a client tested to not require it). */
+ * CAP negotiation (IRCv3 `cap-3.2`) is a real gate on registration, not
+ * a side channel: a client that sends `CAP LS` MUST NOT be registered
+ * until it sends `CAP END` (or never — a client that hangs here is a
+ * client bug, not something bicchierino works around), even once
+ * NICK+USER have both arrived. `cap_negotiating` starts false (a
+ * pre-IRCv3 client that never sends CAP at all registers exactly as
+ * before — this is additive, not a behavior change for existing
+ * clients) and flips true on the FIRST `CAP` line of any kind; from
+ * then on registration is gated on `cap_done` too. See
+ * `handle_cap_command`'s own doc for the supported capability set and
+ * REQ/ACK/NAK semantics (bicchierino#2's step 1). */
 struct registration {
     char pass_raw[IRC_LINE_MAX]; /* "network:password" or bare "password" */
     char account[IRC_LINE_MAX];  /* USER's first param */
@@ -288,6 +310,13 @@ struct registration {
     bool got_pass;
     bool got_user;
     bool got_nick;
+
+    bool cap_negotiating;
+    bool cap_done;
+    bool cap_server_time;
+    bool cap_message_tags;
+    bool cap_batch;
+    bool cap_chathistory;
 };
 
 struct network_entry {
@@ -320,6 +349,19 @@ struct grappa_session {
     bool network_resolved;
     char channels[MAX_CHANNELS][128];
     size_t channel_count;
+
+    /* Copied from `struct registration`'s own cap_* flags once Phase 1
+     * completes — CAP negotiation is a Phase-1-only wire exchange, but
+     * what got negotiated needs to outlive it: every later Phase 2 line
+     * this connection sends (message-tags, server-time, batch framing)
+     * has to know whether the client actually asked for that
+     * decoration. `cap_negotiating`/`cap_done` themselves don't need to
+     * survive the copy — they're pure Phase-1 gating state, meaningless
+     * once registration has already completed. */
+    bool cap_server_time;
+    bool cap_message_tags;
+    bool cap_batch;
+    bool cap_chathistory;
 
     /* WS join_refs (WIRE.md §4) — every later push on a topic must carry
      * the join_ref that topic's own phx_join returned, or Phoenix
@@ -438,7 +480,95 @@ struct grappa_session {
     size_t pending_dm_peer_count;
 };
 
-static void handle_registration_message(const struct irc_message *msg, struct registration *reg) {
+/* IRCv3 `cap-3.2` — CAP LS/REQ/END/LIST, the gate registration waits on
+ * once a client has shown it's IRCv3-aware at all (`struct
+ * registration`'s own doc explains the gating rule). bicchierino#2's
+ * step 1: this is a prerequisite for message-tags/server-time/batch/
+ * draft/chathistory, none of which render anything differently YET —
+ * negotiating a capability here only sets a flag that later work reads.
+ *
+ * The advertised set mirrors shottino's own CAP LS list exactly
+ * (`shottino.c:20944-20946`) minus the caps shottino has that
+ * bicchierino doesn't implement at all (`multi-prefix`, `echo-message`)
+ * — advertising a capability bicchierino can't actually honor would be
+ * the same class of bug as the old guessed-005 issue: asserting
+ * something not true.
+ *
+ * `REQ` is atomic per line, matching common ircd practice: if EVERY
+ * token in one REQ is a capability bicchierino recognizes, the whole
+ * line is ACKed and every flag flips on; if ANY token is unrecognized,
+ * the WHOLE line is NAKed and nothing in it takes effect — a client
+ * never ends up in an ambiguous "some of what I asked for" state.
+ * Capability REMOVAL (`CAP REQ :-server-time`) isn't handled — neither
+ * is it in shottino's own reference implementation, and bicchierino has
+ * no post-registration re-negotiation use case to justify it yet. */
+static void handle_cap_command(int fd, struct registration *reg, const struct irc_message *msg) {
+    const char *sub = msg->param_count > 0 ? msg->params[0] : "";
+    const char *target = reg->nick[0] ? reg->nick : "*";
+
+    if (strcasecmp(sub, "LS") == 0) {
+        reg->cap_negotiating = true;
+        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory",
+                  IRCD_SERVER, target);
+        return;
+    }
+
+    if (strcasecmp(sub, "LIST") == 0) {
+        reg->cap_negotiating = true;
+        char enabled[128] = "";
+        size_t len = 0;
+        const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory"};
+        bool flags[] = {reg->cap_server_time, reg->cap_message_tags, reg->cap_batch,
+                        reg->cap_chathistory};
+        for (size_t i = 0; i < 4; i++) {
+            if (!flags[i]) continue;
+            int written =
+                snprintf(enabled + len, sizeof(enabled) - len, "%s%s", len ? " " : "", names[i]);
+            if (written > 0 && (size_t)written < sizeof(enabled) - len) len += (size_t)written;
+        }
+        send_line(fd, ":%s CAP %s LIST :%s", IRCD_SERVER, target, enabled);
+        return;
+    }
+
+    if (strcasecmp(sub, "REQ") == 0) {
+        reg->cap_negotiating = true;
+        const char *want = msg->param_count > 1 ? msg->params[1] : "";
+        bool all_known = true;
+        bool want_server_time = false, want_message_tags = false, want_batch = false,
+             want_chathistory = false;
+        const char *cursor = want;
+        char tok[64];
+        while (next_space_token(&cursor, tok, sizeof(tok))) {
+            if (strcmp(tok, "server-time") == 0) want_server_time = true;
+            else if (strcmp(tok, "message-tags") == 0) want_message_tags = true;
+            else if (strcmp(tok, "batch") == 0) want_batch = true;
+            else if (strcmp(tok, "draft/chathistory") == 0) want_chathistory = true;
+            else all_known = false;
+        }
+        if (all_known) {
+            reg->cap_server_time = reg->cap_server_time || want_server_time;
+            reg->cap_message_tags = reg->cap_message_tags || want_message_tags;
+            reg->cap_batch = reg->cap_batch || want_batch;
+            reg->cap_chathistory = reg->cap_chathistory || want_chathistory;
+            send_line(fd, ":%s CAP %s ACK :%s", IRCD_SERVER, target, want);
+        } else {
+            send_line(fd, ":%s CAP %s NAK :%s", IRCD_SERVER, target, want);
+        }
+        return;
+    }
+
+    if (strcasecmp(sub, "END") == 0) {
+        reg->cap_done = true;
+        return;
+    }
+
+    /* Unrecognized subcommand: ignored, not errored — the same
+     * additive-only posture this codebase already follows for grappa's
+     * own wire (WIRE.md) applies to a client's CAP traffic too. */
+}
+
+static void handle_registration_message(int fd, const struct irc_message *msg,
+                                         struct registration *reg) {
     if (strcmp(msg->command, "PASS") == 0) {
         if (msg->param_count >= 1) {
             snprintf(reg->pass_raw, sizeof(reg->pass_raw), "%s", msg->params[0]);
@@ -454,9 +584,11 @@ static void handle_registration_message(const struct irc_message *msg, struct re
             snprintf(reg->account, sizeof(reg->account), "%s", msg->params[0]);
             reg->got_user = true;
         }
+    } else if (strcmp(msg->command, "CAP") == 0) {
+        handle_cap_command(fd, reg, msg);
     }
-    /* CAP, PING, and anything else pre-registration: silently tolerated.
-     * A real client sends little else before NICK/USER. */
+    /* PING and anything else pre-registration: silently tolerated. A
+     * real client sends little else before NICK/USER. */
 }
 
 /* Splits "network:password" on the first ':'. No colon → network is
@@ -3366,7 +3498,13 @@ void *connection_run(void *arg) {
     struct registration reg = {0};
     char line[IRC_LINE_MAX];
 
-    /* Phase 1: IRC registration (PASS/NICK/USER) — unchanged. */
+    /* Phase 1: IRC registration (PASS/NICK/USER), plus CAP negotiation
+     * if the client engages in any (`struct registration`'s own doc) —
+     * NICK+USER alone are no longer sufficient once a client has shown
+     * itself IRCv3-aware; it must also send `CAP END` before
+     * registration completes. A pre-IRCv3 client that never sends CAP
+     * at all is unaffected — `cap_negotiating` stays false and this
+     * degrades to exactly the old condition. */
     bool registered = false;
     for (;;) {
         int r = next_line(fd, &lb, line, sizeof(line));
@@ -3375,8 +3513,8 @@ void *connection_run(void *arg) {
         struct irc_message msg;
         if (!irc_parse_line(line, &msg)) continue;
 
-        handle_registration_message(&msg, &reg);
-        if (reg.got_nick && reg.got_user) {
+        handle_registration_message(fd, &msg, &reg);
+        if (reg.got_nick && reg.got_user && (!reg.cap_negotiating || reg.cap_done)) {
             registered = true;
             break;
         }
@@ -3409,6 +3547,17 @@ void *connection_run(void *arg) {
      * itself up on a bounded timescale, which is a far smaller cost than
      * taking down every sibling connection on every QUIT. */
     struct grappa_session sess = {0};
+
+    /* Carries whatever Phase 1's CAP negotiation actually settled on
+     * into Phase 2, where it outlives `reg` (stack-local to this
+     * function either way, but conceptually `reg` is Phase-1-only
+     * scratch — see `struct registration`'s own doc). `cap_negotiating`/
+     * `cap_done` themselves don't need to survive: pure gating state,
+     * meaningless once registration has already completed. */
+    sess.cap_server_time = reg.cap_server_time;
+    sess.cap_message_tags = reg.cap_message_tags;
+    sess.cap_batch = reg.cap_batch;
+    sess.cap_chathistory = reg.cap_chathistory;
 
     /* One persistent HTTP/1.1 connection for every REST call this
      * session makes (login, both bootstrap GETs, every PRIVMSG send,

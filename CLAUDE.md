@@ -1256,7 +1256,6 @@ silenzioso.
 `bicchierino-preprod` NON è ancora stato ricompilato/ridistribuito con
 i fix di questa sezione — serve un rebase di `feature/chathistory` su
 `develop` e un redeploy prima che l'utente possa ritestare con irssi.
-
 ## 12. `/me` (ACTION) rendeva doppio-framed — trovato dall'utente su irssi reale
 
 L'utente ha riportato, incollando l'output reale di irssi:
@@ -1296,3 +1295,49 @@ normale arriva con esattamente 2 byte `\x01` (uno in apertura, uno in
 chiusura); un ACTION in una DM da gemello arriva con lo stesso conteggio
 E col marcatore `<nick>` correttamente dentro il frame, subito dopo
 `ACTION `.
+## 13. IRCv3 CHATHISTORY — bicchierino#2, in corso su `feature/chathistory`
+
+Piano completo, analisi di grappa/cicchetto/shottino e verdetto
+("sì, pulito") nell'issue GitLab #2. Riferimenti primari: la vera
+implementazione FUNZIONANTE di `draft/chathistory` di shottino
+(`frontends/shottino/shottino.c:20394-20786`, `ircd.c:190-289`) e il
+contratto REST reale di grappa (`GrappaWeb.MessagesController`,
+`?before=|after=|around=&limit=`, cursore SEMPRE l'id intero del
+messaggio, mai un timestamp). Ordine di build a 5 step: CAP → message-
+tags → server-time → batch → `draft/chathistory` stesso. Bicchierino è
+STATELESS per connessione (nessun ring locale come shottino), quindi
+può saltare l'intero design "ring poi archivio" a due livelli di
+shottino — ogni richiesta CHATHISTORY va dritta al REST di grappa,
+sempre. Problema aperto, non risolto nemmeno da shottino: i selettori
+`timestamp=` non hanno un cursore REST diretto (solo id) — rimandato,
+si parte da `msgid=`/`*`.
+
+**Step 1, CAP negotiation (`cap-3.2`): fatto, provato live, tre
+scenari.** `struct registration` guadagna `cap_negotiating`/`cap_done`
++ un flag per capability (`cap_server_time`, `cap_message_tags`,
+`cap_batch`, `cap_chathistory`) — copiati su `sess` una volta che Phase
+1 finisce, così sopravvivono per il resto della connessione (nessuno di
+essi cambia ANCORA il rendering di una riga — sono letti dai prossimi
+step, non da questo). Set advertito identico a quello di shottino
+(`server-time message-tags batch draft/chathistory`) MENO le capability
+che shottino ha e bicchierino non implementa affatto
+(`multi-prefix`/`echo-message` — stessa disciplina "mai asserire
+qualcosa non vero" del fix al 005). `REQ` è atomico per riga (prassi
+ircd comune): se OGNI token è riconosciuto, ACK e tutti i flag si
+attivano; se ANCHE UNO non è riconosciuto, NAK dell'INTERA riga, nessun
+flag cambia — mai uno stato ambiguo "parte di quello che ho chiesto".
+Il gate di registrazione cambia da `got_nick && got_user` a `got_nick
+&& got_user && (!cap_negotiating || cap_done)` — un client pre-IRCv3
+che non manda mai CAP non vede alcun cambiamento (`cap_negotiating`
+resta false, degrada esattamente alla condizione vecchia). **Provato
+live, tre scenari**: (1) client senza CAP affatto → registrazione
+identica a prima, nessuna regressione; (2) `CAP LS` → `CAP REQ` (tutte
+note) → ACK → `CAP LIST` → mostra le cap attive → `CAP END` →
+registrazione vera completa contro grappa reale; (3) `CAP REQ` con UNA
+cap sconosciuta mischiata a caps note → NAK dell'intera riga, atomico,
+confermato; (4) `CAP LS` mandato ma `CAP END` MAI mandato → nessun 001,
+connessione resta bloccata in attesa — provato con un client che si
+disconnette senza mai completare, nessuna registrazione mai avvenuta.
+
+**Prossimo passo**: step 2 (message-tags) — il carrier per i tag
+`msgid`/`batch` che gli step successivi useranno.
