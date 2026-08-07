@@ -6,12 +6,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strncasecmp — HTTP header names are case-insensitive */
 #include <sys/socket.h>
 #include <unistd.h>
 
 #define GRAPPA_URL_PREFIX "https://"
 #define HTTP_READ_CHUNK 4096
 #define HTTP_REQUEST_MAX 8192
+#define HTTP_HEADER_MAX 8192 /* grappa's own response headers are a few
+                               * hundred bytes at most; generous bound,
+                               * not a real limit */
 #define HTTP_MAX_RESPONSE (4 * 1024 * 1024) /* any of bicchierino's own
                                               * responses are a few KB at
                                               * most; this is a
@@ -166,131 +170,185 @@ static bool parse_status_line(const char *response, int *status) {
     return *status >= 100 && *status < 600;
 }
 
-/* The shared mechanics: connect, TLS handshake (verified — both chain of
- * trust and hostname, ARCHITECTURE.md's "OpenSSL, two distinct roles",
- * this is the client role), send a fully-formed request, read until the
- * peer closes (every request here sends Connection: close, so this is
- * always correct — no Content-Length/chunked parsing needed on our own
- * traffic, and grappa's JSON responses are fully-buffered non-streamed
- * bodies, so the assumption holds there too — see WIRE.md §2.5), split
- * headers from body, parse the status line. One exchange per call, no
- * connection reuse — matches WIRE.md §2.5's "no repeated HTTP traffic to
- * optimize" finding exactly. */
-static bool https_exchange(const struct parsed_url *pu, const char *request, size_t request_len,
-                            struct http_response *out) {
-    SSL_CTX *ctx;
-    SSL *ssl;
-    int fd;
-    if (!tls_connect(pu, &ctx, &ssl, &fd)) return false;
+void http_client_init(struct http_client *hc) { memset(hc, 0, sizeof(*hc)); }
 
-    bool ok = true;
-    struct growbuf response = {0};
+static void http_client_disconnect(struct http_client *hc) {
+    if (!hc->connected) return;
+    SSL_shutdown(hc->ssl);
+    SSL_free(hc->ssl);
+    SSL_CTX_free(hc->ctx);
+    close(hc->fd);
+    hc->ssl = NULL;
+    hc->ctx = NULL;
+    hc->fd = -1;
+    hc->connected = false;
+}
 
-    if (ok && SSL_write(ssl, request, (int)request_len) <= 0) ok = false;
+void http_client_close(struct http_client *hc) { http_client_disconnect(hc); }
 
-    if (ok) {
-        char chunk[HTTP_READ_CHUNK];
-        for (;;) {
-            int n = SSL_read(ssl, chunk, sizeof(chunk));
-            if (n <= 0) break; /* clean close (Connection: close) or error;
-                                 * either way, response is done or unusable */
-            if (!growbuf_append(&response, chunk, (size_t)n)) {
-                ok = false;
-                break;
-            }
-        }
-    }
-
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    SSL_CTX_free(ctx);
-    close(fd);
-
-    if (!ok || response.len == 0 || !growbuf_append(&response, "", 1)) {
-        free(response.data);
-        return false;
-    }
-
-    char *sep = strstr(response.data, "\r\n\r\n");
-    if (!sep || !parse_status_line(response.data, &out->status)) {
-        free(response.data);
-        return false;
-    }
-
-    const char *body_start = sep + 4;
-    size_t body_len = response.len - 1 - (size_t)(body_start - response.data);
-    out->body = malloc(body_len + 1);
-    if (!out->body) {
-        free(response.data);
-        return false;
-    }
-    memcpy(out->body, body_start, body_len);
-    out->body[body_len] = '\0';
-    out->body_len = body_len;
-
-    free(response.data);
+static bool http_client_connect(struct http_client *hc, const char *grappa_url) {
+    if (hc->connected) return true;
+    struct parsed_url pu;
+    if (!parse_grappa_url(grappa_url, &pu)) return false;
+    snprintf(hc->host, sizeof(hc->host), "%s", pu.host);
+    if (!tls_connect(&pu, &hc->ctx, &hc->ssl, &hc->fd)) return false;
+    hc->connected = true;
+    /* One line per ACTUAL new TCP+TLS handshake — the whole point of
+     * this file is that this should fire once per connection's life,
+     * not once per REST call. Cheap ops signal for exactly that. */
+    fprintf(stderr, "bicchierino: http: new keep-alive connection to %s\n", hc->host);
     return true;
 }
 
-bool https_post_login(const char *grappa_url, const char *json_body, struct http_response *out) {
-    memset(out, 0, sizeof(*out));
-
-    struct parsed_url pu;
-    if (!parse_grappa_url(grappa_url, &pu)) return false;
-
-    char request[HTTP_REQUEST_MAX];
-    int req_len = snprintf(request, sizeof(request),
-                            "POST /auth/login HTTP/1.1\r\n"
-                            "Host: %s\r\n"
-                            "Content-Type: application/json\r\n"
-                            "Content-Length: %zu\r\n"
-                            "Connection: close\r\n"
-                            "\r\n"
-                            "%s",
-                            pu.host, strlen(json_body), json_body);
-    if (req_len < 0 || (size_t)req_len >= sizeof(request)) return false;
-
-    return https_exchange(&pu, request, (size_t)req_len, out);
+/* Case-insensitive header lookup within the raw, not-yet-split header
+ * block (`headers[0..header_len)`, no NUL assumed past it). HTTP header
+ * names are case-insensitive by spec; grappa's own server may spell it
+ * either way depending on framework version. */
+static bool find_content_length(const char *headers, size_t header_len, long *out) {
+    static const char needle[] = "Content-Length:";
+    size_t needle_len = sizeof(needle) - 1;
+    const char *pos = headers;
+    const char *end = headers + header_len;
+    while (pos < end) {
+        if ((size_t)(end - pos) >= needle_len && strncasecmp(pos, needle, needle_len) == 0) {
+            const char *val = pos + needle_len;
+            while (val < end && *val == ' ') val++;
+            *out = atol(val);
+            return true;
+        }
+        const char *nl = memchr(pos, '\n', (size_t)(end - pos));
+        if (!nl) break;
+        pos = nl + 1;
+    }
+    return false;
 }
 
-bool https_get_bearer(const char *grappa_url, const char *path, const char *bearer_token,
-                       struct http_response *out) {
-    memset(out, 0, sizeof(*out));
+/* One request/response over an already-connected `hc` — no reconnect
+ * logic here, that's http_client_request()'s job. Reads the header
+ * block bounded (same read-until-terminator shape as ws_client.c's
+ * handshake reader — headers are always small and arrive in one or two
+ * TCP segments), then reads exactly Content-Length body bytes: unlike
+ * the old one-shot-connection model, this can NOT just "read until the
+ * peer closes" — the whole point is that the peer does NOT close, the
+ * connection outlives this one exchange. A 204 (DELETE /auth/logout)
+ * is the one case allowed an absent Content-Length — RFC 7230 says a
+ * 204 carries no body regardless. Any other status without
+ * Content-Length is a hard failure: grappa's JSON responses are always
+ * fully-buffered, so a real one always sets it, and a persistent
+ * connection can't safely guess. */
+static bool http_client_exchange_once(struct http_client *hc, const char *request,
+                                       size_t request_len, struct http_response *out) {
+    if (SSL_write(hc->ssl, request, (int)request_len) <= 0) return false;
 
-    struct parsed_url pu;
-    if (!parse_grappa_url(grappa_url, &pu)) return false;
+    char header_buf[HTTP_HEADER_MAX];
+    size_t header_len = 0;
+    const char *sep = NULL;
+    for (;;) {
+        if (header_len >= sizeof(header_buf) - 1) return false;
+        int n = SSL_read(hc->ssl, header_buf + header_len,
+                          (int)(sizeof(header_buf) - 1 - header_len));
+        if (n <= 0) return false;
+        header_len += (size_t)n;
+        header_buf[header_len] = '\0';
+        sep = strstr(header_buf, "\r\n\r\n");
+        if (sep) break;
+    }
+    size_t headers_end = (size_t)(sep - header_buf) + 4;
 
-    char request[HTTP_REQUEST_MAX];
-    int req_len = snprintf(request, sizeof(request),
-                            "GET %s HTTP/1.1\r\n"
-                            "Host: %s\r\n"
-                            "Authorization: Bearer %s\r\n"
-                            "Connection: close\r\n"
-                            "\r\n",
-                            path, pu.host, bearer_token);
-    if (req_len < 0 || (size_t)req_len >= sizeof(request)) return false;
+    int status;
+    if (!parse_status_line(header_buf, &status)) return false;
 
-    return https_exchange(&pu, request, (size_t)req_len, out);
+    long content_length = 0;
+    bool have_cl = find_content_length(header_buf, headers_end, &content_length);
+    if (!have_cl) {
+        if (status != 204) return false;
+    } else if (content_length < 0) {
+        return false;
+    }
+
+    /* Body: whatever came bundled past the header terminator in the
+     * SAME reads (TCP/TLS records don't respect our header/body split
+     * any more than they respect message boundaries elsewhere in this
+     * codebase), plus more SSL_read calls until content_length bytes
+     * are in hand. */
+    struct growbuf body = {0};
+    size_t already = header_len - headers_end;
+    if (already > 0 && !growbuf_append(&body, header_buf + headers_end, already)) return false;
+    while (body.len < (size_t)content_length) {
+        char chunk[HTTP_READ_CHUNK];
+        size_t want = (size_t)content_length - body.len;
+        int n = SSL_read(hc->ssl, chunk, (int)(want < sizeof(chunk) ? want : sizeof(chunk)));
+        if (n <= 0) {
+            free(body.data);
+            return false;
+        }
+        if (!growbuf_append(&body, chunk, (size_t)n)) {
+            free(body.data);
+            return false;
+        }
+    }
+
+    out->status = status;
+    out->body = malloc(body.len + 1);
+    if (!out->body) {
+        free(body.data);
+        return false;
+    }
+    memcpy(out->body, body.data, body.len);
+    out->body[body.len] = '\0';
+    out->body_len = body.len;
+    free(body.data);
+    return true;
 }
 
-bool https_delete_bearer(const char *grappa_url, const char *path, const char *bearer_token,
+bool http_client_request(struct http_client *hc, const char *grappa_url, const char *method,
+                          const char *path, const char *bearer_token, const char *json_body,
                           struct http_response *out) {
     memset(out, 0, sizeof(*out));
 
     struct parsed_url pu;
     if (!parse_grappa_url(grappa_url, &pu)) return false;
 
+    /* No `Connection: close` — the entire point of this file is that
+     * the connection is NOT torn down after one exchange. HTTP/1.1
+     * defaults to keep-alive; omitting the header is enough. */
     char request[HTTP_REQUEST_MAX];
-    int req_len = snprintf(request, sizeof(request),
-                            "DELETE %s HTTP/1.1\r\n"
+    int req_len;
+    if (json_body) {
+        req_len = snprintf(request, sizeof(request),
+                            "%s %s HTTP/1.1\r\n"
                             "Host: %s\r\n"
-                            "Authorization: Bearer %s\r\n"
-                            "Connection: close\r\n"
+                            "%s%s%s"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: %zu\r\n"
+                            "\r\n"
+                            "%s",
+                            method, path, pu.host, bearer_token ? "Authorization: Bearer " : "",
+                            bearer_token ? bearer_token : "", bearer_token ? "\r\n" : "",
+                            strlen(json_body), json_body);
+    } else {
+        req_len = snprintf(request, sizeof(request),
+                            "%s %s HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "%s%s%s"
                             "\r\n",
-                            path, pu.host, bearer_token);
+                            method, path, pu.host, bearer_token ? "Authorization: Bearer " : "",
+                            bearer_token ? bearer_token : "", bearer_token ? "\r\n" : "");
+    }
     if (req_len < 0 || (size_t)req_len >= sizeof(request)) return false;
 
-    return https_exchange(&pu, request, (size_t)req_len, out);
+    if (!http_client_connect(hc, grappa_url)) return false;
+
+    if (http_client_exchange_once(hc, request, (size_t)req_len, out)) return true;
+
+    /* The pooled connection may simply have gone stale — a server-side
+     * keep-alive idle timeout racing with reuse is routine for
+     * HTTP/1.1, not a hostile-input case. Reconnect fresh and retry
+     * exactly once before reporting grappa unreachable. */
+    http_client_disconnect(hc);
+    http_response_free(out);
+    if (!http_client_connect(hc, grappa_url)) return false;
+    return http_client_exchange_once(hc, request, (size_t)req_len, out);
 }
 
 void http_response_free(struct http_response *resp) {

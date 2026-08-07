@@ -1,13 +1,19 @@
-/* http.h — the small, fixed set of HTTPS calls bicchierino ever makes:
- * login, the bootstrap discovery GETs (WIRE.md §1.5), and logout.
+/* http.h — one persistent HTTP/1.1 (keep-alive) client per bicchierino
+ * connection, reused for every REST call grappa needs: login, the
+ * bootstrap discovery GETs (WIRE.md §1.5), sending a PRIVMSG (WIRE.md
+ * §2.5's corrected text — this is REST, not a websocket push), and the
+ * final logout DELETE.
  *
- * Not a general HTTP client. WIRE.md §2.5: once bootstrap is done, a
- * session never makes another HTTP request — everything else is a push
- * on the already-open websocket. Every call here is blocking, one-shot,
- * no connection reuse between them — that's fine precisely because none
- * of this repeats within a session (CLAUDE.md §3: it's also why
- * connections are threads, not multiplexed on one poll() loop — a
- * blocking call here only ever stalls its own connection).
+ * NOT one-shot-connection-per-call (an earlier version of this file was)
+ * — flagged live as a real cost: a fresh TCP+TLS handshake per outbound
+ * chat line is 2-3 network round trips paid on every single PRIVMSG,
+ * the one REST call that happens far more than once per connection.
+ * cicchetto (the browser client) never pays this because the browser's
+ * own HTTP stack keeps the connection open across requests by default —
+ * this is bicchierino doing the same thing explicitly, since nothing
+ * does it for a hand-rolled C client. One `struct http_client` opened
+ * lazily on first use and kept alive for the whole IRC connection's
+ * life, torn down only at final cleanup.
  */
 #ifndef BICCHIERINO_HTTP_H
 #define BICCHIERINO_HTTP_H
@@ -22,47 +28,51 @@ struct http_response {
     size_t body_len;
 };
 
-/* Blocking HTTPS POST of `json_body` to `<grappa_url>/auth/login`.
- * `grappa_url` must start with "https://" — TLS to grappa is mandatory,
- * never optional (ARCHITECTURE.md's "OpenSSL, two distinct roles").
+struct http_client {
+    SSL_CTX *ctx;
+    SSL *ssl;
+    int fd;
+    bool connected;
+    char host[256];
+};
+
+/* Zeroes `hc` — not yet connected. Connecting is lazy, on the first
+ * http_client_request() call, same as every other "open on first use"
+ * resource in this codebase (config validated once, connected once). */
+void http_client_init(struct http_client *hc);
+
+/* Sends one request over `hc`'s persistent connection — reconnects
+ * (once, transparently) if not yet connected, or if the pooled
+ * connection turned out stale (a server-side keep-alive idle timeout
+ * racing with reuse is routine for HTTP/1.1, not a hostile-input case:
+ * every real keep-alive client retries exactly like this). `method` is
+ * a literal like `"GET"`/`"POST"`/`"DELETE"`. `bearer_token` and
+ * `json_body` may be NULL — no `Authorization` header / no body,
+ * respectively (the one bearer-less call is `/auth/login` itself).
  *
- * Returns true when an HTTP exchange actually completed — the caller
- * checks `out->status`, 401 is a normal, expected outcome here, not a
- * transport failure. Returns false only when grappa could not be reached
- * at all (DNS, connect, TLS handshake, malformed response) — this is
- * CLAUDE.md §3.3's "grappa not reachable" case, not a credentials one. */
-bool https_post_login(const char *grappa_url, const char *json_body, struct http_response *out);
-
-/* Blocking authenticated HTTPS GET of `<grappa_url><path>`, bearer auth.
- * Same return-value contract as https_post_login. Used for the
- * post-login bootstrap discovery calls (WIRE.md §1.5): GET /networks and
- * GET /networks/:slug/channels — both blocking, both one-shot, no
- * connection reuse between them (WIRE.md §2.5: nothing here is frequent
- * enough to need it). */
-bool https_get_bearer(const char *grappa_url, const char *path, const char *bearer_token,
-                       struct http_response *out);
-
-/* Blocking authenticated HTTPS DELETE of `<grappa_url><path>`, bearer
- * auth. Same return-value contract as https_post_login. Used for
- * `DELETE /auth/logout` when the downstream client goes away — revokes
- * bicchierino's own token. Confirmed safe for a registered-user session
- * (WIRE.md, auth_controller.ex's own #126 comment): this detaches, it
- * does NOT tear down the real upstream IRC connection — that lives in
- * grappa's own Session.Server, keyed by (user, network), independent of
- * any WS client. Best-effort by the caller: nothing meaningful to do if
- * this fails, the connection is already tearing down either way. */
-bool https_delete_bearer(const char *grappa_url, const char *path, const char *bearer_token,
+ * Same return-value contract every call in this codebase already used:
+ * true when an HTTP exchange actually completed (the caller checks
+ * `out->status` — 401/404/429/etc. are normal outcomes here, not
+ * transport failures); false only when grappa could not be reached at
+ * all even after the one retry — CLAUDE.md §3.3's "grappa not
+ * reachable" case. */
+bool http_client_request(struct http_client *hc, const char *grappa_url, const char *method,
+                          const char *path, const char *bearer_token, const char *json_body,
                           struct http_response *out);
 
-/* Opens a verified TLS connection (same posture as every call above —
- * chain of trust + hostname, never skipped) to `<grappa_url>`'s host:port
- * and leaves it OPEN — unlike every function above, which owns the whole
- * request/response exchange and tears the connection down before
- * returning. For ws_client.c: the websocket connection is persistent
- * (WIRE.md §2), so it needs the TLS setup without the one-shot
- * request/close lifecycle. Caller owns *ssl_out, *ctx_out and *fd_out,
- * and must tear down all three (SSL_shutdown, SSL_free, SSL_CTX_free,
- * close) when done.
+/* Tears down the persistent connection — call once, at the IRC
+ * connection's own teardown (`cleanup:`), not between individual REST
+ * calls (that would defeat the entire point of this file). */
+void http_client_close(struct http_client *hc);
+
+/* Opens a verified TLS connection (same posture as every REST call
+ * above — chain of trust + hostname, never skipped) to `<grappa_url>`'s
+ * host:port and leaves it OPEN — for ws_client.c: the websocket
+ * connection is persistent too (WIRE.md §2), but speaks WS framing, not
+ * HTTP/1.1 keep-alive, so it needs the bare TLS setup, not
+ * http_client_request's request/response machinery. Caller owns
+ * *ssl_out, *ctx_out and *fd_out, and must tear down all three
+ * (SSL_shutdown, SSL_free, SSL_CTX_free, close) when done.
  *
  * `host_out` receives the parsed hostname (NUL-terminated, truncated to
  * `host_out_sz` in the pathological case) — a caller building its own

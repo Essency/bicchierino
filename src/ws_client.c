@@ -124,8 +124,14 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
 
     if (ok) {
         char request[WS_HANDSHAKE_MAX];
+        /* vsn=2.0.0 selects Phoenix's V2 serializer (the 5-element
+         * [join_ref, ref, topic, event, payload] array this client
+         * speaks). Omitting it defaults to V1, which expects a JSON
+         * object instead and crashes the channel process on our first
+         * frame — confirmed against a live server-side stack trace,
+         * not guessed. Same query param shottino sends. */
         int req_len = snprintf(request, sizeof(request),
-                                "GET /socket/websocket HTTP/1.1\r\n"
+                                "GET /socket/websocket?vsn=2.0.0 HTTP/1.1\r\n"
                                 "Host: %s\r\n"
                                 "Upgrade: websocket\r\n"
                                 "Connection: Upgrade\r\n"
@@ -193,12 +199,16 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
     return true;
 }
 
-bool ws_client_send_text(struct ws_client *wsc, const char *text) {
-    size_t len = strlen(text);
-
+/* RFC 6455 §5.3: every client-to-server frame MUST be masked — this is
+ * the one thing ws.c (receive-side, server frames are never masked)
+ * never had to do, so it's the one thing bicchierino writes itself
+ * rather than reusing the vendored code for. Shared by every outbound
+ * frame kind (text, pong, ...) — only the opcode byte differs. */
+static bool send_masked_frame(struct ws_client *wsc, unsigned char opcode, const void *payload,
+                               size_t len) {
     unsigned char header[14];
     size_t header_len = 0;
-    header[header_len++] = 0x81; /* FIN=1, opcode=0x1 (text) */
+    header[header_len++] = (unsigned char)(0x80 | opcode); /* FIN=1 */
 
     const unsigned char mask_bit = 0x80;
     if (len < 126) {
@@ -220,17 +230,28 @@ bool ws_client_send_text(struct ws_client *wsc, const char *text) {
 
     if (SSL_write(wsc->ssl, header, (int)header_len) <= 0) return false;
 
-    /* RFC 6455 §5.3: every client-to-server frame MUST be masked —
-     * this is the one thing ws.c (receive-side, server frames are never
-     * masked) never had to do, so it's the one thing bicchierino writes
-     * itself rather than reusing the vendored code for. */
     unsigned char *masked = malloc(len);
     if (!masked) return false;
-    for (size_t i = 0; i < len; i++)
-        masked[i] = ((unsigned char)text[i]) ^ mask_key[i % sizeof(mask_key)];
+    const unsigned char *src = payload;
+    for (size_t i = 0; i < len; i++) masked[i] = src[i] ^ mask_key[i % sizeof(mask_key)];
     bool ok = len == 0 || SSL_write(wsc->ssl, masked, (int)len) > 0;
     free(masked);
     return ok;
+}
+
+bool ws_client_send_text(struct ws_client *wsc, const char *text) {
+    return send_masked_frame(wsc, 0x1, text, strlen(text));
+}
+
+/* RFC 6455 §5.5.2: a PONG MUST carry the identical application data the
+ * PING carried, byte for byte — not re-derived, not re-encoded, the
+ * exact same bytes echoed back. Every control frame (ping/pong) is
+ * capped at 125 bytes payload by the RFC itself (§5.5) and MUST NOT be
+ * fragmented, so this never needs the extended-length header forms
+ * `send_masked_frame` still defensively handles for the text-frame
+ * case — opcode 0xA, otherwise identical masking mechanics. */
+bool ws_client_send_pong(struct ws_client *wsc, const char *payload, size_t len) {
+    return send_masked_frame(wsc, 0xA, payload, len);
 }
 
 ws_result ws_client_recv(struct ws_client *wsc, char **payload, size_t *len) {
@@ -239,8 +260,7 @@ ws_result ws_client_recv(struct ws_client *wsc, char **payload, size_t *len) {
 
     unsigned char chunk[4096];
     int n = SSL_read(wsc->ssl, chunk, sizeof(chunk));
-    if (n == 0) return WS_CLOSED;
-    if (n < 0) return WS_ERROR;
+    if (n <= 0) return n == 0 ? WS_CLOSED : WS_ERROR;
     if (!ws_reader_feed(&wsc->reader, chunk, (size_t)n)) return WS_ERROR;
 
     return ws_reader_take(&wsc->reader, payload, len);
