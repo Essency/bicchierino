@@ -25,6 +25,9 @@
                            * its reference point; this is a hostile-
                            * response backstop, not a real ceiling */
 #define MAX_NETWORKS 64  /* generous — real accounts bind a handful */
+#define MAX_DM_PEERS 64  /* one per person ever DMed on this network — same
+                           * "hostile-response backstop, not a real ceiling"
+                           * posture as MAX_CHANNELS */
 #define IRCD_SERVER "bicchierino"
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
@@ -357,6 +360,18 @@ struct grappa_session {
      * there instead. */
     bool dm_needs_rejoin;
 
+    /* `isupport_changed` pushes once per channel-shaped topic join
+     * (`handle_grappa_isupport_changed_event`'s own doc) — harmless
+     * with 1-2 channels, but the DM-peer-topic fix below made a normal
+     * session join 5-10+ such topics, so a real session started
+     * re-announcing an IDENTICAL 005 that many times in a row (user-
+     * spotted live: "can we stop sending 005 for every open window?").
+     * The content is always the same within one session (one network,
+     * `chanmodes`/`prefix` don't change mid-session in practice), so
+     * sending it once and skipping every later push is correct, not
+     * just quieter. */
+    bool isupport_005_sent;
+
     /* Real bug found live, testing two simultaneous bicchierino
      * connections for the SAME grappa account: the old is_self check
      * (folded sender == own nick) can't tell "this is MY OWN optimistic
@@ -388,6 +403,39 @@ struct grappa_session {
      * fixed-size buffer in this file). */
     long pending_self_msg_ids[16];
     size_t pending_self_msg_count;
+
+    /* Real gap found live (testing a DM to a real user with a second
+     * client listening, right after the multi-client fixes above):
+     * an OUTBOUND DM's message event broadcasts on a topic keyed by the
+     * TARGET's folded nick (`channel:<peer>`), not the sender's own nick
+     * — confirmed against grappa's own source
+     * (`Session.Persistor.persist_and_broadcast/3` derives the topic
+     * from `attrs.channel`, and `handle_persisting_send` in
+     * `session/server.ex` sets `attrs.channel` to the fold of the DM
+     * TARGET for an outbound send). bicchierino used to only join its
+     * own-nick DM-listener topic (incoming DMs re-key `channel` to the
+     * recipient's own nick, server.ex's own comment on
+     * `maybe_open_query_window` confirms this asymmetry) — so no
+     * client, not even the sender, ever saw its own outbound DM
+     * confirmed. Fix: grappa already pushes `query_windows_list` (the
+     * full current DM-window list, one entry per peer ever DMed) on the
+     * user topic, both as the after-join snapshot AND live on every
+     * new window open (#422) — every bicchierino connection already
+     * joins the user topic, so this is free delivery, no extra
+     * subscription needed to LEARN about a new peer. `dm_peer_names`
+     * are the FOLDED target_nick of every peer topic already joined
+     * (parallel `dm_peer_join_refs`); `pending_dm_peer_names` are
+     * newly-seen peers waiting for their `bridge_join` — queued here
+     * instead of joined immediately for the exact same reason as
+     * `dm_needs_rejoin` above: `handle_grappa_query_windows_list_event`
+     * can run NESTED inside another `bridge_join`'s own wait loop
+     * (confirmed live during bootstrap, same hazard), so the actual
+     * join is deferred to the Phase 2 main loop, never nested. */
+    char dm_peer_names[MAX_DM_PEERS][64];
+    unsigned long dm_peer_join_refs[MAX_DM_PEERS];
+    size_t dm_peer_count;
+    char pending_dm_peer_names[MAX_DM_PEERS][64];
+    size_t pending_dm_peer_count;
 };
 
 static void handle_registration_message(const struct irc_message *msg, struct registration *reg) {
@@ -2582,9 +2630,18 @@ static void handle_grappa_members_seeded_event(int fd, const char *nick,
  * against `ISupport.t/0` that only `chanmodes`/`prefix` reach this wire
  * event at all — `casemapping`/`statusmsg` are tracked server-side but
  * never exposed here, so there is nothing live to prefer over the
- * fallback for those three tokens. */
+ * fallback for those three tokens.
+ *
+ * Sent only ONCE per connection (`sess->isupport_005_sent`) — see its
+ * own doc on `struct grappa_session`: with the DM-peer-topic fix a
+ * normal session now joins many more channel-shaped topics, each
+ * pushing this same event, and re-announcing an identical 005 that
+ * many times over is pure noise a real client gains nothing from. */
 static void handle_grappa_isupport_changed_event(int fd, const char *nick,
+                                                   struct grappa_session *sess,
                                                    const json_value *payload) {
+    if (sess->isupport_005_sent) return;
+
     const json_value *groups[4] = {
         json_get(payload, "chanmodes_a"),
         json_get(payload, "chanmodes_b"),
@@ -2645,6 +2702,7 @@ static void handle_grappa_isupport_changed_event(int fd, const char *nick,
               ":%s 005 %s CHANTYPES=# PREFIX=(%s)%s CHANMODES=%s CASEMAPPING=ascii "
               "STATUSMSG=@+ :are supported by this server",
               IRCD_SERVER, nick, letters, sigils, chanmodes);
+    sess->isupport_005_sent = true;
 }
 
 /* WIRE.md §3/§6: `join_failed` payload is `{kind, network, channel,
@@ -2732,6 +2790,51 @@ static void handle_grappa_away_confirmed_event(int fd, const char *nick,
         send_line(fd, ":%s 306 %s :You have been marked as being away", IRCD_SERVER, nick);
     else if (strcmp(state, "present") == 0)
         send_line(fd, ":%s 305 %s :You are no longer marked as being away", IRCD_SERVER, nick);
+}
+
+/* `query_windows_list` payload is `{kind, windows: {network_id =>
+ * [{network_id, target_nick, opened_at}, ...]}}` (`QueryWindows.Wire.
+ * windows_list_payload/1`) — confirmed against the real wire, not
+ * guessed (a raw dump showed `{"windows":{"1":[{"target_nick":"RealUser",
+ * ...}, ...]}}`, keyed by network_id AS A STRING since JSON object keys
+ * are always strings, even though the Elixir side types it as
+ * `integer()`). See `dm_peer_names`'s own doc on `struct grappa_session`
+ * for why bicchierino needs this at all — this only QUEUES newly-seen
+ * peers into `pending_dm_peer_names`; the actual `bridge_join` happens
+ * in the Phase 2 main loop, same deferred pattern as `dm_needs_rejoin`,
+ * for the same nested-bridge_join hazard (this can run nested inside
+ * another `bridge_join`'s wait loop via `bridge_event_dispatch`, e.g.
+ * mid-bootstrap — confirmed live). */
+static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
+                                                     const json_value *payload) {
+    char net_key[32];
+    snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
+    const json_value *windows = json_get(payload, "windows");
+    const json_value *list = json_get(windows, net_key);
+    if (!list || json_type_of(list) != JSON_ARRAY) return;
+
+    for (size_t i = 0; i < json_len(list); i++) {
+        const json_value *entry = json_at(list, i);
+        const char *target_nick = NULL;
+        if (!json_str_req(entry, "target_nick", &target_nick)) continue;
+
+        char folded[64];
+        ascii_fold_lower(target_nick, folded, sizeof(folded));
+
+        bool known = false;
+        for (size_t j = 0; j < sess->dm_peer_count && !known; j++)
+            if (strcmp(sess->dm_peer_names[j], folded) == 0) known = true;
+        for (size_t j = 0; j < sess->pending_dm_peer_count && !known; j++)
+            if (strcmp(sess->pending_dm_peer_names[j], folded) == 0) known = true;
+        if (known) continue;
+
+        if (sess->pending_dm_peer_count >= MAX_DM_PEERS) {
+            fprintf(stderr, "bicchierino: pending DM peer topics full, dropping %s\n", folded);
+            continue;
+        }
+        snprintf(sess->pending_dm_peer_names[sess->pending_dm_peer_count++],
+                 sizeof(sess->pending_dm_peer_names[0]), "%s", folded);
+    }
 }
 
 /* WIRE.md §3/§6: `names_reply` payload is `{kind, network, channel,
@@ -3180,7 +3283,7 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "members_seeded") == 0) {
         handle_grappa_members_seeded_event(fd, nick, inner);
     } else if (strcmp(kind, "isupport_changed") == 0) {
-        handle_grappa_isupport_changed_event(fd, nick, inner);
+        handle_grappa_isupport_changed_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "join_failed") == 0) {
         handle_grappa_join_failed_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "names_reply") == 0) {
@@ -3203,9 +3306,10 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
         handle_grappa_server_reply_event(fd, nick, inner);
     } else if (strcmp(kind, "away_confirmed") == 0) {
         handle_grappa_away_confirmed_event(fd, nick, inner);
+    } else if (strcmp(kind, "query_windows_list") == 0) {
+        handle_grappa_query_windows_list_event(sess, inner);
     } else if (strcmp(kind, "joined") == 0 || strcmp(kind, "channels_changed") == 0 ||
-               strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0 ||
-               strcmp(kind, "query_windows_list") == 0) {
+               strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
     } else {
         fprintf(stderr, "bicchierino: grappa event (not yet handled): kind=%s\n", kind);
@@ -3437,6 +3541,39 @@ void *connection_run(void *arg) {
             else
                 fprintf(stderr, "bicchierino: DM listener rejoin %s failed\n", dm_topic);
             sess.dm_needs_rejoin = false;
+        }
+
+        /* Newly-discovered DM-peer topics, queued by
+         * `handle_grappa_query_windows_list_event` — deferred here for
+         * the same reason as the DM-listener rejoin right above: this
+         * point in the loop is never nested inside another
+         * `bridge_join`'s own wait loop. See `dm_peer_names`'s own doc
+         * on `struct grappa_session`. */
+        if (br_connected && sess.pending_dm_peer_count > 0) {
+            for (size_t i = 0; i < sess.pending_dm_peer_count; i++) {
+                if (sess.dm_peer_count >= MAX_DM_PEERS) {
+                    fprintf(stderr, "bicchierino: DM peer topic slots full, dropping %s\n",
+                            sess.pending_dm_peer_names[i]);
+                    continue;
+                }
+                char dm_peer_topic[512];
+                snprintf(dm_peer_topic, sizeof(dm_peer_topic),
+                         "grappa:user:%s/network:%s/channel:%s", sess.subject_name,
+                         sess.network_slug, sess.pending_dm_peer_names[i]);
+                struct bridge_event_ctx ctx = {fd, sess.network_nick, &br, &sess};
+                unsigned long join_ref = 0;
+                if (bridge_join(&br, dm_peer_topic, &join_ref, bridge_event_dispatch, &ctx)) {
+                    snprintf(sess.dm_peer_names[sess.dm_peer_count],
+                             sizeof(sess.dm_peer_names[0]), "%s", sess.pending_dm_peer_names[i]);
+                    sess.dm_peer_join_refs[sess.dm_peer_count] = join_ref;
+                    sess.dm_peer_count++;
+                    fprintf(stderr, "bicchierino: joined DM peer topic %s (join_ref=%lu)\n",
+                            dm_peer_topic, join_ref);
+                } else {
+                    fprintf(stderr, "bicchierino: join DM peer topic %s failed\n", dm_peer_topic);
+                }
+            }
+            sess.pending_dm_peer_count = 0;
         }
 
         /* Ghost-client detection — the client-side twin of the
