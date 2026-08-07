@@ -356,6 +356,38 @@ struct grappa_session {
      * as the heartbeat/ping-timeout checks, and does the actual rejoin
      * there instead. */
     bool dm_needs_rejoin;
+
+    /* Real bug found live, testing two simultaneous bicchierino
+     * connections for the SAME grappa account: the old is_self check
+     * (folded sender == own nick) can't tell "this is MY OWN optimistic
+     * echo, already shown locally" from "this is a message a SIBLING
+     * connection sharing my identity just sent, which I have NOT seen
+     * yet" — both look identical by nick alone, since both connections
+     * share the same underlying grappa identity. The old check
+     * suppressed BOTH, so a PRIVMSG sent from one connection was
+     * invisible on EVERY connection for that account, sender's own
+     * included — not just self-echo suppression working as intended,
+     * genuine message loss. grappa is already the layer that fans a
+     * message out to every attached client (cicchetto, shottino, N
+     * bicchierino connections) identically — bicchierino re-multiplexing
+     * locally wouldn't remove the need for this correlation, it would
+     * just add a second delivery path that ALSO needs it (grappa's own
+     * WS broadcast still fires regardless of what bicchierino does
+     * locally). Fix: remember the REST-assigned `id` of every message
+     * THIS connection just sent (`send_privmsg_rest`'s response body,
+     * previously discarded after the status check) in this small ring;
+     * a self-labeled live event is suppressed ONLY when its `id` matches
+     * something still in here (my own echo, remove it once matched) —
+     * anything else self-labeled (a sibling connection's send) renders
+     * normally, no different from any other incoming message. Sized
+     * generously past normal typing speed — REST send and WS echo
+     * round-trip in well under a second on a healthy connection, so 16
+     * outstanding sends is not a realistic cap to hit; oldest entries
+     * are evicted on overflow rather than growing unbounded (same
+     * "best-effort bound, not a hard requirement" posture as every other
+     * fixed-size buffer in this file). */
+    long pending_self_msg_ids[16];
+    size_t pending_self_msg_count;
 };
 
 static void handle_registration_message(const struct irc_message *msg, struct registration *reg) {
@@ -995,40 +1027,6 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
     }
 }
 
-/* Best-effort `DELETE /auth/logout`, fire-and-forget — same shape as
- * shottino's own logout_grappa. A no-op if login never succeeded
- * (sess->token empty), otherwise revokes bicchierino's own token.
- *
- * This does NOT disconnect the user from the real IRC network: for a
- * registered-user session (the only kind bicchierino ever creates,
- * WIRE.md §1) logout is a detach, not a teardown —
- * auth_controller.ex's own #126 comment says so explicitly, and
- * http_client_request's own doc has the quote. grappa's Session.Server
- * owns the actual upstream connection, keyed by (user, network),
- * independent of any WS client — closing bicchierino's own session here
- * has no more effect on it than closing a cicchetto browser tab would.
- * Rides the SAME persistent `hc` every other REST call in this
- * connection used — the one time it's about to be torn down anyway
- * (`cleanup:`), so there's no future request left to keep it alive for. */
-static void logout_grappa(struct http_client *hc, const struct config *cfg,
-                           const struct grappa_session *sess) {
-    if (sess->token[0] == '\0') return;
-
-    struct http_response resp;
-    if (!http_client_request(hc, cfg->grappa_url, "DELETE", "/auth/logout", sess->token, NULL,
-                              &resp)) {
-        fprintf(stderr, "bicchierino: logout: grappa not reachable\n");
-        return;
-    }
-    if (resp.status == 204 || (resp.status >= 200 && resp.status < 300)) {
-        fprintf(stderr, "bicchierino: grappa session terminated (subject=%s)\n",
-                sess->subject_name);
-    } else {
-        fprintf(stderr, "bicchierino: logout failed, HTTP %d\n", resp.status);
-    }
-    http_response_free(&resp);
-}
-
 /* WIRE.md §2.5's corrected text: sending a message is REST, not a WS
  * push — `POST /networks/:slug/channels/:target/messages`, body
  * `{"body": "..."}`, confirmed against `messages_controller.ex`
@@ -1088,8 +1086,39 @@ static void remove_channel_at(struct grappa_session *sess, size_t idx) {
     sess->channel_count--;
 }
 
+/* See `pending_self_msg_ids`'s own doc on `struct grappa_session` for
+ * why this exists. Insert evicts the OLDEST entry on overflow (a
+ * simple shift, not a proper ring cursor — 16 entries is small enough
+ * that this is free, and it keeps `consume`'s linear scan simple too;
+ * neither is worth a real ring-buffer index for a set this size). */
+static void remember_pending_self_id(struct grappa_session *sess, long id) {
+    size_t cap = sizeof(sess->pending_self_msg_ids) / sizeof(sess->pending_self_msg_ids[0]);
+    if (sess->pending_self_msg_count == cap) {
+        memmove(sess->pending_self_msg_ids, sess->pending_self_msg_ids + 1,
+                (cap - 1) * sizeof(sess->pending_self_msg_ids[0]));
+        sess->pending_self_msg_count--;
+    }
+    sess->pending_self_msg_ids[sess->pending_self_msg_count++] = id;
+}
+
+/* Returns true and removes `id` if found (my own echo, already
+ * rendered — suppress this one); false leaves the set untouched (not
+ * mine, or already consumed once — render it). */
+static bool consume_pending_self_id(struct grappa_session *sess, long id) {
+    for (size_t i = 0; i < sess->pending_self_msg_count; i++) {
+        if (sess->pending_self_msg_ids[i] != id) continue;
+        size_t remaining = sess->pending_self_msg_count - i - 1;
+        if (remaining)
+            memmove(sess->pending_self_msg_ids + i, sess->pending_self_msg_ids + i + 1,
+                    remaining * sizeof(sess->pending_self_msg_ids[0]));
+        sess->pending_self_msg_count--;
+        return true;
+    }
+    return false;
+}
+
 static void send_privmsg_rest(struct http_client *hc, const struct config *cfg,
-                               const struct grappa_session *sess, const char *target,
+                               struct grappa_session *sess, const char *target,
                                const char *body) {
     char encoded_slug[192];
     url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
@@ -1112,6 +1141,20 @@ static void send_privmsg_rest(struct http_client *hc, const struct config *cfg,
     if (resp.status != 200 && resp.status != 201 && resp.status != 202) {
         fprintf(stderr, "bicchierino: PRIVMSG to %s: unexpected HTTP status %d\n", target,
                 resp.status);
+    } else if (resp.status == 201) {
+        /* 201 = a real, persisted message (the 202 no-persist case —
+         * a services-targeted line like a NickServ IDENTIFY — carries
+         * no `id` and never comes back as a `message` event at all, so
+         * there is nothing to correlate). `Wire.to_json/1` is the SAME
+         * shape used everywhere (REST show/index, WS push), so `id` is
+         * a plain top-level integer field here too. */
+        char err[128];
+        json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+        if (doc) {
+            long id = 0;
+            if (json_long_req(json_root(doc), "id", &id)) remember_pending_self_id(sess, id);
+            json_free(doc);
+        }
     }
     http_response_free(&resp);
 }
@@ -2096,7 +2139,17 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
      * kick/mode/topic/quit render UNCONDITIONALLY, sender or not — now
      * that outbound KICK exists (handle_kick), suppressing our own
      * would leave the user with zero confirmation their kick worked,
-     * exactly the bug this scoping fixes. */
+     * exactly the bug this scoping fixes.
+     *
+     * `is_self` alone is NOT sufficient for privmsg/notice/action —
+     * see the `pending_self_msg_ids` doc on `struct grappa_session`:
+     * two simultaneous bicchierino connections sharing one grappa
+     * identity both compute `is_self == true` for EITHER connection's
+     * own message, which used to mean BOTH suppressed it — real
+     * message loss, not just self-echo suppression, found live testing
+     * exactly that scenario. The privmsg/notice/action branch below
+     * additionally correlates by the message's own `id` before
+     * suppressing. */
     bool is_self = folded_own_nick[0] && strcmp(folded_sender, folded_own_nick) == 0;
 
     char prefix[196];
@@ -2104,21 +2157,69 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
 
     if (strcmp(kind, "privmsg") == 0 || strcmp(kind, "notice") == 0 ||
         strcmp(kind, "action") == 0) {
-        if (is_self) return;
+        if (is_self) {
+            long id = 0;
+            bool has_id = false;
+            json_long_opt(message, "id", &id, &has_id);
+            /* Correlated by id: this IS my own optimistic echo, from
+             * THIS connection — the client already showed it when it
+             * was typed, drop the confirmation. NOT correlated: same
+             * identity, but a SIBLING connection sent it (see
+             * `pending_self_msg_ids`'s own doc on `struct
+             * grappa_session`) — genuinely new to THIS connection,
+             * must still render, just not necessarily verbatim (see
+             * the DM case below). */
+            if (has_id && consume_pending_self_id(sess, id)) return;
+        }
         const char *body = NULL;
         if (!json_str_req(message, "body", &body)) return;
 
         /* WIRE.md §5: an incoming DM persists at channel == own nick,
          * with no `dm_with` on the wire at all — `sender` alone names
          * the real peer, so the re-key is exactly this substitution. */
-        const char *target = channel;
-        if (folded_own_nick[0] && strcmp(folded_channel, folded_own_nick) == 0) target = sender;
+        bool is_incoming_dm = folded_own_nick[0] && strcmp(folded_channel, folded_own_nick) == 0;
+        const char *target = is_incoming_dm ? sender : channel;
+
+        /* A SIBLING connection's OUTBOUND DM (is_self, target is a
+         * bare peer nick, NOT the incoming-DM re-key case — i.e. we
+         * sent this to `channel` from elsewhere) can't be rendered
+         * verbatim: a real IRC client routes an incoming PRIVMSG into
+         * a query window by its TARGET, not its prefix — a line
+         * shaped `:me!... PRIVMSG peer :body` names a target the
+         * client never asked about (not its own nick, not a channel
+         * it's in), so most clients would just drop it rather than
+         * open/update the peer's query window at all. The only way to
+         * land it in the RIGHT window on a vanilla IRC client is to
+         * fake it as an INCOMING line FROM the peer (so the client
+         * opens/updates exactly the query window keyed to that peer,
+         * same as a real incoming DM would) and mark the body so a
+         * human can tell it was actually SENT by this identity, not
+         * received — same convention real multi-client bouncers use
+         * for this exact, protocol-level gap (no vanilla IRC wire
+         * shape exists for "an outbound message I sent elsewhere").
+         * Caught live before ever shipping — a first draft of this fix
+         * would have rendered `:me!... PRIVMSG me :body`, which is
+         * worse: a real client seeing itself as both prefix AND target
+         * would likely open a bogus self-addressed query window. */
+        char sibling_prefix[196];
+        char body_with_marker[900];
+        const char *effective_prefix = prefix;
+        const char *effective_body = body;
+        if (is_self && channel[0] != '#' && !is_incoming_dm) {
+            snprintf(sibling_prefix, sizeof(sibling_prefix), "%s!bicchierino@bicchierino", channel);
+            effective_prefix = sibling_prefix;
+            target = sess->network_nick;
+            snprintf(body_with_marker, sizeof(body_with_marker), "<%s> %s", sess->network_nick,
+                     body);
+            effective_body = body_with_marker;
+        }
 
         if (strcmp(kind, "action") == 0) {
-            send_line(fd, ":%s PRIVMSG %s :\x01""ACTION %s\x01", prefix, target, body);
+            send_line(fd, ":%s PRIVMSG %s :\x01""ACTION %s\x01", effective_prefix, target,
+                      effective_body);
         } else {
             const char *verb = strcmp(kind, "notice") == 0 ? "NOTICE" : "PRIVMSG";
-            send_line(fd, ":%s %s %s :%s", prefix, verb, target, body);
+            send_line(fd, ":%s %s %s :%s", effective_prefix, verb, target, effective_body);
         }
         return;
     }
@@ -3162,12 +3263,20 @@ void *connection_run(void *arg) {
                             sizeof(password));
 
     /* Everything from here on may obtain a grappa token, so every exit
-     * path funnels through `cleanup` — logout_grappa() is a no-op if
-     * sess.token was never populated, and a real DELETE /auth/logout
-     * otherwise. This is what guarantees a client's QUIT (or any other
-     * teardown: EOF, a bootstrap step failing) revokes bicchierino's own
-     * token instead of abandoning it — safe for the real IRC connection,
-     * see logout_grappa's own doc. */
+     * path funnels through `cleanup`. bicchierino deliberately does NOT
+     * call DELETE /auth/logout here on ordinary teardown (it used to) —
+     * found live via a real 2-client test on one grappa account: the
+     * request DOES leave the upstream IRC session alone as intended
+     * (auth_controller.ex's own #126 comment confirms Session.Server
+     * outlives any one WS client), but it ALSO makes
+     * UserSocket.disconnect_subject/1 broadcast a Phoenix "disconnect" to
+     * the subject's shared socket_id — force-closing EVERY sibling
+     * WebSocket for that account, not just this one. Confirmed with
+     * server logs: client B's clean QUIT killed client A's still-active
+     * session outright. grappa's own tokens carry a sliding 7-day idle
+     * expiry (accounts.ex) — an abandoned, never-revoked token cleans
+     * itself up on a bounded timescale, which is a far smaller cost than
+     * taking down every sibling connection on every QUIT. */
     struct grappa_session sess = {0};
 
     /* One persistent HTTP/1.1 connection for every REST call this
@@ -3456,7 +3565,6 @@ void *connection_run(void *arg) {
 
 cleanup:
     if (br_connected) bridge_close(&br);
-    logout_grappa(&hc, cfg, &sess);
     http_client_close(&hc);
     client_tls_close(client_ssl_ctx);
     close(fd);

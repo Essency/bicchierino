@@ -1109,3 +1109,101 @@ indagare: il primo tentativo di connessione irssi ha prodotto
 byte non-TLS su una porta TLS) — sintomo tipico di un client che non ha
 davvero attivato TLS nella sua invocazione, non un bug di bicchierino.
 L'utente ha risolto da solo la sintassi lato irssi.
+
+## 10. Multi-client sullo stesso account grappa — 2 bug reali trovati testando live, 1 gap architetturale scoperto per caso
+
+Su richiesta esplicita dell'utente ("collega 2 client irc a bicchierino,
+ho paura che quando ha 2 client per lo stesso user si incasini"): due
+connessioni bicchierino indipendenti (thread, socket, `struct
+grappa_session`, login/token grappa separati) che condividono LO STESSO
+account grappa (stesso subject) non erano mai state testate. Trovati due
+bug reali, più un gap pre-esistente scoperto mentre si verificava il
+secondo.
+
+**Bug 1 — perdita di messaggi tra connessioni gemelle (FIXATO).**
+`is_self` (mittente foldato == proprio nick) non distingueva "il mio
+echo ottimistico da QUESTA connessione" da "un messaggio appena mandato
+da una connessione GEMELLA con la stessa identità" — entrambi risultano
+`is_self == true`, e il vecchio codice sopprimeva ENTRAMBI, quindi un
+PRIVMSG mandato dal client A spariva anche dal client B (stesso
+account) — perdita di messaggi vera, non soppressione corretta
+dell'eco. Fix: `send_privmsg_rest` ora legge il body della risposta
+REST su 201 (`Wire.to_json/1`, stesso shape ovunque) ed estrae l'`id`
+del messaggio appena persistito, salvato in un piccolo ring
+`pending_self_msg_ids[16]` su `struct grappa_session`.
+`handle_grappa_message_event` sopprime un evento self-labeled SOLO se il
+suo `id` combacia con qualcosa nel pending set (rimuovendolo una volta
+consumato) — altrimenti (mandato da un gemello) lo rende normalmente.
+
+**Correzione critica dell'utente durante l'implementazione**: per il
+caso specifico di una DM IN USCITA da una connessione gemella (non un
+messaggio di canale), renderla alla lettera (`me!...  PRIVMSG me
+:body`, target = proprio nick) avrebbe fatto aprire a un client IRC
+vero una query bacata verso se stesso, perché i client instradano le
+righe in arrivo per TARGET, non per prefisso. Fix: la riga viene
+falsificata come se arrivasse DAL PEER (`peer!bicchierino@bicchierino
+PRIVMSG <propriconick> :<propriconick> body`), così la query si
+apre/aggiorna sotto il nick del PEER (la finestra corretta), col corpo
+prefissato da `<propriconick>` per indicare che il mittente reale sono
+io da un'altra connessione — la convenzione standard dei bouncer
+multi-client per questo esatto limite di protocollo.
+
+Verificato live: PRIVMSG di canale da A appare correttamente su B, non
+duplicato su A. Vedi il gap sotto per la DM.
+
+**Bug 2 — QUIT da un client ammazzava TUTTE le connessioni gemelle
+(FIXATO).** Confermato via log server: il QUIT/logout pulito del
+client B era seguito IMMEDIATAMENTE dalla morte del WebSocket di A
+verso grappa. Causa root, letta nel sorgente grappa reale:
+`auth_controller.ex`'s `logout/2` → `maybe_disconnect_socket/1` →
+`UserSocket.disconnect_subject/1` → `disconnect_user_name/1` →
+`Endpoint.broadcast(socket_id, "disconnect", %{})` — il meccanismo
+standard di Phoenix per chiudere OGNI socket che condivide quel
+`socket_id`, condiviso da TUTTI i socket dello stesso subject/account,
+non solo dalla sessione che sta facendo logout.
+
+Fix: bicchierino non chiama più `DELETE /auth/logout` nel teardown
+ordinario (rimossa `logout_grappa` e la sua chiamata in `cleanup:`).
+Giustificato da `accounts.ex` (commento: "Sliding 7-day idle expiry") —
+i token di sessione grappa NON sono permanenti, quindi un token
+abbandonato e mai revocato si pulisce comunque da solo entro una
+finestra limitata, un costo molto più basso di ammazzare ogni
+connessione gemella a ogni QUIT. Verificato live: dopo il QUIT di B, A
+risponde ancora a PING e riesce ancora a mandare PRIVMSG.
+
+**Gap architetturale scoperto (NON FIXATO, fuori scope per oggi) — le
+DM in uscita non tornano MAI indietro, nemmeno al mittente stesso, su
+NESSUN client.** Testando la DM A→GameBot: la POST REST riesce (201,
+`id` valido, `channel:"gamebot"` nel body), ma NESSUN client (nemmeno
+A) vede mai l'eco. Causa, confermata leggendo `Session.Persistor.
+persist_and_broadcast/3` + `handle_persisting_send` in
+`~/progetti/grappa-irc/lib/grappa/session/{persistor,server}.ex`: il
+topic PubSub su cui grappa fa broadcast è SEMPRE derivato da
+`attrs.channel` (`Topic.channel(subject, network, attrs.channel)`), e
+per una DM IN USCITA `attrs.channel` è il nome (foldato) del
+DESTINATARIO (`gamebot`), non il proprio nick — asimmetrico rispetto
+alle DM IN ENTRATA, dove invece `channel` viene re-keyed al proprio
+nick (`server.ex:4600-4607`, già noto e verificato prima in sessione).
+bicchierino oggi si iscrive SOLO al topic statico del proprio nick
+(`channel:sonictest`, per le DM in entrata) più i topic dei canali
+joinati — MAI a un topic per-peer come `channel:gamebot`. L'evento che
+segnalerebbe "si è aperta una nuova query window" (`query_windows_list`,
+broadcast sul topic utente dopo il persist+broadcast, per-#422) è un
+no-op deliberato in `handle_grappa_message_event` (connection.c
+~3208-3211) — mai implementato.
+
+Questo NON è un bug introdotto dal lavoro di oggi: è un limite
+pre-esistente del modello di sottoscrizione DM di bicchierino, mai
+notato prima perché nessuna DM in uscita era mai stata testata contro
+un peer nuovo con un secondo client in ascolto. Serve una feature vera
+(iscriversi dinamicamente a `channel:<peer>` per ogni DM mandata/
+ricevuta, o fetchare la lista `query_windows` esistente al bootstrap e
+joinarle tutte, specchiando cosa fa cic) — non una one-liner fix,
+quindi rimandato a una sessione dedicata invece di espandere lo scope
+di questa.
+
+`bicchierino-preprod` NON è ancora stato ricompilato/ridistribuito con
+i fix di questa sezione — build attuale = HEAD di `feature/chathistory`
+prima di questo lavoro (CAP negotiation + TLS fix + sigilli NAMES, non
+i fix multi-client). Serve un rebase di `feature/chathistory` su
+`develop` e un redeploy prima che l'utente possa ritestare con irssi.
