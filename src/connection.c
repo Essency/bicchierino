@@ -2249,26 +2249,53 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
          * would have rendered `:me!... PRIVMSG me :body`, which is
          * worse: a real client seeing itself as both prefix AND target
          * would likely open a bogus self-addressed query window. */
+        bool is_sibling_dm = is_self && channel[0] != '#' && !is_incoming_dm;
         char sibling_prefix[196];
-        char body_with_marker[900];
         const char *effective_prefix = prefix;
-        const char *effective_body = body;
-        if (is_self && channel[0] != '#' && !is_incoming_dm) {
+        if (is_sibling_dm) {
             snprintf(sibling_prefix, sizeof(sibling_prefix), "%s!bicchierino@bicchierino", channel);
             effective_prefix = sibling_prefix;
             target = sess->network_nick;
-            snprintf(body_with_marker, sizeof(body_with_marker), "<%s> %s", sess->network_nick,
-                     body);
-            effective_body = body_with_marker;
         }
 
-        if (strcmp(kind, "action") == 0) {
-            send_line(fd, ":%s PRIVMSG %s :\x01""ACTION %s\x01", effective_prefix, target,
-                      effective_body);
-        } else {
-            const char *verb = strcmp(kind, "notice") == 0 ? "NOTICE" : "PRIVMSG";
-            send_line(fd, ":%s %s %s :%s", effective_prefix, verb, target, effective_body);
+        /* `body` for kind=="action" already carries the RAW CTCP
+         * `\x01ACTION <text>\x01` frame verbatim — confirmed against
+         * grappa's own persist path (`event_router.ex`'s
+         * `privmsg_default/3` hands `body` to `build_persist`
+         * unmodified regardless of kind; `CTCP.action?/1` classifies
+         * without stripping). Re-wrapping it in ANOTHER `\x01ACTION
+         * ... \x01` here (the bug this replaces, found live: irssi
+         * showed `* OtherUser \x01ACTION accarezza cdc\x01\x01` as
+         * literal text — irssi stripped the OUTER frame and displayed
+         * the un-stripped INNER one, each `\x01` rendered as a bare
+         * `A` via irssi's own control-picture convention) double-frames
+         * it. So `action`, like `privmsg`/`notice`, sends `body`
+         * verbatim — the framing is already there; CTCP always rides a
+         * PRIVMSG (never NOTICE), matching the wire convention. */
+        char body_with_marker[900];
+        const char *effective_body = body;
+        if (is_sibling_dm) {
+            if (strcmp(kind, "action") == 0) {
+                /* The marker must land INSIDE the CTCP frame, right
+                 * after "ACTION ", not in front of the whole string —
+                 * `\x01` has to stay the very first byte or the client
+                 * won't recognize this as CTCP at all. */
+                static const char action_prefix[] = "\x01""ACTION ";
+                size_t prefix_len = sizeof(action_prefix) - 1;
+                if (strncmp(body, action_prefix, prefix_len) == 0) {
+                    snprintf(body_with_marker, sizeof(body_with_marker), "%.*s<%s> %s",
+                             (int)prefix_len, body, sess->network_nick, body + prefix_len);
+                    effective_body = body_with_marker;
+                }
+            } else {
+                snprintf(body_with_marker, sizeof(body_with_marker), "<%s> %s",
+                         sess->network_nick, body);
+                effective_body = body_with_marker;
+            }
         }
+
+        const char *verb = strcmp(kind, "notice") == 0 ? "NOTICE" : "PRIVMSG";
+        send_line(fd, ":%s %s %s :%s", effective_prefix, verb, target, effective_body);
         return;
     }
 
