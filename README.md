@@ -84,14 +84,18 @@ on the network if sent in the clear off loopback.
 ./bicchierino --config bicchierino.config
 ```
 
-Then point any IRC client at it:
+Then configure any IRC client to connect to it — nobody types `USER`,
+`NICK`, or `PASS` by hand, the client sends those automatically from its
+own connection settings at connect time:
 
-```
-/server <bicchierino-host> <port>
-/PASS <network>:<password>
-/NICK <anything>
-/USER <grappa-account> * * :<anything>
-```
+- **Server / host**: the bicchierino host and port.
+- **Password** (sometimes labeled "server password" — not SASL): grappa's
+  `<network>:<password>`, exactly as you'd give the grappa network you're
+  binding to.
+- **Nick**: anything — it's not used for identity, only for how the
+  bridge addresses you until grappa's own nick is known.
+- **Username / ident** (some clients call this "user" or derive it from
+  the account/login field): your grappa account name.
 
 bicchierino logs into grappa with exactly those credentials, for that
 connection only — there is no fixed identity baked into the running
