@@ -145,6 +145,26 @@ jobs:
           kill $BICCHIERINO_PID
           wait $BICCHIERINO_PID 2>/dev/null || true
 
+      # The cap and the registration deadline from #20. Neither is
+      # unit-testable in any useful way — the cap arithmetic is inline in
+      # main.c's accept loop, and what actually breaks is the invariant
+      # that connection_run releases a slot on every exit path — so this
+      # drives the real binary over real sockets instead.
+      #
+      # In THIS job rather than the build matrix, for two reasons: the
+      # binary here is already instrumented, so the run doubles as
+      # ASan/UBSan coverage of the accept and teardown paths; and python3
+      # is already installed above for the smoke test. openssl, which the
+      # script uses to mint a throwaway cert for its tls bind, ships on
+      # the runner.
+      #
+      # Takes about a minute, most of it waiting out the 30s deadline it
+      # is measuring.
+      - name: Connection cap and registration deadline
+        run: |
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            BIN=./bicchierino python3 tests/caps.py
+
   e2e:
     name: e2e — sealed azzurra stack
     runs-on: ubuntu-latest
