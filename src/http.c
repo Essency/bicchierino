@@ -222,19 +222,97 @@ static bool find_content_length(const char *headers, size_t header_len, long *ou
     return false;
 }
 
+/* Check for Transfer-Encoding: chunked header in the raw header block.
+ * RFC 7230 §3.3.1: if present, Content-Length must be ignored and the
+ * body is framed by the chunked encoding itself — not by a byte count.
+ * Reverse proxies (nginx, Caddy, Traefik) commonly re-frame upstream
+ * responses as chunked even when the origin set Content-Length, which
+ * is why this path is needed for any deployment that puts a proxy in
+ * front of grappa. */
+static bool find_chunked_encoding(const char *headers, size_t header_len) {
+    static const char needle[] = "Transfer-Encoding:";
+    size_t needle_len = sizeof(needle) - 1;
+    const char *pos = headers;
+    const char *end = headers + header_len;
+    while (pos < end) {
+        if ((size_t)(end - pos) >= needle_len &&
+            strncasecmp(pos, needle, needle_len) == 0) {
+            const char *val = pos + needle_len;
+            while (val < end && (*val == ' ' || *val == '\t')) val++;
+            if ((size_t)(end - val) >= 7 && strncasecmp(val, "chunked", 7) == 0)
+                return true;
+        }
+        const char *nl = memchr(pos, '\n', (size_t)(end - pos));
+        if (!nl) break;
+        pos = nl + 1;
+    }
+    return false;
+}
+
+/* Sliding-window read buffer for chunked decoding.  Leftover bytes from
+ * the header read are seeded in first; SSL_read fills the rest on demand.
+ * sizeof(buf) must exceed HTTP_HEADER_MAX - 4 (max bytes that can arrive
+ * ahead of the body in a single header read) — HTTP_READ_CHUNK * 4 = 16384
+ * satisfies that. */
+struct chunkbuf {
+    SSL   *ssl;
+    char   buf[HTTP_READ_CHUNK * 4];
+    size_t len; /* valid bytes at buf[0..len) */
+};
+
+/* Read one CRLF-terminated line from the buffer into `out` (without the
+ * CRLF), NUL-terminated.  Pulls more bytes from SSL as needed. */
+static bool chunkbuf_readline(struct chunkbuf *cb, char *out, size_t out_cap) {
+    for (;;) {
+        for (size_t i = 0; i + 1 < cb->len; i++) {
+            if (cb->buf[i] == '\r' && cb->buf[i + 1] == '\n') {
+                if (i >= out_cap) return false;
+                memcpy(out, cb->buf, i);
+                out[i] = '\0';
+                /* consume line + CRLF */
+                cb->len -= i + 2;
+                if (cb->len > 0) memmove(cb->buf, cb->buf + i + 2, cb->len);
+                return true;
+            }
+        }
+        if (cb->len >= sizeof(cb->buf)) return false; /* no CRLF, buf full */
+        int n = SSL_read(cb->ssl, cb->buf + cb->len,
+                         (int)(sizeof(cb->buf) - cb->len));
+        if (n <= 0) return false;
+        cb->len += (size_t)n;
+    }
+}
+
+/* Copy exactly `n` bytes from the chunkbuf into a growbuf, pulling more
+ * bytes from SSL whenever the internal buffer runs dry. */
+static bool chunkbuf_read_into(struct chunkbuf *cb, struct growbuf *gb, size_t n) {
+    while (n > 0) {
+        if (cb->len == 0) {
+            int r = SSL_read(cb->ssl, cb->buf, (int)sizeof(cb->buf));
+            if (r <= 0) return false;
+            cb->len = (size_t)r;
+        }
+        size_t take = cb->len < n ? cb->len : n;
+        if (!growbuf_append(gb, cb->buf, take)) return false;
+        cb->len -= take;
+        if (cb->len > 0) memmove(cb->buf, cb->buf + take, cb->len);
+        n -= take;
+    }
+    return true;
+}
+
 /* One request/response over an already-connected `hc` — no reconnect
  * logic here, that's http_client_request()'s job. Reads the header
  * block bounded (same read-until-terminator shape as ws_client.c's
  * handshake reader — headers are always small and arrive in one or two
- * TCP segments), then reads exactly Content-Length body bytes: unlike
- * the old one-shot-connection model, this can NOT just "read until the
- * peer closes" — the whole point is that the peer does NOT close, the
- * connection outlives this one exchange. A 204 (DELETE /auth/logout)
- * is the one case allowed an absent Content-Length — RFC 7230 says a
- * 204 carries no body regardless. Any other status without
- * Content-Length is a hard failure: grappa's JSON responses are always
- * fully-buffered, so a real one always sets it, and a persistent
- * connection can't safely guess. */
+ * TCP segments), then reads the body using whichever framing the server
+ * chose: Content-Length (grappa direct), Transfer-Encoding: chunked
+ * (grappa behind nginx/Caddy/Traefik — the normal self-hosted shape),
+ * or no body at all (204).  The connection is kept alive in all cases
+ * because we consume the body exactly: unlike a Content-Length read,
+ * chunked decoding must also consume the trailing CRLF / trailer-part
+ * so the connection is left at a clean message boundary for the next
+ * request. */
 static bool http_client_exchange_once(struct http_client *hc, const char *request,
                                        size_t request_len, struct http_response *out) {
     if (SSL_write(hc->ssl, request, (int)request_len) <= 0) return false;
@@ -257,33 +335,88 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
     int status;
     if (!parse_status_line(header_buf, &status)) return false;
 
+    /* RFC 7230 §3.3.3: Transfer-Encoding takes precedence over
+     * Content-Length when both are present. */
+    bool is_chunked = find_chunked_encoding(header_buf, headers_end);
     long content_length = 0;
-    bool have_cl = find_content_length(header_buf, headers_end, &content_length);
-    if (!have_cl) {
+    bool have_cl = !is_chunked &&
+                   find_content_length(header_buf, headers_end, &content_length);
+
+    if (!is_chunked && !have_cl) {
         if (status != 204) return false;
-    } else if (content_length < 0) {
+    } else if (have_cl && content_length < 0) {
         return false;
     }
 
     /* Body: whatever came bundled past the header terminator in the
      * SAME reads (TCP/TLS records don't respect our header/body split
      * any more than they respect message boundaries elsewhere in this
-     * codebase), plus more SSL_read calls until content_length bytes
-     * are in hand. */
+     * codebase), plus more SSL_read calls until the full body is in
+     * hand — either counted by Content-Length or decoded from chunks. */
     struct growbuf body = {0};
     size_t already = header_len - headers_end;
-    if (already > 0 && !growbuf_append(&body, header_buf + headers_end, already)) return false;
-    while (body.len < (size_t)content_length) {
-        char chunk[HTTP_READ_CHUNK];
-        size_t want = (size_t)content_length - body.len;
-        int n = SSL_read(hc->ssl, chunk, (int)(want < sizeof(chunk) ? want : sizeof(chunk)));
-        if (n <= 0) {
-            free(body.data);
-            return false;
+
+    if (is_chunked) {
+        /* RFC 7230 §4.1 chunked-body decode.  Seed the sliding-window
+         * buffer with any bytes that arrived bundled with the headers. */
+        struct chunkbuf cb;
+        memset(&cb, 0, sizeof(cb));
+        cb.ssl = hc->ssl;
+        if (already > 0) {
+            memcpy(cb.buf, header_buf + headers_end, already);
+            cb.len = already;
         }
-        if (!growbuf_append(&body, chunk, (size_t)n)) {
-            free(body.data);
-            return false;
+
+        char szline[64]; /* chunk-size [ ";" chunk-ext ] CRLF — fits in 64 */
+        for (;;) {
+            if (!chunkbuf_readline(&cb, szline, sizeof(szline))) {
+                free(body.data);
+                return false;
+            }
+            char *semi = strchr(szline, ';'); /* strip optional chunk-ext */
+            if (semi) *semi = '\0';
+            char *endp;
+            long csz = strtol(szline, &endp, 16);
+            if (endp == szline || csz < 0 || csz > HTTP_MAX_RESPONSE) {
+                free(body.data);
+                return false;
+            }
+            if (csz == 0) break; /* last-chunk */
+            if (!chunkbuf_read_into(&cb, &body, (size_t)csz)) {
+                free(body.data);
+                return false;
+            }
+            /* consume the CRLF that follows each chunk-data */
+            if (!chunkbuf_readline(&cb, szline, sizeof(szline))) {
+                free(body.data);
+                return false;
+            }
+        }
+        /* consume trailer-part (zero or more header-field lines followed
+         * by a blank line) so the connection is at a clean boundary */
+        for (;;) {
+            char trailer[HTTP_HEADER_MAX];
+            if (!chunkbuf_readline(&cb, trailer, sizeof(trailer))) {
+                free(body.data);
+                return false;
+            }
+            if (trailer[0] == '\0') break; /* blank line = end of trailers */
+        }
+    } else {
+        /* Content-Length (or 0 for a 204 — loop body executes zero times) */
+        if (already > 0 && !growbuf_append(&body, header_buf + headers_end, already)) return false;
+        while (body.len < (size_t)content_length) {
+            char chunk[HTTP_READ_CHUNK];
+            size_t want = (size_t)content_length - body.len;
+            int n = SSL_read(hc->ssl, chunk, (int)(want < sizeof(chunk) ? want : sizeof(chunk)));
+            if (n <= 0) {
+                free(body.data);
+                return false;
+            }
+            if (!growbuf_append(&body, chunk, (size_t)n)) {
+                free(body.data);
+                return false;
+            }
         }
     }
 
