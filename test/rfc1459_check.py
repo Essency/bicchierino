@@ -14,7 +14,8 @@ Mechanically checkable invariants verified here:
      nick!user@host prefix, correct target
   6. NOTICE — user NOTICE: nick!user@host;     (#29 fix)
      server NOTICE: bare hostname prefix
-     (dot-containing, no !), never a nick
+     (dot-containing, no !), never a nick.
+     Triggered actively via PRIVMSG OperServ :UPDATE
   7. CTCP ACTION (/me) — exactly one           (CTCP spec; bicchierino
      \\x01ACTION ...\\x01 frame, no             regression guard)
      double-wrapping
@@ -407,38 +408,59 @@ def check_notice_user(bicc: IRCConn, peer: IRCConn) -> None:
             fail(f"NOTICE user: unexpected format {line!r}")
 
 
-def check_notice_server(post_reg_lines: list[str]) -> None:
+def check_notice_server(bicc: IRCConn) -> None:
     """
     Rule 6b: server NOTICE (#29 fix) — prefix must be a bare server hostname
-    (contains a dot, no '!') for NOTICEs originating from the ircd or
-    services.  These arrive in the post-registration drain from grappa's
-    $server window replay.  The dot heuristic in handle_grappa_server_window_row
-    is the discriminator: any sender without a dot is treated as a user nick
-    and gets !user@host appended; any sender WITH a dot is used verbatim.
+    (contains a dot, no '!') for NOTICEs originating from the ircd or services.
+
+    Rather than relying on passive $server window history (which grappa does NOT
+    replay on Phoenix Channel join — only real-time pushes flow), we actively
+    trigger a server NOTICE by sending PRIVMSG OperServ :UPDATE through
+    bicchierino.  bicc-grappa is the SERVICES_MASTER in the test stack, so
+    OperServ processes the command and broadcasts a Global NOTICE from
+    services.azzurra.chat — a real server-hostname-prefixed line that exercises
+    handle_grappa_server_window_row's dot-heuristic end to end.
+
+    The expected wire path:
+      bicc →[REST]→ grappa → bahamut → OperServ (processes UPDATE)
+      → services.azzurra.chat NOTICE * :*** Global -- from services.azzurra.chat: ...
+      → bahamut → grappa $server window (live push) → bicchierino WS
+      → handle_grappa_server_window_row (sender=services.azzurra.chat, has dot)
+      → :services.azzurra.chat NOTICE bicc-grappa :... → rfc-check
     """
     print("\n─ NOTICE (server/#29 fix) check ─", flush=True)
 
-    # A server NOTICE from grappa's $server window looks like:
-    #   :some.server.hostname NOTICE bicc-grappa :text
-    # The prefix has a dot and no '!'.
-    server_notices = [
-        t for t in post_reg_lines
-        if (t.startswith(":") and " NOTICE " in t
-            and "!" not in t.split()[0]        # no nick!user@host
-            and "." in t.split()[0][1:])       # dot in the prefix (strip ':')
-    ]
+    # Request an OperServ database update. bicc-grappa is SERVICES_MASTER so
+    # OperServ accepts the command. Services then writes the database and sends
+    # a Global NOTICE back to the network (services.azzurra.chat has a dot,
+    # no '!' — exactly the server-prefix shape handle_grappa_server_window_row
+    # must preserve verbatim rather than appending !bicchierino@bicchierino).
+    bicc.send("PRIVMSG OperServ :UPDATE")
 
-    if not server_notices:
+    # Wait for a NOTICE whose prefix contains a dot and no '!'.
+    # OperServ's personal acknowledge ("Access granted", "Update started") uses
+    # nick!user@host (OperServ!service@azzurra.chat) so it is skipped here.
+    # The Global NOTICE from services.azzurra.chat matches.
+    server_notice = bicc.recv_match(
+        RELAY_TIMEOUT,
+        lambda t: (
+            t.startswith(":")
+            and " NOTICE " in t
+            and "!" not in t.split()[0]
+            and "." in t.split()[0][1:]
+        ),
+    )
+
+    if not server_notice:
         fail(
-            "NOTICE server (#29): no server-hostname-prefixed NOTICE found "
-            "in post-registration lines — expected at least one from grappa's "
-            "$server window replay (bahamut/services NOTICEs stored on initial connect)"
+            "NOTICE server (#29): no server-hostname-prefixed NOTICE received within "
+            f"{RELAY_TIMEOUT}s after triggering OperServ UPDATE — "
+            "expected :services.azzurra.chat NOTICE ... from services Global broadcast"
         )
         return
 
-    ok(f"NOTICE server (#29): found {len(server_notices)} server NOTICE(s)")
-    for sn in server_notices[:3]:   # validate first three to keep output short
-        assert_server_prefix(sn, "NOTICE server")
+    ok(f"NOTICE server (#29): received server-prefixed NOTICE")
+    assert_server_prefix(server_notice, "NOTICE server")
 
 
 def check_ctcp_action(bicc: IRCConn, peer: IRCConn) -> None:
@@ -836,7 +858,7 @@ def main() -> None:
     # removes bicc-grappa from TEST_CHAN).
 
     check_topic_332_333(snapshot_lines, TEST_CHAN)
-    check_notice_server(post_reg_lines)
+    check_notice_server(bicc)
     check_names(bicc, TEST_CHAN)
     check_who(bicc, TEST_CHAN)
     check_whois(bicc, "rfc-peer")
