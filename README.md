@@ -45,8 +45,8 @@ WebSocket pushes.
   is deliberately not advertised yet: grappa's scrollback REST cursor is
   always an integer message id, never a timestamp, which blocks the
   timestamp-based selectors a real client is likely to send on
-  reconnect. See this repo's issue tracker for the exact blocker and the
-  options considered to unblock it.
+  reconnect. The exact blocker and the options considered to unblock it
+  are documented in `src/connection.c`'s `handle_cap_command` comment.
 
 Full design rationale lives in [`ARCHITECTURE.md`](ARCHITECTURE.md). The
 grappa wire-protocol contract this bridge relies on — read from grappa's
