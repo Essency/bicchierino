@@ -30,6 +30,13 @@
                            * "hostile-response backstop, not a real ceiling"
                            * posture as MAX_CHANNELS */
 #define IRCD_SERVER "bicchierino"
+/* grappa's synthetic per-network window for everything that belongs to no
+ * channel and no query: server notices, connect MOTD, unsolicited
+ * INFO/VERSION/ADMIN bursts, and the event router's catch-all rows. It is
+ * a window KEY, never an IRC target — `GrappaWeb.Validation`'s own
+ * `validate_post_target_name("$server")` refuses a write to it. Folds to
+ * itself under both sides' ASCII fold (only `A-Z` folds). */
+#define GRAPPA_SERVER_WINDOW "$server"
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
 
@@ -1238,6 +1245,28 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
         fprintf(stderr, "bicchierino: join %s failed\n", user_topic);
     }
 
+    /* The `$server` window is NOT derived from the channel list and never
+     * appears in it: `GET /networks/:slug/channels` merges the credential
+     * autojoin list with `Session.list_channels/2` (grappa's
+     * `channels_controller.ex`), both of which are real channels only.
+     * `$server` is synthetic and always exists, so it is joined
+     * unconditionally — grappa broadcasts its rows on the per-channel
+     * topic like any other window (`Session.Persistor`'s
+     * `Topic.channel(subject, slug, attrs.channel)`), which means without
+     * this join every server notice, MOTD line and catch-all row is
+     * dropped one layer below the renderer. Nothing is ever pushed on this
+     * topic, so its join_ref is local — unlike the user topic's, which the
+     * heartbeat/visibility pushes need. */
+    char server_topic[512];
+    snprintf(server_topic, sizeof(server_topic), "grappa:user:%s/network:%s/channel:%s",
+             sess->subject_name, sess->network_slug, GRAPPA_SERVER_WINDOW);
+    unsigned long server_join_ref = 0;
+    if (bridge_join(br, server_topic, &server_join_ref, bridge_event_dispatch, &ctx)) {
+        fprintf(stderr, "bicchierino: joined %s (join_ref=%lu)\n", server_topic, server_join_ref);
+    } else {
+        fprintf(stderr, "bicchierino: join %s failed\n", server_topic);
+    }
+
     for (size_t i = 0; i < sess->channel_count; i++) {
         char folded_channel[128];
         ascii_fold_lower(sess->channels[i], folded_channel, sizeof(folded_channel));
@@ -2337,13 +2366,54 @@ static void format_prefix(const json_value *meta, const char *sender, char *out,
         snprintf(out, out_sz, "%s!bicchierino@bicchierino", sender);
 }
 
+/* The renderable text of a row whose `body` may legitimately be absent.
+ * `server_event` is the one kind grappa leaves `body` nullable for
+ * (`Scrollback.Message`'s `@body_required_kinds` excludes it, because a
+ * catch-all body is a verb-name fallback rather than user-meaningful
+ * text), so the catch-all `meta.raw_verb` is the substitute — naming the
+ * verb that produced the row beats rendering nothing. */
+static const char *row_text(const json_value *message, const json_value *meta) {
+    const char *text = NULL;
+    if (json_str_req(message, "body", &text)) return text;
+    if (meta && json_str_req(meta, "raw_verb", &text)) return text;
+    return NULL;
+}
+
+/* A row on the synthetic `$server` window, rendered as a NOTICE to our own
+ * nick — which is where a real ircd puts these same lines, and the only
+ * shape available: `$server` is not a valid IRC target, so no per-kind arm
+ * of `handle_grappa_message_event` can render one verbatim.
+ *
+ * Kind-blind on purpose. Everything grappa files here is a line of server
+ * chrome addressed to us — `:notice` rows from `persist_server_notice/2`
+ * (connect MOTD, unsolicited INFO/VERSION/ADMIN bursts, 402, and the CP13
+ * non-channel NOTICE cluster) and `:server_event` rows from the router
+ * fallthrough (KILL, WALLOPS, GLOBOPS, ERROR, CHGHOST, vendor verbs) alike
+ * — and a NOTICE is how all of it reaches a client that negotiated no
+ * grappa-specific capability. The structured `meta` is deliberately not
+ * unpacked: grappa fills `body` with a plain spelling for exactly this
+ * reason ("the wire is additive-only — an old client ignores the meta and
+ * shows the body").
+ *
+ * `sender` is `Message.sender_nick/1`: the upstream server's hostname for
+ * a server-prefixed line, or the `"*"` sentinel for a prefix-less one.
+ * `"*"` is not a usable IRC prefix, and a prefix-less line is one this
+ * bridge is speaking on its own behalf anyway, so it becomes IRCD_SERVER. */
+static void handle_grappa_server_window_row(int fd, const struct grappa_session *sess,
+                                             const char *sender, const json_value *message,
+                                             const json_value *meta, long server_time_ms) {
+    const char *text = row_text(message, meta);
+    if (!text) return;
+
+    const char *prefix = sender && sender[0] && strcmp(sender, "*") != 0 ? sender : IRCD_SERVER;
+    const char *target = sess->network_nick[0] ? sess->network_nick : "*";
+    send_tagged_line(fd, sess, server_time_ms, ":%s NOTICE %s :%s", prefix, target, text);
+}
+
 /* A `"message"` WS event's inner `message` object (WIRE.md §2.5's
  * corrected text — `Scrollback.Wire.message_payload/1`'s wire shape).
  * Per-kind `meta` shapes are `Grappa.Scrollback.Meta`'s own catalogue
- * (`meta.ex:68-131`), read directly rather than guessed. `server_event`
- * is the one kind still unhandled — its meta shape is a router-catchall
- * grab-bag (`raw_verb`/`raw_sender`/`raw_params`, or a numeric bundle),
- * not worth a render without a concrete case driving it. */
+ * (`meta.ex:68-131`), read directly rather than guessed. */
 static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa_session *sess,
                                          const json_value *message) {
     const char *kind = NULL;
@@ -2366,6 +2436,14 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
      * `handle_grappa_links_bundle_event`'s `hopcount`). */
     long server_time_ms = 0;
     json_long_opt(message, "server_time", &server_time_ms, NULL);
+
+    /* Routed by WINDOW before kind: none of the identity/DM/self-echo
+     * reasoning below applies to a `$server` row, and its `channel` can
+     * never be used as an IRC target. */
+    if (strcmp(channel, GRAPPA_SERVER_WINDOW) == 0) {
+        handle_grappa_server_window_row(fd, sess, sender, message, meta, server_time_ms);
+        return;
+    }
 
     /* Every nick/channel-key identity compare in this codebase mirrors
      * grappa's own rule (its CLAUDE.md: "EVERY server-side nick compare
@@ -2631,7 +2709,19 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         return;
     }
 
-    /* :server_event and anything future/unrecognized — no render yet. */
+    if (strcmp(kind, "server_event") == 0) {
+        /* The channel-scoped half of the catch-all — the `$server`-scoped
+         * half never reaches here, intercepted above. Same reasoning as
+         * `handle_grappa_server_window_row`: `body` is a legible line by
+         * construction, so a NOTICE on the channel it belongs to beats
+         * discarding the row. Not a PRIVMSG: nobody said this. */
+        const char *text = row_text(message, meta);
+        if (!text) return;
+        send_tagged_line(fd, sess, server_time_ms, ":%s NOTICE %s :%s", prefix, channel, text);
+        return;
+    }
+
+    /* Anything future/unrecognized — no render yet. */
 }
 
 /* WIRE.md §3/§6: `topic_changed` payload is `{kind, network, channel,
