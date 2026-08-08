@@ -329,7 +329,7 @@ static bool next_space_token(const char **cursor, char *out, size_t out_sz) {
  * clients) and flips true on the FIRST `CAP` line of any kind; from
  * then on registration is gated on `cap_done` too. See
  * `handle_cap_command`'s own doc for the supported capability set and
- * REQ/ACK/NAK semantics (bicchierino#2's step 1). */
+ * REQ/ACK/NAK semantics. */
 struct registration {
     char pass_raw[IRC_LINE_MAX]; /* "network:password" or bare "password" */
     char account[IRC_LINE_MAX];  /* USER's first param */
@@ -593,8 +593,8 @@ static void send_tagged_line(int fd, const struct grappa_session *sess, long ser
  * once a client has shown it's IRCv3-aware at all (`struct
  * registration`'s own doc explains the gating rule).
  *
- * `batch`/`draft/chathistory` were advertised here through bicchierino#2's
- * step 1, in prep for CHATHISTORY — DROPPED (bicchierino#3): grappa's
+ * `batch`/`draft/chathistory` were advertised here in an earlier
+ * development pass, in prep for CHATHISTORY — dropped: grappa's
  * scrollback REST cursor is id-only (`?before=|after=|around=`, always
  * an integer message id, never a timestamp — confirmed against
  * `GrappaWeb.MessagesController`), so a `timestamp=` CHATHISTORY
@@ -607,8 +607,8 @@ static void send_tagged_line(int fd, const struct grappa_session *sess, long ser
  * batch-wrapped) — with CHATHISTORY gone, batch has no real consumer
  * here either, so it goes too rather than sitting advertised-but-unused.
  * `server-time`/`message-tags` remain: both are actually implemented
- * now (see `send_tagged_line`) — see bicchierino#3 for the CHATHISTORY
- * write-up and what would need to change on grappa's side to unblock it.
+ * now (see `send_tagged_line`) — unblocking CHATHISTORY would require
+ * a timestamp→id translation on grappa's side (see blocker above).
  *
  * The advertised set otherwise mirrors shottino's own CAP LS list
  * (`shottino.c:20944-20946`) minus the caps shottino has that
