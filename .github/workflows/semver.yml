@@ -40,11 +40,18 @@ jobs:
       - name: Compute next version from Conventional Commits
         id: version
         run: |
-          NEXT_VERSION="$(git-cliff --bumped-version)"
-          if [ -z "$NEXT_VERSION" ]; then
+          BUMPED="$(git-cliff --bumped-version)"
+          if [ -z "$BUMPED" ]; then
             echo "No conventional commits (feat/fix/...) since the last tag — nothing to release"
             exit 1
           fi
+          # git-cliff's own --bumped-version output has no "v" prefix
+          # (bare semver) regardless of whether the LAST tag had one —
+          # confirmed live: an earlier run of this workflow tagged a
+          # bare "0.1.0", which release.yml's tags: ['v*.*.*'] trigger
+          # silently never matched, so no release was ever built. Add
+          # it back here, once, rather than trust git-cliff to.
+          NEXT_VERSION="v${BUMPED#v}"
           echo "Next version: $NEXT_VERSION"
           echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
 
