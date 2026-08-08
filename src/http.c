@@ -8,9 +8,18 @@
 #include <string.h>
 #include <strings.h> /* strncasecmp — HTTP header names are case-insensitive */
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define GRAPPA_URL_PREFIX "https://"
+/* Timeout for the initial TCP connect() — bounds how long we wait if
+ * grappa's host is unreachable or blackholes SYNs. */
+#define HTTP_CONNECT_TIMEOUT_SEC 30
+/* Timeout for all subsequent I/O (SSL_read / SSL_write) on a connected
+ * socket — ensures an unresponsive server can't park the thread forever
+ * in SSL_read.  A timed-out read returns an error and the caller's
+ * existing reconnect-and-retry path handles it cleanly. */
+#define HTTP_IO_TIMEOUT_SEC 30
 #define HTTP_READ_CHUNK 4096
 #define HTTP_REQUEST_MAX 8192
 #define HTTP_HEADER_MAX 8192 /* grappa's own response headers are a few
@@ -72,6 +81,11 @@ static int tcp_connect(const char *host, const char *port) {
     for (rp = res; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
+        /* Bound the connect() call — without this, a host that blackholes
+         * SYNs stalls here for the kernel's full TCP connect timeout
+         * (~130 s on Linux) while the IRC client waits for its 001. */
+        struct timeval connect_tv = { .tv_sec = HTTP_CONNECT_TIMEOUT_SEC, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &connect_tv, sizeof(connect_tv));
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
@@ -91,6 +105,17 @@ static bool tls_connect(const struct parsed_url *pu, SSL_CTX **ctx_out, SSL **ss
                          int *fd_out) {
     int fd = tcp_connect(pu->host, pu->port);
     if (fd < 0) return false;
+
+    /* Override the connect-phase SO_SNDTIMEO with the I/O timeout and
+     * also arm SO_RCVTIMEO — from this point on any SSL_read or
+     * SSL_write that blocks past HTTP_IO_TIMEOUT_SEC returns an error
+     * rather than parking the thread forever.  Both paths through this
+     * function (http_client_connect for REST, https_tls_connect for the
+     * WebSocket leg) need this: an unresponsive grappa must not pin the
+     * connection thread indefinitely regardless of how it was opened. */
+    struct timeval io_tv = { .tv_sec = HTTP_IO_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_tv, sizeof(io_tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_tv, sizeof(io_tv));
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
