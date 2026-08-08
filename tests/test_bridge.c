@@ -232,38 +232,68 @@ TEST(a_server_that_never_replies_gives_up) {
     bridge_close(&br);
 }
 
-/* DEFECT, pinned rather than fixed — this suite does not touch src/.
- *
- * bridge_join escapes the topic into esc_topic[256], which TRUNCATES at
- * 255 bytes, and only then checks whether the assembled frame fits
- * frame[512]. Because the escaped topic can never exceed 255, that check
- * cannot fire on topic length alone: an over-long topic is silently
- * shortened and the join is issued against a DIFFERENT topic than the
- * caller named, reporting success.
- *
- * Not known to be reachable today — topics come from grappa's own
- * discovery (`rooms:<id>`, `$server`), not from downstream client bytes.
- * The assertion below therefore records what the code does now; when the
- * truncation is made to fail closed, this test flips and should be
- * rewritten to expect the refusal. bridge_push has the same escape
- * truncation but a raw json_payload that CAN overflow 512, which is why
- * the push case below really does fail closed. */
-TEST(an_oversized_topic_is_silently_truncated_today) {
+/* #14. A topic that does not fit must not be shortened and sent: the
+ * result would not be a degraded message, it would be a join on a
+ * DIFFERENT channel, reported as success. Nothing goes on the wire. */
+TEST(a_topic_that_does_not_fit_is_refused_not_shortened) {
     struct bridge br;
     fresh(&br);
-    char big[600];
+    char big[BRIDGE_TOPIC_MAX + 64];
     memset(big, 't', sizeof(big) - 1);
     big[sizeof(big) - 1] = '\0';
 
-    ws_stub_queue(WS_TEXT, "[\"1\",\"1\",\"t\",\"phx_reply\",{\"status\":\"ok\"}]");
-    bridge_join(&br, big, NULL, NULL, NULL);
+    CHECK(!bridge_join(&br, big, NULL, NULL, NULL));
+    CHECK_LONG(ws_stub_sent_count(), 0);
 
+    bridge_close(&br);
+}
+
+/* The bound has to fit what connection.c can legally build: a topic from
+ * subject_name[128] + network_slug[64] + a folded channel[128] reaches
+ * 347 bytes, and every one of those is a real join that must still work.
+ * A fix that refused these would trade a silent wrong join for an
+ * outright broken one. */
+TEST(the_longest_topic_connection_c_can_build_still_joins) {
+    struct bridge br;
+    fresh(&br);
+
+    char subject[128], network[64], channel[128];
+    memset(subject, 's', sizeof(subject) - 1);
+    subject[sizeof(subject) - 1] = '\0';
+    memset(network, 'n', sizeof(network) - 1);
+    network[sizeof(network) - 1] = '\0';
+    channel[0] = '#';
+    memset(channel + 1, 'c', sizeof(channel) - 2);
+    channel[sizeof(channel) - 1] = '\0';
+
+    char topic[512];
+    int n = snprintf(topic, sizeof(topic), "grappa:user:%s/network:%s/channel:%s", subject, network,
+                     channel);
+    CHECK(n == 347); /* the number in #14 — if this moves, the bound needs revisiting */
+
+    ws_stub_queue(WS_TEXT, "[\"1\",\"1\",\"t\",\"phx_reply\",{\"status\":\"ok\"}]");
+    CHECK(bridge_join(&br, topic, NULL, NULL, NULL));
     CHECK_LONG(ws_stub_sent_count(), 1);
-    const char *sent = ws_stub_sent(0);
-    CHECK(sent != NULL);
-    /* 255 t's made it, the other 344 did not, and nothing said so. */
-    CHECK(sent && strstr(sent, "\"phx_join\"") != NULL);
-    CHECK(sent && strlen(sent) < 600);
+    /* And it went out whole — the topic in the frame is the one asked for. */
+    CHECK(ws_stub_sent(0) && strstr(ws_stub_sent(0), topic) != NULL);
+
+    bridge_close(&br);
+}
+
+/* Escaping expands: a `"` costs 2 bytes, a control byte costs 6. A topic
+ * that fits raw can therefore still not fit escaped, and that case has to
+ * refuse for the same reason. */
+TEST(a_topic_that_only_overflows_once_escaped_is_also_refused) {
+    struct bridge br;
+    fresh(&br);
+
+    char big[BRIDGE_TOPIC_MAX - 32];
+    for (size_t i = 0; i < sizeof(big) - 1; i++) big[i] = '"';
+    big[sizeof(big) - 1] = '\0';
+    CHECK(strlen(big) < BRIDGE_TOPIC_MAX); /* fits raw ... */
+
+    CHECK(!bridge_join(&br, big, NULL, NULL, NULL)); /* ... not escaped */
+    CHECK_LONG(ws_stub_sent_count(), 0);
 
     bridge_close(&br);
 }
@@ -307,14 +337,36 @@ TEST(a_push_escapes_its_topic_and_event) {
     bridge_close(&br);
 }
 
-TEST(an_oversized_push_fails_instead_of_sending_a_truncated_frame) {
+/* json_payload is interpolated raw, so it is snprintf's return value that
+ * catches this one rather than the escaper — but the outcome must be the
+ * same: nothing truncated goes on the wire. */
+TEST(an_oversized_push_payload_fails_instead_of_sending_a_truncated_frame) {
     struct bridge br;
     fresh(&br);
-    char big[600];
+    char big[BRIDGE_FRAME_MAX + 64];
     memset(big, 'p', sizeof(big) - 1);
     big[sizeof(big) - 1] = '\0';
 
     CHECK(!bridge_push(&br, "rooms:1", 1, "ev", big));
+    CHECK_LONG(ws_stub_sent_count(), 0);
+
+    bridge_close(&br);
+}
+
+TEST(an_oversized_push_topic_or_event_is_refused) {
+    struct bridge br;
+    fresh(&br);
+
+    char big_topic[BRIDGE_TOPIC_MAX + 8];
+    memset(big_topic, 't', sizeof(big_topic) - 1);
+    big_topic[sizeof(big_topic) - 1] = '\0';
+    CHECK(!bridge_push(&br, big_topic, 1, "ev", "{}"));
+
+    char big_event[BRIDGE_EVENT_MAX + 8];
+    memset(big_event, 'e', sizeof(big_event) - 1);
+    big_event[sizeof(big_event) - 1] = '\0';
+    CHECK(!bridge_push(&br, "rooms:1", 1, big_event, "{}"));
+
     CHECK_LONG(ws_stub_sent_count(), 0);
 
     bridge_close(&br);
@@ -333,11 +385,14 @@ int main(void) {
     RUN(my_own_reply_without_a_status_fails_the_join);
     RUN(a_closed_socket_fails_the_join_instead_of_spinning);
     RUN(a_server_that_never_replies_gives_up);
-    RUN(an_oversized_topic_is_silently_truncated_today);
+    RUN(a_topic_that_does_not_fit_is_refused_not_shortened);
+    RUN(the_longest_topic_connection_c_can_build_still_joins);
+    RUN(a_topic_that_only_overflows_once_escaped_is_also_refused);
     RUN(a_push_on_a_joined_topic_carries_its_join_ref);
     RUN(a_push_with_no_join_ref_encodes_null_not_zero);
     RUN(a_push_escapes_its_topic_and_event);
-    RUN(an_oversized_push_fails_instead_of_sending_a_truncated_frame);
+    RUN(an_oversized_push_payload_fails_instead_of_sending_a_truncated_frame);
+    RUN(an_oversized_push_topic_or_event_is_refused);
     events_reset();
     ws_stub_reset();
     return test_report();
