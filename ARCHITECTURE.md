@@ -7,6 +7,45 @@ bridges the two protocols for as long as the client is attached.
 
 This document is architecture only. No code yet.
 
+## Guiding principle: as dumb as possible
+
+bicchierino is a **stateless JSON⇄IRC translator**, nothing more. It holds
+no state that outlives a connection, and it originates no domain logic of
+its own — grappa already decides what happened, bicchierino only decides
+how to say it in IRC.
+
+This is possible, not just a nice slogan, because grappa's own persistence
+turns out to be complete enough to make it true (checked directly, see
+`lib/grappa/scrollback/message.ex` + `event_router.ex`):
+`Grappa.Scrollback.Message` covers `:privmsg`, `:notice`, `:action`,
+`:join`, `:part`, `:quit`, `:nick_change`, `:mode`, `:topic`, `:kick`, plus
+a `:server_event` catch-all that keeps `raw_verb`/`raw_sender`/`raw_params`
+for anything else (`KILL`, `WALLOPS`, vendor verbs, …) — nothing falls
+through uncaptured. So a fresh login + a REST replay reconstructs a session
+that is content-equivalent to one that stayed connected the whole time.
+grappa's own wire is JSON, not IRC bytes (`Scrollback.Wire` says the IRC
+serializer is still an unbuilt "Phase 6" on grappa's side) — the JSON→IRC
+translation is exactly bicchierino's one job, same as it's already
+shottino's one job on the client side today.
+
+**What "no state" actually means, precisely:**
+- **Nothing persists across a disconnect.** No session cache, no reattach,
+  no on-disk anything. Every new connection is a fresh `/auth/login` +
+  fresh WS join + fresh channel-snapshot fetch + fresh `CHATHISTORY` replay
+  for backfill. This resolves former open questions 1 and 4 outright —
+  4 doesn't just get answered, it stops applying: there is no reattach
+  path to decide an identity rule for.
+- **Something small DOES live in memory for the duration of one live
+  connection**, and this is not a contradiction: to answer `WHOIS`/`NAMES`/
+  `WHO` without a REST round-trip per query, bicchierino keeps the same
+  kind of per-channel member/topic/mode mirror shottino keeps
+  (`ircd_cmd_whois` answers from `app->windows[i].members`, never forwards
+  upstream). This isn't extra state to design or maintain — it falls out
+  for free from relaying `JOIN`/`PART`/`QUIT`/`NICK`/`MODE`/`KICK` events to
+  the client, which bicchierino has to parse and translate anyway. Discarded
+  the instant the socket closes; never written anywhere; never consulted by
+  a different connection.
+
 ## Scope
 
 **In scope:**
@@ -40,10 +79,10 @@ different auth lifecycle (per-connection login vs. per-process login).
 ### scbnc (`irc/scbnc`) — pattern reference, no code copied
 C bouncer already running in this infra. Relevant
 architecture to imitate:
-- **libevent** event loop instead of hand-rolled `select`/`poll`.
 - Per-user session triggered by the client's own `PASS` at registration —
   the multi-tenant shape we want, just against a real ircd instead of
-  grappa.
+  grappa. (scbnc itself uses libevent for its reactor — see "Event loop"
+  below for why we don't follow it there.)
 - SSL/TLS on both the client-facing and server-facing side.
 
 ### shottino `--ircd` (`frontends/shottino/shottino.c:20780-21209`) — logic reference
@@ -80,6 +119,35 @@ reads `c->user`). We give it a job: it's the grappa login identifier.
   `GrappaWeb.UserChannel` directly when we get to implementation — not
   guessed.
 
+## Event loop: `poll()`, no library
+
+Checked directly: shottino itself does **not** use libevent, or any event
+library — plain `poll()` (`shottino.c:21462-21493`), direct OpenSSL for
+TLS. Final runtime deps are just `libssl, libcrypto, libm, libc, libz,
+libzstd`. Considered and rejected in favor of this:
+
+- **libevent** (what scbnc uses) — the one thing it buys over raw `poll()`
+  is `bufferevent_openssl` (TLS wired into the reactor). Against that:
+  some discomfort with the library itself (not universal, but real), and
+  every event library still leaves you writing the OpenSSL BIO plumbing
+  by hand for anything beyond the simple client-role case anyway.
+- **epoll directly** — considered and dropped. `epoll` is **Linux-only**;
+  vjt develops on BSD, which is presumably exactly why shottino uses
+  `poll()` and not `epoll` — `poll()` is POSIX (POSIX.1-2001), identical
+  behavior on Linux, FreeBSD, OpenBSD, NetBSD, macOS. `epoll`'s O(1) vs.
+  `poll()`'s O(n) fd-scan is not a real difference at bicchierino's scale
+  (tens of connections, not tens of thousands) — so there is no upside to
+  the Linux lock-in and a real downside (can't build/run alongside vjt's
+  own toolchain).
+- **libuv** — modern, actively maintained, MIT, nicer API than libevent.
+  Still doesn't include TLS (same OpenSSL wiring either way), so the
+  actual win over raw `poll()` is thinner than it looks — and it's still a
+  dependency to justify.
+
+**Decided: `poll()` + direct OpenSSL, matching shottino exactly.** One
+fewer dependency, portable to whatever vjt's own machine is, and proven at
+this exact scale by the very codebase we're vendoring pieces of.
+
 ## Vendoring (MIT, no restriction — confirmed)
 
 `grappa-irc` is MIT, single top-level `LICENSE`, no per-file restriction
@@ -101,66 +169,140 @@ Marcello Barnaba / `vjt/grappa-irc`, MIT, alongside the vendored files.
 Worth a heads-up to vjt when this starts for real, even though the license
 doesn't require it.
 
-## Connection lifecycle (draft)
+## Connection lifecycle
+
+Superseded by `WIRE.md` for the exact request/response shapes — this is
+just the sequencing, kept here because it's the shape the code follows,
+not the wire detail. `WIRE.md` §1-4 is authoritative; this diagram was
+wrong on two points in an earlier draft (bearer via query string, a
+single generic network join, no bootstrap REST calls) and has been
+corrected against it, not the other way around.
 
 ```
 downstream IRC client                bicchierino                    grappa
         |                                |                             |
-        |--- CAP LS / PASS / NICK / USER ->                            |
+        |--- CAP LS / PASS net:pw / NICK / USER ->                     |
         |                                | (buffered until NICK+USER)  |
         |                                |--- POST /auth/login ------->|
-        |                                |    {account, password}      |
-        |                                |<-- 200 {token} -------------|
-        |                                |   (or 401 -> IRC 464, close)|
-        |                                |--- WS connect /socket ----->|
-        |                                |    ?token=...                |
-        |                                |<-- phx_reply ok -------------|
-        |                                |--- phx_join user:<id> ----->|
-        |                                |<-- channels/state ------------|
-        |<-- 001..005, MOTD, JOINs, replay -|                             |
+        |                                |    {identifier, password}   |
+        |                                |<-- 200 {token, subject} ----|
+        |                                |   (401 / unreachable: bare  |
+        |                                |    ERROR, close — §3.3)     |
+        |                                |--- GET /networks ----------->|
+        |                                |<-- [{slug, id, ...}] --------|
+        |                                | (resolve PASS's network      |
+        |                                |  against this list; zero     |
+        |                                |  or unmatched: ERROR, close) |
+        |                                |--- GET /networks/:slug/     ->|
+        |                                |    channels                  |
+        |                                |<-- [{name, joined, ...}] ----|
+        |                                |--- WS connect /socket ------>|
+        |                                |    (bearer via              |
+        |                                |    Sec-WebSocket-Protocol,   |
+        |                                |    not query string)         |
+        |                                |--- phx_join                 ->|
+        |                                |    grappa:user:{subject}     |
+        |                                |<-- snapshot (DM windows,     |
+        |                                |    topic/modes) -------------|
+        |                                |--- phx_join per joined       ->|
+        |                                |    channel + own-nick DM     |
+        |                                |    listener (WIRE.md §4-5)   |
+        |                                |--- push visibility:true     ->|
+        |<-- 001..005, MOTD, JOINs -------|                             |
         |                                |                             |
         |--- PRIVMSG #chan :hi --------->|--- push message ----------->|
         |                                |<-- event (echo/others) ------|
         |<-- :nick PRIVMSG #chan :hi ----|                             |
         |                                |                             |
-        |--- QUIT / disconnect --------->|--- (see open question: -----|
-        |                                |     teardown or detach?)    |
+        |--- QUIT / disconnect --------->|--- WS leave + close -------->|
+        |                                | (in-memory mirror dropped;   |
+        |                                |  nothing persisted)          |
 ```
+
+## Decided
+
+### Identity has three fronts, not two: user, password, network
+
+grappa is multi-user **and** multi-network — an account can have several
+networks bound, same as shottino's own `--ircd` had to handle. So
+authentication needs three pieces of information, not two, and IRC's
+registration handshake only gives us two fields to carry them in:
+
+- `USER`'s first param → grappa **account** (already decided).
+- `PASS` → **`network:password`** (shottino's own convention, kept
+  as-is — no reason to invent a new separator when one already exists and
+  every existing shottino user already knows it).
+
+So `PASS azzurra:hunter2` means: log into grappa as the account from
+`USER`, with password `hunter2`, and bridge the `azzurra` network bound to
+that account. A `PASS` with no colon is tried as a bare password against
+the account's only network first (single-network accounts don't need to
+name one — same fallback shottino already has in `ircd_register`), and
+answered with the network list if that account has more than one and none
+was named.
+
+This resolves former open question 3 outright — no longer a fork, it's
+the design.
+
+### OpenSSL, in two distinct roles — don't conflate them
+
+TLS is needed on **both legs**, but they are not the same job and the code
+must not pretend they are:
+
+- **Client role** (bicchierino → grappa): `SSL_connect`, verifying
+  *grappa's* server certificate (chain of trust, hostname check) for the
+  REST login (`https://`) and the Phoenix Channels socket (`wss://`). No
+  local certificate needed on our side for this leg.
+- **Server role** (downstream IRC client → bicchierino): `SSL_accept`,
+  presenting **bicchierino's own** certificate + private key to whatever
+  connects to the `ircs://` listener. This is the leg that needs a cert to
+  provision/renew (self-signed or real, per how it's deployed — same
+  the same kind of question a TLS-terminating reverse-proxy front answers once, not a new problem to solve from scratch).
+
+Same library (direct OpenSSL, no bufferevent — see "Event loop" above),
+two different `SSL_CTX` setups, two different handshake directions. Both
+sides matter independently: loopback-only downstream deployments can skip
+the server-role cert (plaintext on `127.0.0.1`, same reasoning shottino's
+`--ircd` already uses for `SHOTTINO_IRCD_PASS`), but the client role
+towards grappa is not optional — grappa is presumably always behind TLS.
+
+### Horizontal scaling is free, because there's no state to coordinate
+
+Direct consequence of "Guiding principle" above: since no state survives a
+disconnect and the only per-connection state (the WHOIS/NAMES mirror) is
+private to that one connection, **nothing needs to be shared between
+bicchierino processes**. N instances behind a plain TCP load balancer (or
+even bare DNS round-robin — an IRC client reconnecting to a different IP
+is normal) need zero coordination: no sticky sessions, no shared cache, no
+cluster protocol. Relevant if this ever fronts more than a personal/small-
+group deployment (a small IRC network's worth of users) — `poll()`'s O(n)
+cost per process stays irrelevant by keeping each instance's connection
+count low, rather than by switching to `epoll`/`kqueue`.
+
+### grappa base URL is daemon-level config, not per-connection
+
+One bicchierino process → one grappa deployment, given at daemon startup
+(CLI arg, matching shottino's own positional
+`https://grappa.example.net`). The thing that varies per-connection is
+*who's* logging in (account/password/network, from `USER`/`PASS`) — the
+deployment it's logging into is an infrastructure choice, fixed for the
+life of the process, not something a random downstream IRC client should
+be able to redirect. It also composes cleanly with horizontal scaling
+(above): every instance behind the load balancer points at the same
+`--grappa-url`, no per-connection routing logic needed anywhere.
 
 ## Open questions — decide before writing code
 
-1. **Session persistence on disconnect.** Does the grappa session die with
-   the IRC socket (simplest, but loses "offline while client is away"
-   bouncer behavior — the whole point of a bouncer), or does it persist
-   detached and reattach on the next connection with matching
-   account+password (real bouncer behavior, needs a session cache keyed by
-   grappa account, closer to what scbnc already does for real IRC
-   servers)? This is the single biggest architectural fork — decides
-   whether bicchierino needs any persistent state at all.
-2. **grappa base URL**: one bicchierino process → one grappa deployment,
-   configured at daemon startup (matches how you'd actually run it against
-   e.g. your own grappa instance), or does it need to be per-connection
-   too? Leaning toward daemon-level config — the account/password varying
-   per-connection is the actual ask, the target deployment isn't.
-3. **Multi-network per account**: keep shottino's `PASS
-   network:password` convention so one account can pick among several
-   grappa-bound networks, or assume one network per account and drop the
-   prefix entirely? Depends on whether your actual grappa accounts have
-   more than one network bound.
-4. **TLS**: both legs need it eventually (downstream for real clients off
-   loopback, upstream because grappa is presumably HTTPS/WSS). libevent's
-   `bufferevent_openssl` on both sides, matching scbnc's existing approach
-   — no new decision needed here, just confirming before implementation.
-5. **Reattach identity**: if (1) picks persistence, how is "same session"
-   decided — account name alone, or account+password re-checked each
-   time? Re-checking is safer (a revoked/changed password should kick a
-   stale session) but means every reconnect is a fresh `/auth/login` call
-   even for a session that never actually died.
+None left. All four are resolved above:
+~~1. Session persistence~~, ~~2. Reattach identity~~, ~~3. TLS~~,
+~~4. grappa base URL~~.
 
 ## Next step
 
-Once (1)-(3) above are answered, the actual work is: read
-`GrappaWeb.UserSocket`/`UserChannel` to pin the exact connect-param and
-channel-topic shape, then write the skeleton (libevent listener +
-vendored `ws.c`/`json.c` + the registration/login/bridge state machine
-sketched above).
+Nothing left to decide at the architecture level — implementation can
+start. First real step: read `GrappaWeb.UserSocket`/`UserChannel` to pin
+the exact connect-param and channel-topic shape (the one piece of the
+design that was deliberately left "read the code when we get there"
+rather than guessed), then write the skeleton (`poll()`-based listener +
+direct OpenSSL + vendored `ws.c`/`json.c` + the registration/login/bridge
+state machine sketched above).

@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  build:
+    name: build (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags — `git describe` (the Makefile's own
+          # version derivation) needs tag refs that a shallow default
+          # checkout doesn't fetch.
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      # -Werror on top of the Makefile's own always-on -Wall -Wextra
+      # -Wpedantic -Wformat=2 (see Makefile's own comment: those are
+      # appended unconditionally, never dropped by a CFLAGS override —
+      # this only adds strictness on top, it can't accidentally weaken
+      # the baseline).
+      - name: Build with warnings as errors
+        run: |
+          make clean
+          make CC=${{ matrix.cc }} CFLAGS="-O2 -Werror"
+
+      - name: Binary sanity check
+        run: ./bicchierino --config /nonexistent-config 2>&1 | grep -q "cannot open config file" || (echo "unexpected startup behavior" && exit 1)
+
+      - name: Version is real, not the no-tags fallback
+        run: |
+          v=$(./bicchierino --version)
+          echo "$v"
+          echo "$v" | grep -vq 'v0\.0\.0+unknown' || (echo "version derivation produced the total-fallback value — checkout history/tags are missing" && exit 1)
+
+  sanitizers:
+    name: ASan/UBSan build + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags — `git describe` (the Makefile's own
+          # version derivation) needs tag refs that a shallow default
+          # checkout doesn't fetch.
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev python3
+
+      # No -Werror here on purpose: this job's goal is runtime
+      # instrumentation, not warning strictness (that's the build job's
+      # job) — keep it decoupled so a sanitizer-only concern here never
+      # depends on the warning-strictness build passing first, or vice
+      # versa.
+      - name: Build with ASan + UBSan
+        run: |
+          make clean
+          make CFLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      # No live grappa in CI, so this can't exercise a real login/bridge
+      # round trip. What it CAN verify without one: the safety-default
+      # config validation, and that the IRC line parser survives a
+      # burst of malformed/hostile input on a real accepted connection
+      # without ASan/UBSan flagging anything — this binary's own stated
+      # threat model (Makefile's own comment: "parses hostile bytes ...
+      # so the hardening earns its keep").
+      - name: Non-loopback plain bind is refused without --insecure
+        run: |
+          cat > refuse.config <<'EOF'
+          grappa-url https://127.0.0.1:1
+          bind 0.0.0.0 17667 plain
+          EOF
+          ! ./bicchierino --config refuse.config
+
+      - name: Smoke test — malformed input under ASan/UBSan
+        run: |
+          cat > smoke.config <<'EOF'
+          grappa-url https://127.0.0.1:1
+          bind 127.0.0.1 17667 plain
+          EOF
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./bicchierino --config smoke.config &
+          BICCHIERINO_PID=$!
+          sleep 1
+
+          python3 - <<'EOF'
+          import socket, time
+          lines = [
+              b"\r\n",
+              b":\r\n",
+              b"NICK\r\n",
+              b"NICK " + b"A" * 4000 + b"\r\n",
+              b"USER a b c :d\r\n",
+              b"PASS \r\n",
+              b"PASS " + b":" * 100 + b"\r\n",
+              b"\x00\x01\x02\x03\r\n",
+              b"CAP LS\r\n",
+              b"CAP REQ :" + b"unknown-cap " * 200 + b"\r\n",
+              ("x" * 8000).encode() + b"\r\n",
+          ]
+          for line in lines:
+              try:
+                  s = socket.create_connection(("127.0.0.1", 17667), timeout=2)
+                  s.sendall(line)
+                  time.sleep(0.1)
+                  s.close()
+              except OSError:
+                  pass
+          EOF
+
+          sleep 1
+          if ! kill -0 $BICCHIERINO_PID 2>/dev/null; then
+            echo "bicchierino crashed while handling malformed input"
+            exit 1
+          fi
+          kill $BICCHIERINO_PID
+          wait $BICCHIERINO_PID 2>/dev/null || true

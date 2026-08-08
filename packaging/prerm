@@ -1,0 +1,10 @@
+#!/bin/sh
+# prerm — stop the service before files are removed, so dpkg never
+# yanks a binary out from under a running process.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl stop bicchierino >/dev/null 2>&1 || true
+fi
+
+exit 0

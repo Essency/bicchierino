@@ -1,0 +1,33 @@
+[Unit]
+Description=bicchierino — stateless IRC-facade bridge to grappa
+Documentation=https://github.com/Essency/bicchierino
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bicchierino
+Group=bicchierino
+ExecStart=/usr/bin/bicchierino --config /etc/bicchierino/bicchierino.config
+Restart=on-failure
+RestartSec=5
+
+# Hardening. ProtectSystem=strict mounts the whole filesystem read-only
+# except /dev, /proc, /sys and ReadWritePaths= below — bicchierino only
+# ever needs to WRITE to its own log directory (when log-file is
+# configured; reading /etc/bicchierino/* for config/certs works fine
+# under a read-only mount, this only affects writes).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/bicchierino
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
