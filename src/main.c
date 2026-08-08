@@ -35,7 +35,7 @@
  * decremented by connection_run at every exit path.  Atomic because
  * the decrements happen on the connection threads, not the accept
  * thread. */
-static atomic_int g_live_connections = ATOMIC_VAR_INIT(0);
+static atomic_int g_live_connections = 0;
 
 struct listener {
     int fd;
