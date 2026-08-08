@@ -1,0 +1,95 @@
+# services.conf template — rendered by entrypoint.sh.
+# Keep minimal; testnet-grade.
+
+# Link to the hub. Services dials out; docker forward DNS on svc-net
+# resolves hub.azzurra.chat to the hub's static IP. The hub's inbound
+# match is by source IP (find_conf_ip against the bare IP in
+# conf.hub.tmpl, post `*@` auto-prefix), not by the host field here —
+# hostname works.
+C:${SERVICES_NAME}:${SERVICES_PASSWORD}:${HUB}:${HUB_PORT}
+
+# Description, as shown in /links.
+D:${SERVICES_DESC}
+
+# User@host every services client presents.
+U:service:azzurra.chat
+
+# Network + master nick (owner of the net).
+A:Azzurra
+M:${SERVICES_MASTER}
+
+# Services clients.
+NS:NickServ
+CS:ChanServ
+MS:MemoServ
+HS:HelpServ
+OS:OperServ
+RS:RootServ
+ST:StatServ
+SS:SeenServ
+Global:Azzurra
+
+# Tunables — sensible testnet defaults.
+UPDATE:1200
+TIMEOUT:2
+P:5:300:5:30
+MEMOMAX:32
+MEMO_DELAY:20
+NICKEXP:40
+CHANEXP:40
+MEMOEXP:21
+STATEXP:30
+SEENEXP:30
+AKILLEXP:3600
+IGNEXP:10800
+CHAN_ACC_MAX:400
+U_ACC_MAX:5
+
+# Outbound AUTH mail — env-gated (GH #349). Defaults (SVC_EMAIL=0) keep
+# the historic "no sendmail in the container" behavior; the grappa e2e
+# compose sets SVC_EMAIL=1 + SVC_FORCE_AUTH=1 to exercise the real
+# register→emailed-AUTH-code→+r flow against a mailpit sink. services
+# shells out via system("<SENDMAIL> -f <RETURN> -t < authnick.txt")
+# (nickserv.c do_register); the runtime image ships msmtp as
+# /usr/sbin/sendmail relaying to mailpit (see msmtprc). conf.c fatals on
+# (!EMAIL && FORCE_AUTH) and (!EMAIL && AUTODEL), so the SVC_* defaults
+# keep all three coherent when email is off. SENDMAIL/RETURN are inert
+# when EMAIL is off (parsed but never used).
+EMAIL:${SVC_EMAIL}
+SENDMAIL:${SVC_SENDMAIL}
+RETURN:${SVC_RETURN}
+FORCE_AUTH:${SVC_FORCE_AUTH}
+AUTODEL:${SVC_AUTODEL}
+
+# Clone-akill threshold — env-gated (GH #349). Maps to conf.c's CLONES
+# directive → CONF_AKILL_CLONES; default 5 mirrors the azzurra/services
+# built-in (autokill on the 5th connection from one IP; expiry 600s).
+# grappa is a BOUNCER: every session it opens (bahamut-test + azzurra +
+# azzurra-reg — all linked to THIS one hub) originates from grappa's
+# single container IP, so services count them as clones and autokill the
+# IP once the 5th lands. On a hermetic single-tenant testnet that is a
+# false positive that turns the FULL integration suite red from a hard
+# cliff (`k-line: You have been Autokilled.` → session :failed →
+# resetSubject 500 → every live-IRC spec times out). The grappa e2e
+# compose sets SVC_AKILL_CLONES=0 to disable clone-AUTOKILL (0 is a valid
+# conf.c value — clone detection/globops still run, only the autokill is
+# off). The standalone testnet keeps the default 5. NB: conf.c fatals on
+# a value that is non-zero AND < CONF_CLONE_MIN_USERS(5), or > 50.
+CLONES:${SVC_AKILL_CLONES}
+
+# Show taglines when saving databases. The DIRECTIVE is TAGLINES —
+# SHOW_TAGLINES is the C variable it sets (conf.c:448), and using that
+# name fatals the daemon with "Unknown option".
+#
+# Added for the bicchierino baseline, and NOT present in the testnet's own
+# template. conf.c defaults CONF_SHOW_TAGLINES to FALSE (conf.c:219) and
+# tagline_show() returns early without it (tagline.c:523), so the
+# store-and-expire cycle emits
+#     *** Global -- from services.azzurra.chat: Completed database write (0 secs)
+# with no trailing " -> <tagline>".
+#
+# That trailing part is the whole point here: the operator's
+# notice_route.py special-cases exactly this line and bolds whatever
+# follows the arrow, and with taglines off there is nothing to bold, so
+# the branch is untestable.
+TAGLINES:1

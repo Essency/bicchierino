@@ -1,0 +1,295 @@
+# bicchierino test stack — an azzurra testnet with NO route off the host.
+#
+# azzurra.chat is a real, live network, and its names are compiled into
+# bahamut and services (config.h's STATS_NAME / STAFF_ADDRESS /
+# HELPER_ADDRESS, services' conf.c return address). The testnet reproduces
+# those names on purpose — that is what makes it a faithful target for
+# bicchierino — so the containment has to be structural, not a matter of
+# getting some config right.
+#
+# Every network below is `internal: true`: docker gives an internal network
+# no gateway at all, so nothing in this stack can send a packet off the
+# host — to azzurra prod or anywhere else. That is the whole guarantee, and
+# test/isolation.sh asserts it rather than trusting this comment.
+#
+# Image BUILDS still reach the network (docker build uses the host's
+# network, not these), so `compose build` works normally — it is the
+# RUNTIME that is sealed.
+name: bicchierino-test
+
+include:
+  # hub + leaf-v4 + leaf-v6 + services, bahamut built from source.
+  # Pinned as a submodule at test/azzurra-testnet.
+  - path: ./azzurra-testnet/compose.yaml
+
+services:
+  # The testnet's cert-init runs `apk add openssl` as its first step, which
+  # needs the network AT RUNTIME — the one thing this stack must not have.
+  # Sealing the networks turns that into `ERROR: unable to select packages`
+  # and the whole stack refuses to start.
+  #
+  # So the package is installed at BUILD time instead, where reaching a
+  # mirror is fine, and the container runs with no network need at all. Same
+  # script, same volume, same output: only the moment the dependency is
+  # resolved moves. The image is renamed rather than left as `alpine:3.20`,
+  # since building into that tag would shadow the real alpine image on the
+  # host for everything else.
+  cert-init:
+    image: bicchierino-test-certinit
+    build:
+      context: .
+      dockerfile: Dockerfile.certinit
+    entrypoint: ["/bin/sh"]
+    command: ["/certs/gen-cert.sh"]
+
+  # The testnet publishes 6667/6697 on the host by default. Drop that:
+  # nothing here should be reachable from outside the compose network, and
+  # a published port would also clash with a real client on the box.
+  hub:
+    ports: !override []
+
+  # Clients ALWAYS attach to a leaf, never the hub — hubs are S2S routers.
+  # `bahamut-test` is the one name the rest of the stack points at.
+  leaf-v4:
+    ports: !override []
+    networks:
+      leaf4-net: null
+      bicc-net:
+        aliases: [leaf4.azzurra.chat, bahamut-test]
+
+  leaf-v6:
+    ports: !override []
+
+  # Left mail-free: SVC_EMAIL defaults to 0 in the testnet, and outbound
+  # mail is the one thing in this stack that would genuinely want to leave
+  # the host. Not enabling it is a second layer under `internal: true`.
+  services:
+    environment:
+      # Must be 0, and NOT for the reason the testnet's own conf.tmpl gives.
+      #
+      # That template writes `CLONES:${SVC_AKILL_CLONES}` and defaults the
+      # variable to 5, describing it as the clone-autokill threshold. It is
+      # not: in azzurra/services' conf.c, `CLONES` is a BOOLEAN mapping to
+      # CONF_SET_CLONE (`(value != FALSE) && (value != TRUE)` fatals), while
+      # the numeric threshold is a separate `CLONEKILL` directive mapping to
+      # CONF_AKILL_CLONES. So the default 5 fatals at startup with
+      # "Value 5 for CLONES is not valid", and the testnet cannot bring
+      # services up at all on its own defaults. 0 works only because it is
+      # a valid boolean false — it turns clone DETECTION off, which is not
+      # the same thing as the autokill the template means to disable.
+      #
+      # 0 is the right value here regardless: grappa is a bouncer, so every
+      # session it opens shares one container IP and clone handling would
+      # fire on our own traffic. Worth reporting upstream to
+      # vjt/azzurra-testnet rather than carrying quietly.
+      SVC_AKILL_CLONES: "0"
+      # Services identifies its root by NICK, not by which O:line you
+      # opered with — and the testnet defaults this to `testoper`, a nick
+      # nothing in this stack ever holds. Left alone, every RootServ /
+      # OperServ command answers "Access denied" no matter how many flags
+      # the O:line carries, which reads like a bicchierino relay failure
+      # and is not one.
+      #
+      # The bridged session's nick is what has to match.
+      SERVICES_MASTER: bicc-grappa
+    volumes:
+      # The testnet's template with SHOW_TAGLINES added. conf.c defaults
+      # CONF_SHOW_TAGLINES to FALSE and the template never sets it, so the
+      # database-write global ships without its trailing "-> <tagline>" —
+      # and that trailing part is precisely the branch notice_route.py
+      # special-cases. Without this the rule cannot be exercised at all.
+      - ./services.conf.tmpl:/opt/azzurra/services/services.conf.tmpl:ro
+    networks:
+      svc-net: null
+      bicc-net:
+        aliases: [services, services.azzurra.chat]
+
+  # ── grappa ────────────────────────────────────────────────────────────
+  #
+  # Only what bicchierino needs: the REST API and the Phoenix Channels
+  # socket. Everything the cicchetto e2e stack carries for the browser —
+  # nginx, the bun SPA build, mailpit, push-catcher, the second solanum
+  # network — is left out.
+  #
+  # Storage is sqlite under ./runtime, bind-mounted so it lands with the
+  # operator's uid: grappa drops to that uid, and a named volume would
+  # initialise root-owned and fail the sqlite open. Same reason the source
+  # tree is bind-mounted rather than baked — the image is toolchain-only.
+  grappa-seed:
+    build:
+      context: ./grappa
+      args:
+        CONTAINER_UID: ${CONTAINER_UID:-1000}
+        CONTAINER_GID: ${CONTAINER_GID:-1000}
+    image: grappa:bicchierino-test
+    pull_policy: never
+    user: "${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000}"
+    working_dir: /app
+    depends_on:
+      leaf-v4:
+        condition: service_started
+    volumes:
+      - ./grappa:/app
+      - ./runtime/grappa:/app/runtime
+    environment:
+      MIX_ENV: dev
+      ELIXIR_ERL_OPTIONS: "+fnu"
+      GRAPPA_CAPTCHA_PROVIDER: disabled
+    # OFFLINE ONLY. Hex, rebar and deps are fetched by ./prepare.sh before
+    # this stack comes up, because they need the network and this stack
+    # has none — see that script's header. Everything below is local work
+    # against the tree prepare.sh populated: sqlite migrations and two
+    # grappa mix tasks, none of which touch the network.
+    #
+    # `--auth none` because services on this testnet has no account
+    # registered for us, and the bind points at the LEAF, never the hub —
+    # hubs are S2S routers.
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+        mix ecto.create
+        mix ecto.migrate
+        # `up` runs this on EVERY boot while the sqlite file survives in
+        # ./runtime, and `grappa.create_user` has no upsert path — it dies
+        # on the unique index and, via
+        # `condition: service_completed_successfully`, takes the whole
+        # stack down with it. That is the failure the cicchetto e2e works
+        # around with a wrapper script.
+        #
+        # Querying first was the obvious guard and does not work:
+        # `mix run --no-start` leaves the Repo unstarted, so the check
+        # itself errors and every boot takes the create path anyway.
+        # Starting the app just to ask would boot the whole supervision
+        # tree, IRC sessions included, inside a seeder.
+        #
+        # So both tasks are best-effort here, and the end state is what
+        # gets verified — downstream, by bicchierino actually logging in.
+        # A seeder that cannot tell "already done" from "failed" has no
+        # business being the thing that decides the stack is healthy.
+        mix grappa.create_user --name bicc --password test-password-not-secret \
+          || echo "seed: create_user failed — expected on a re-run, fatal on a first one"
+        mix grappa.bind_network --user bicc --network bahamut-test \
+          --server bahamut-test:6667 --no-tls --nick bicc-grappa \
+          --auth none --autojoin '#bicc' \
+          || echo "seed: bind_network failed — expected on a re-run, fatal on a first one"
+    networks:
+      bicc-net: null
+
+  grappa:
+    image: grappa:bicchierino-test
+    pull_policy: never
+    hostname: grappa
+    user: "${CONTAINER_UID:-1000}:${CONTAINER_GID:-1000}"
+    working_dir: /app
+    depends_on:
+      # The seeder migrates the database this reads, so it goes first.
+      # compose can express that here only because the seeder is genuinely
+      # idempotent — see its guard. The cicchetto e2e cannot declare this
+      # dependency at all: its seeder dies on the duplicate user row, so
+      # the ordering lives in a wrapper script instead.
+      grappa-seed:
+        condition: service_completed_successfully
+    volumes:
+      - ./grappa:/app
+      - ./runtime/grappa:/app/runtime
+    environment:
+      MIX_ENV: dev
+      ELIXIR_ERL_OPTIONS: "+fnu"
+      GRAPPA_CAPTCHA_PROVIDER: disabled
+    command: ["mix", "phx.server"]
+    networks:
+      bicc-net:
+        aliases: [grappa]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 90s
+      retries: 40
+
+  # ── TLS in front of grappa ────────────────────────────────────────────
+  tls-init:
+    image: bicchierino-test-certinit
+    volumes:
+      - ./certs:/certs
+    entrypoint: ["/bin/sh"]
+    command: ["/certs/gen-tls.sh"]
+    networks:
+      default: null
+
+  grappa-tls:
+    image: nginx:1.27-alpine
+    hostname: grappa-tls
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+      grappa:
+        condition: service_healthy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+    networks:
+      bicc-net:
+        aliases: [grappa-tls]
+
+  # ── bicchierino, the thing under test ─────────────────────────────────
+  bicchierino:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.bicchierino
+    image: bicchierino:test
+    pull_policy: never
+    hostname: bicchierino
+    depends_on:
+      grappa-tls:
+        condition: service_started
+    networks:
+      bicc-net:
+        aliases: [bicchierino]
+
+  # ── weechat: the operator's real setup, as the baseline ───────────────
+  #
+  # Same version the operator runs (4.10.0), same scripts, same config
+  # above irc.conf's [server] section — see derive-weechat-config.sh, and
+  # note that it refuses to emit a config carrying a real azzurra host, a
+  # sec.conf reference, or a second autoconnecting server.
+  #
+  # It reaches exactly one thing: bicchierino, on this sealed network.
+  weechat:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile.weechat
+    image: weechat:bicchierino-test
+    pull_policy: never
+    hostname: weechat
+    depends_on:
+      bicchierino:
+        condition: service_started
+    networks:
+      bicc-net:
+        aliases: [weechat]
+
+networks:
+  # Compose's IMPLICIT network, sealed too. Nothing here needs it today —
+  # only cert-init lands on it, and that just runs a shell script over a
+  # mounted volume — but this is the one that makes forgetting to declare
+  # a network fail CLOSED. Without it, a service added later with no
+  # `networks:` key silently gets a gateway, and the isolation this whole
+  # file exists for is gone with no diff that looks like it did anything.
+  default:
+    internal: true
+
+  # Overrides of the testnet's own three bridges — same names, sealed.
+  svc-net:
+    internal: true
+  leaf4-net:
+    internal: true
+  leaf6-net:
+    internal: true
+
+  # Where bicchierino, grappa and weechat will meet the leaf.
+  bicc-net:
+    driver: bridge
+    internal: true
