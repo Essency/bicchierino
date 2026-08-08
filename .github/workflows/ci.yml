@@ -157,13 +157,22 @@ jobs:
     # brought in via `include:`, which the override pattern requires. The
     # multi-file (-f) merge predates `include:` and handles overrides without
     # that constraint: the second file's keys win over the first's.
-    # COMPOSE_FILE is relative to the CWD at the point docker compose runs;
-    # all steps cd into test/ first, so these paths resolve to
-    # test/azzurra-testnet/compose.yaml and test/compose.yaml. The env var is
-    # set at the job level so every step (including isolation.sh's own
-    # `docker compose` invocations) picks it up automatically.
+    #
+    # COMPOSE_FILE lists both files; all steps cd into test/ first, so these
+    # paths resolve to test/azzurra-testnet/compose.yaml and test/compose.yaml.
+    #
+    # --project-directory is critical: without it Docker Compose infers the
+    # project directory from the first file in COMPOSE_FILE, giving
+    # test/azzurra-testnet/ — which makes relative build contexts in
+    # test/compose.yaml (e.g. `context: ..` for the bicchierino and weechat
+    # images) resolve one level too deep (test/ instead of repo root).
+    # Forcing it to `.` pins it to the CWD (test/) where all steps run from.
+    #
+    # COMPOSE is also set so isolation.sh (which reads `COMPOSE` to learn
+    # how to invoke docker compose) inherits the same flags automatically.
     env:
       COMPOSE_FILE: azzurra-testnet/compose.yaml:compose.yaml
+      COMPOSE: docker compose --project-directory .
     steps:
       - uses: actions/checkout@v4
         with:
@@ -197,7 +206,7 @@ jobs:
         run: cd test && ./prepare.sh
 
       - name: Bring up the sealed stack
-        run: cd test && docker compose up -d --wait
+        run: cd test && $COMPOSE up -d --wait
 
       # test/isolation.sh is the point of this job as much as functional
       # correctness is: it proves every network is internal (no gateway),
@@ -208,10 +217,23 @@ jobs:
       - name: Prove the seal
         run: cd test && ./isolation.sh
 
+      # Mechanically verify RFC 1459 wire compliance on the live bicchierino
+      # instance: CRLF termination, ≤512-byte lines, numeric format, and the
+      # mandatory 001-004 registration burst in order. Runs from inside
+      # bicc-net so it can reach the bicchierino container directly.
+      - name: RFC 1459 compliance check
+        run: |
+          cd test
+          bicc_net="$($COMPOSE ps --format '{{.Project}}' | head -1)_bicc-net"
+          docker run --rm \
+            --network "$bicc_net" \
+            -v "$(pwd)/rfc1459_check.py:/check.py:ro" \
+            python:3.12-slim python3 /check.py
+
       - name: Stack logs
         if: failure()
-        run: cd test && docker compose logs --tail=300
+        run: cd test && $COMPOSE logs --tail=300
 
       - name: Tear down
         if: always()
-        run: cd test && docker compose down -v
+        run: cd test && $COMPOSE down -v
