@@ -152,6 +152,18 @@ jobs:
     # Elixir compile and a 6-container stack if the binary itself is broken.
     needs: build
     timeout-minutes: 30
+    # compose.yaml is an override layer on top of azzurra-testnet/compose.yaml.
+    # Docker Compose 2.27+ disallows redefining services/networks from a file
+    # brought in via `include:`, which the override pattern requires. The
+    # multi-file (-f) merge predates `include:` and handles overrides without
+    # that constraint: the second file's keys win over the first's.
+    # COMPOSE_FILE is relative to the CWD at the point docker compose runs;
+    # all steps cd into test/ first, so these paths resolve to
+    # test/azzurra-testnet/compose.yaml and test/compose.yaml. The env var is
+    # set at the job level so every step (including isolation.sh's own
+    # `docker compose` invocations) picks it up automatically.
+    env:
+      COMPOSE_FILE: azzurra-testnet/compose.yaml:compose.yaml
     steps:
       - uses: actions/checkout@v4
         with:

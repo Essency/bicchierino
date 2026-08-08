@@ -17,10 +17,23 @@
 # RUNTIME that is sealed.
 name: bicchierino-test
 
-include:
-  # hub + leaf-v4 + leaf-v6 + services, bahamut built from source.
-  # Pinned as a submodule at test/azzurra-testnet.
-  - path: ./azzurra-testnet/compose.yaml
+# ── How to use this file ──────────────────────────────────────────────────────
+# This file is an OVERRIDE layer on top of azzurra-testnet/compose.yaml.
+# Run it with both files every time — the testnet's services (hub, leaf-v4,
+# leaf-v6, services) come from azzurra-testnet; this file seals, extends and
+# supplements them:
+#
+#   docker compose -f azzurra-testnet/compose.yaml -f compose.yaml <cmd>
+#
+# Or, equivalently, set the env var before any docker compose call:
+#
+#   export COMPOSE_FILE=azzurra-testnet/compose.yaml:compose.yaml
+#
+# Using `include:` was the original approach, but Docker Compose 2.27+
+# validates that parent files cannot redefine services (or networks) that
+# come from an included file — the exact pattern this override layer needs.
+# The multi-file (-f) merge predates `include:` and is designed for exactly
+# this: the second file overrides matching keys in the first.
 
 services:
   # The testnet's cert-init runs `apk add openssl` as its first step, which
