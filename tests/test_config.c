@@ -126,15 +126,26 @@ TEST(insecure_opens_the_gate_and_only_that_gate) {
 }
 
 /* is_loopback() is a deliberate string check, not a prefix parse: the
- * whole 127/8 range counts, and ::1 does. "localhost" deliberately does
- * NOT — it depends on resolver config, which the parser cannot see. */
-TEST(loopback_means_127_slash_8_and_colon_colon_1) {
+ * whole 127/8 range counts. "localhost" deliberately does NOT — it depends
+ * on resolver config, which the parser cannot see.
+ * ::1 is rejected before the loopback gate, at the IPv4-only check. */
+TEST(loopback_means_127_slash_8) {
     struct config cfg;
     CHECK(load("grappa-url https://g.example\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, NULL, 0));
-    CHECK(load("grappa-url https://g.example\nbind 127.10.20.30 6667 plain\n", &cfg, NULL, NULL, 0));
-    CHECK(load("grappa-url https://g.example\nbind ::1 6667 plain\n", &cfg, NULL, NULL, 0));
+    CHECK(load("grappa-url https://g.example\nbind 127.10.20.30 6667 plain\n", &cfg, NULL, NULL,
+               0));
 
     char err[512];
+    /* ::1 is rejected early — the listener is IPv4-only. */
+    CHECK(!load("grappa-url https://g.example\nbind ::1 6667 plain\n", &cfg, NULL, err,
+                sizeof(err)));
+    CHECK(strstr(err, "IPv6 not wired up yet") != NULL);
+
+    /* Other IPv6 addresses are likewise rejected. */
+    CHECK(!load("grappa-url https://g.example\nbind :: 6667 plain\n", &cfg, NULL, err,
+                sizeof(err)));
+    CHECK(strstr(err, "IPv6 not wired up yet") != NULL);
+
     CHECK(!load("grappa-url https://g.example\nbind localhost 6667 plain\n", &cfg, NULL, err,
                 sizeof(err)));
     CHECK(strstr(err, "refusing to start") != NULL);
@@ -297,7 +308,7 @@ int main(void) {
     RUN(binds_are_repeatable_and_keep_their_order);
     RUN(a_plain_bind_off_loopback_is_refused);
     RUN(insecure_opens_the_gate_and_only_that_gate);
-    RUN(loopback_means_127_slash_8_and_colon_colon_1);
+    RUN(loopback_means_127_slash_8);
     RUN(both_required_directives_are_required);
     RUN(an_unknown_directive_fails_loudly);
     RUN(malformed_binds_are_rejected);
