@@ -234,9 +234,15 @@ jobs:
         run: cd test && ./isolation.sh
 
       # Mechanically verify RFC 1459 wire compliance on the live bicchierino
-      # instance: CRLF termination, ≤512-byte lines, numeric format, and the
-      # mandatory 001-004 registration burst in order. Runs from inside
-      # bicc-net so it can reach the bicchierino container directly.
+      # instance.  Two sockets: the primary client connects through bicchierino
+      # (port 6667); a second "leaf peer" connects directly to bahamut-test
+      # (port 6667) inside bicc-net, generating real IRC events that the primary
+      # client asserts.  Covered: CRLF termination, ≤512-byte lines, numeric
+      # format, 001-004 registration burst, PRIVMSG (channel + DM), NOTICE
+      # (user and server-sourced — the #29 regression), CTCP ACTION framing
+      # (the double-wrap regression), KICK (via OperServ MODE), TOPIC
+      # (332/333 + live echo), WHOIS (311/312/317/319/318), WHO (352+315),
+      # NAMES (353/366 + sigil correctness — the CLAUDE.md §9 regression).
       - name: RFC 1459 compliance check
         run: |
           cd test
