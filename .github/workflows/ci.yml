@@ -34,6 +34,13 @@ jobs:
           make clean
           make CC=${{ matrix.cc }} CFLAGS="-O2 -Werror"
 
+      # Unit suites, built with the same -Werror strictness as the binary
+      # above: a warning introduced by a test is a warning either way, and
+      # letting tests compile dirtier than the code they check is how the
+      # baseline erodes.
+      - name: Unit tests
+        run: make CC=${{ matrix.cc }} CFLAGS="-O2 -Werror" check
+
       - name: Binary sanity check
         run: ./bicchierino --config /nonexistent-config 2>&1 | grep -q "cannot open config file" || (echo "unexpected startup behavior" && exit 1)
 
@@ -66,6 +73,18 @@ jobs:
         run: |
           make clean
           make CFLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      # The unit suites under instrumentation — where the hostile-input
+      # cases in tests/ actually earn their keep: a truncation or an
+      # over-read that a CHECK can't see is exactly what ASan reports.
+      #
+      # halt_on_error=1 matches the smoke step below: a UBSan report that
+      # only prints leaves a green build sitting on undefined behaviour,
+      # which is the same as not running UBSan at all.
+      - name: Unit tests under ASan/UBSan
+        run: |
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" check
 
       # No live grappa in CI, so this can't exercise a real login/bridge
       # round trip. What it CAN verify without one: the safety-default
