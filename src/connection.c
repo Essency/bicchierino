@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h> /* strcasecmp — slug matching is case-insensitive */
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -51,6 +52,17 @@
  * already pings bicchierino on its own every 30-60s, resetting this
  * same timer via "any traffic counts") almost never triggers this path
  * at all — it exists for the client that's actually gone. */
+/* How long a client has to complete PASS/NICK/USER (plus CAP END if it
+ * opened CAP negotiation) before the connection is closed.  Protects
+ * against two distinct resource-exhaustion scenarios:
+ *   1. A peer that connects and sends nothing — the recv() in next_line
+ *      blocks forever without this timeout (SO_RCVTIMEO on the fd).
+ *   2. A peer that is chatty but never finishes (e.g. sends CAP LS and
+ *      then goes silent) — the wall-clock deadline check in the Phase 1
+ *      loop catches this even if individual recv() calls return quickly.
+ * Cleared after registration so Phase 2's poll()-gated recv() calls are
+ * unaffected. */
+#define REGISTRATION_TIMEOUT 30   /* seconds total for the registration phase */
 #define CLIENT_PING_THRESHOLD 180 /* seconds of client silence before WE ping */
 #define CLIENT_PING_TIMEOUT 60    /* seconds to wait for a reply before giving up */
 
@@ -3682,6 +3694,18 @@ void *connection_run(void *arg) {
     int fd = args->client_fd;
     const struct config *cfg = args->cfg;
 
+    /* Registration-phase timeout: a per-recv SO_RCVTIMEO breaks any
+     * single blocking recv() that would otherwise wait forever (the
+     * completely-idle peer case), and the wall-clock deadline below
+     * closes the gap for a peer that sends data slowly but never
+     * finishes registration (e.g. sends CAP LS then goes quiet).
+     * Cleared after Phase 1 so Phase 2's poll()-gated recv() calls,
+     * which should return immediately once poll() fires, are not
+     * accidentally timed out. */
+    struct timeval reg_tv = {REGISTRATION_TIMEOUT, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &reg_tv, sizeof(reg_tv));
+    time_t reg_deadline = time(NULL) + REGISTRATION_TIMEOUT;
+
     /* `client_ssl_ctx` is scoped to the whole function (not just the
      * setup block) because `client_tls_close` needs it at every exit
      * path from here on, including the ones below Phase 1. NULL for a
@@ -3690,6 +3714,7 @@ void *connection_run(void *arg) {
     if (args->listener->tls && !client_tls_accept(fd, args->listener, &client_ssl_ctx)) {
         client_tls_close(client_ssl_ctx);
         close(fd);
+        atomic_fetch_sub(args->live_connections, 1);
         free(args);
         return NULL;
     }
@@ -3707,6 +3732,11 @@ void *connection_run(void *arg) {
      * degrades to exactly the old condition. */
     bool registered = false;
     for (;;) {
+        /* Wall-clock deadline: catches a client that trickles data
+         * slowly enough to keep beating the per-recv SO_RCVTIMEO but
+         * never actually completes registration. */
+        if (time(NULL) >= reg_deadline) break;
+
         int r = next_line(fd, &lb, line, sizeof(line));
         if (r == NEXT_LINE_EOF || r == NEXT_LINE_ERROR) break;
 
@@ -3720,9 +3750,19 @@ void *connection_run(void *arg) {
         }
     }
 
+    /* Clear the registration timeout before Phase 2, which uses its
+     * own poll()-based timing and must not be disrupted by a stale
+     * SO_RCVTIMEO left over from Phase 1. */
+    struct timeval no_tv = {0, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
+
     if (!registered) {
+        /* Best-effort ERROR — the client may still be connected (just
+         * idle or slow), in which case this explains the disconnect. */
+        send_line(fd, "ERROR :Registration timeout");
         client_tls_close(client_ssl_ctx);
         close(fd);
+        atomic_fetch_sub(args->live_connections, 1);
         free(args);
         return NULL;
     }
@@ -4080,6 +4120,7 @@ cleanup:
     http_client_close(&hc);
     client_tls_close(client_ssl_ctx);
     close(fd);
+    atomic_fetch_sub(args->live_connections, 1);
     free(args);
     return NULL;
 }
