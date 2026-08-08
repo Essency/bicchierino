@@ -6,9 +6,10 @@
  * may not be behaving, so they get compiled straight into the suite —
  * the same trick shottino's test_layout uses to reach its own statics.
  *
- * The connecting parts (tcp_connect, tls_connect, http_client_request)
- * are NOT exercised: they need a real peer, and that is the Phase B
- * testnet's job, not this suite's.
+ * http_client_request is NOT exercised: it needs a real grappa, and that
+ * is the Phase B testnet's job, not this suite's. tcp_connect and
+ * tls_connect ARE, but only for the socket timeouts they arm — see the
+ * last section, which stands up a peer on loopback for exactly that.
  */
 #include "test.h"
 
@@ -16,7 +17,14 @@
  * its directory, so this needs no extra -I. */
 #include "../src/http.c"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509v3.h>
+#include <signal.h>
 #include <string.h>
+#include <sys/wait.h>
 
 /* ── parse_grappa_url ────────────────────────────────────────────── */
 
@@ -393,6 +401,244 @@ TEST(read_into_zero_is_a_no_op) {
  * note is that the untested path exists, so nobody reads the suite as
  * covering a short read from the network. */
 
+/* ── socket timeouts on the grappa leg ───────────────────────────── */
+
+/* Unlike everything above, these need a peer: the property under test is
+ * a socket option, and the only honest way to read one is off a real fd.
+ * It earns the peer. Without these bounds a grappa that stops answering
+ * parks the connection thread in SSL_read for the process lifetime,
+ * holding the fd while the IRC client sits in front of a socket that
+ * will never say anything again (#5).
+ *
+ * What is asserted: the fd each function hands back carries the bound.
+ * What is NOT: that a blocked call then actually returns. Observing that
+ * costs HTTP_IO_TIMEOUT_SEC of wall clock per case and what it would
+ * demonstrate is that the kernel implements SO_RCVTIMEO, not anything
+ * about this file.
+ */
+
+/* Bound to 127.0.0.1, never a wildcard: a unit suite has no business
+ * opening a port to the network for the seconds it runs. */
+static int listen_loopback(char *port_out, size_t port_sz) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 || listen(fd, 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t sl = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) {
+        close(fd);
+        return -1;
+    }
+    snprintf(port_out, port_sz, "%u", (unsigned)ntohs(sa.sin_port));
+    return fd;
+}
+
+static bool timeout_secs(int fd, int optname, long *out) {
+    struct timeval tv;
+    socklen_t sl = sizeof(tv);
+    if (getsockopt(fd, SOL_SOCKET, optname, &tv, &sl) != 0) return false;
+    *out = (long)tv.tv_sec;
+    return true;
+}
+
+TEST(tcp_connect_bounds_the_connect_itself) {
+    /* A zero timeval is the kernel's "block forever", so a bound of zero
+     * would satisfy the comparison below while being no bound at all. */
+    CHECK(HTTP_CONNECT_TIMEOUT_SEC > 0);
+
+    char port[8];
+    int srv = listen_loopback(port, sizeof(port));
+    if (srv < 0) {
+        FAIL("could not listen on loopback");
+        return;
+    }
+
+    int fd = tcp_connect("127.0.0.1", port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        long sec = -1;
+        CHECK(timeout_secs(fd, SO_SNDTIMEO, &sec));
+        CHECK_LONG(sec, HTTP_CONNECT_TIMEOUT_SEC);
+
+        /* Reads are still unbounded here, and that is precisely why the
+         * next test matters: nothing between this fd and the first
+         * SSL_read arms SO_RCVTIMEO except tls_connect. */
+        sec = -1;
+        CHECK(timeout_secs(fd, SO_RCVTIMEO, &sec));
+        CHECK_LONG(sec, 0);
+        close(fd);
+    }
+    close(srv);
+}
+
+/* tls_connect verifies the chain AND the hostname, with no way to ask it
+ * not to — that is the point of it. So the peer is made verifiable
+ * rather than the client weakened: a self-signed cert naming localhost,
+ * handed to the client as its only trust anchor through SSL_CERT_FILE,
+ * which is the file SSL_CTX_set_default_verify_paths consults. */
+static EVP_PKEY *generate_key(void) {
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!pctx) return NULL;
+    EVP_PKEY *key = NULL;
+    if (EVP_PKEY_keygen_init(pctx) != 1 || EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) != 1 ||
+        EVP_PKEY_keygen(pctx, &key) != 1)
+        key = NULL;
+    EVP_PKEY_CTX_free(pctx);
+    return key;
+}
+
+static X509 *self_signed_localhost(EVP_PKEY *key) {
+    X509 *x = X509_new();
+    if (!x) return NULL;
+    X509_set_version(x, 2); /* v3, so the SAN below is honoured */
+    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x), -3600);
+    X509_gmtime_adj(X509_getm_notAfter(x), 3600);
+    X509_set_pubkey(x, key);
+
+    X509_NAME *nm = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (const unsigned char *)"localhost", -1, -1,
+                               0);
+    X509_set_issuer_name(x, nm); /* self-signed: issuer is the subject */
+
+    /* SSL_set1_host checks names, not the CN, so the SAN is what makes
+     * the handshake pass. CA:TRUE because this same cert is the trust
+     * anchor the client is given. */
+    static const struct {
+        int nid;
+        const char *value;
+    } exts[] = { { NID_subject_alt_name, "DNS:localhost" },
+                 { NID_basic_constraints, "critical,CA:TRUE" } };
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        X509_EXTENSION *e = X509V3_EXT_conf_nid(NULL, NULL, exts[i].nid, exts[i].value);
+        if (!e) {
+            X509_free(x);
+            return NULL;
+        }
+        X509_add_ext(x, e, -1);
+        X509_EXTENSION_free(e);
+    }
+
+    if (X509_sign(x, key, EVP_sha256()) == 0) {
+        X509_free(x);
+        return NULL;
+    }
+    return x;
+}
+
+static bool write_pem(X509 *cert, char *path_out, size_t path_sz) {
+    snprintf(path_out, path_sz, "/tmp/bicchierino-test-ca-XXXXXX");
+    int fd = mkstemp(path_out);
+    if (fd < 0) return false;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return false;
+    }
+    bool ok = PEM_write_X509(f, cert) == 1;
+    fclose(f);
+    return ok;
+}
+
+/* A forked child, not a thread: the handshake needs both ends live at
+ * once, and a separate process keeps the server's OpenSSL state — and
+ * anything it does wrong — out of the suite's address space. The child
+ * never returns; the parent kills it once it has read the options. */
+static pid_t serve_one_tls(int srv, X509 *cert, EVP_PKEY *key) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+
+    alarm(30); /* backstop, in case the parent dies before the kill */
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx || SSL_CTX_use_certificate(ctx, cert) != 1 || SSL_CTX_use_PrivateKey(ctx, key) != 1)
+        _exit(1);
+    int c = accept(srv, NULL, NULL);
+    if (c < 0) _exit(1);
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) _exit(1);
+    SSL_set_fd(ssl, c);
+    if (SSL_accept(ssl) != 1) _exit(1);
+    char scratch[64];
+    SSL_read(ssl, scratch, sizeof(scratch)); /* parks until the client goes */
+    _exit(0);
+}
+
+TEST(tls_connect_bounds_reads_and_writes) {
+    CHECK(HTTP_IO_TIMEOUT_SEC > 0); /* same reasoning as the connect bound */
+
+    char port[8];
+    int srv = listen_loopback(port, sizeof(port));
+    if (srv < 0) {
+        FAIL("could not listen on loopback");
+        return;
+    }
+
+    EVP_PKEY *key = generate_key();
+    X509 *cert = key ? self_signed_localhost(key) : NULL;
+    char ca_path[64];
+    if (!cert || !write_pem(cert, ca_path, sizeof(ca_path))) {
+        FAIL("could not build the test server's certificate");
+        X509_free(cert);
+        EVP_PKEY_free(key);
+        close(srv);
+        return;
+    }
+    setenv("SSL_CERT_FILE", ca_path, 1);
+
+    pid_t pid = serve_one_tls(srv, cert, key);
+    if (pid < 0) {
+        FAIL("fork");
+        goto done;
+    }
+
+    /* "localhost", not the literal 127.0.0.1: the cert carries a DNS SAN
+     * and hostname verification matches names. tcp_connect tries every
+     * address getaddrinfo returns, so the listener above is still reached
+     * on a host that resolves localhost to ::1 first (this one does). */
+    char url[64];
+    snprintf(url, sizeof(url), "https://localhost:%s", port);
+
+    SSL_CTX *ctx = NULL;
+    SSL *ssl = NULL;
+    int fd = -1;
+    char host[256] = { 0 };
+    if (!https_tls_connect(url, &ctx, &ssl, &fd, host, sizeof(host))) {
+        FAIL("https_tls_connect to the local test server failed");
+    } else {
+        CHECK_STR(host, "localhost");
+
+        /* Both directions, because both block: a write into a full
+         * window stalls as readily as a read from a silent peer, and #5
+         * was about the thread, not about which syscall pinned it. */
+        long sec = -1;
+        CHECK(timeout_secs(fd, SO_RCVTIMEO, &sec));
+        CHECK_LONG(sec, HTTP_IO_TIMEOUT_SEC);
+        sec = -1;
+        CHECK(timeout_secs(fd, SO_SNDTIMEO, &sec));
+        CHECK_LONG(sec, HTTP_IO_TIMEOUT_SEC);
+
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        close(fd);
+    }
+
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+
+done:
+    unsetenv("SSL_CERT_FILE");
+    unlink(ca_path);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    close(srv);
+}
+
 int main(void) {
     RUN(a_plain_https_url_parses_to_host_and_default_port);
     RUN(an_explicit_port_is_taken);
@@ -419,5 +665,7 @@ int main(void) {
     RUN(readline_refuses_a_line_that_does_not_fit);
     RUN(read_into_copies_exactly_n_bytes);
     RUN(read_into_zero_is_a_no_op);
+    RUN(tcp_connect_bounds_the_connect_itself);
+    RUN(tls_connect_bounds_reads_and_writes);
     return test_report();
 }
