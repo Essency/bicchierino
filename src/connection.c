@@ -19,6 +19,7 @@
 #include "http.h"
 #include "json.h"
 #include "jsonw.h"
+#include "version.h"
 
 #define IRC_LINE_MAX 512
 #define MAX_CHANNELS 128 /* a comparable production bouncer's own scale doc uses ~70 channels as
@@ -1072,10 +1073,11 @@ static bool ensure_network_connected(struct http_client *hc, const struct config
 static void send_welcome(int fd, const char *nick, const char *subject_name) {
     send_line(fd, ":%s 001 %s :Welcome to grappa via bicchierino, %s", IRCD_SERVER, nick,
               subject_name);
-    send_line(fd, ":%s 002 %s :Your host is %s, running bicchierino", IRCD_SERVER, nick,
-              IRCD_SERVER);
+    send_line(fd, ":%s 002 %s :Your host is %s, running bicchierino %s", IRCD_SERVER, nick,
+              IRCD_SERVER, BICCHIERINO_VERSION);
     send_line(fd, ":%s 003 %s :This server has no particular birthday", IRCD_SERVER, nick);
-    send_line(fd, ":%s 004 %s %s bicchierino-0.1 o o", IRCD_SERVER, nick, IRCD_SERVER);
+    send_line(fd, ":%s 004 %s %s bicchierino-%s o o", IRCD_SERVER, nick, IRCD_SERVER,
+              BICCHIERINO_VERSION);
     send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii :are supported by this server",
               IRCD_SERVER, nick);
     send_line(fd, ":%s 375 %s :- %s message of the day -", IRCD_SERVER, nick, IRCD_SERVER);

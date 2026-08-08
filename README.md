@@ -84,6 +84,11 @@ on the network if sent in the clear off loopback.
 ./bicchierino --config bicchierino.config
 ```
 
+`./bicchierino --version` prints the running build's version
+(`vX.Y.Z+shorthash`, derived from the nearest git tag at build time —
+see the Makefile), which also shows up in a connected client's `002`
+and `004` lines.
+
 Then configure any IRC client to connect to it — nobody types `USER`,
 `NICK`, or `PASS` by hand, the client sends those automatically from its
 own connection settings at connect time:

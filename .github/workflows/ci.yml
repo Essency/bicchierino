@@ -15,6 +15,11 @@ jobs:
         cc: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags — `git describe` (the Makefile's own
+          # version derivation) needs tag refs that a shallow default
+          # checkout doesn't fetch.
+          fetch-depth: 0
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
@@ -32,11 +37,22 @@ jobs:
       - name: Binary sanity check
         run: ./bicchierino --config /nonexistent-config 2>&1 | grep -q "cannot open config file" || (echo "unexpected startup behavior" && exit 1)
 
+      - name: Version is real, not the no-tags fallback
+        run: |
+          v=$(./bicchierino --version)
+          echo "$v"
+          echo "$v" | grep -vq 'v0\.0\.0+unknown' || (echo "version derivation produced the total-fallback value — checkout history/tags are missing" && exit 1)
+
   sanitizers:
     name: ASan/UBSan build + smoke test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags — `git describe` (the Makefile's own
+          # version derivation) needs tag refs that a shallow default
+          # checkout doesn't fetch.
+          fetch-depth: 0
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev python3

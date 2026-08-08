@@ -20,6 +20,7 @@
 
 #include "config.h"
 #include "connection.h"
+#include "version.h"
 
 struct listener {
     int fd;
@@ -65,6 +66,16 @@ static int open_listener(const struct bind_config *b) {
 }
 
 int main(int argc, char **argv) {
+    /* Checked before anything else, deliberately not routed through
+     * config_load_from_args — a version query has no business
+     * requiring a valid config file to exist first. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0) {
+            printf("bicchierino %s\n", BICCHIERINO_VERSION);
+            return 0;
+        }
+    }
+
     /* A client hanging up mid-write must not kill the thread handling
      * it — send()/write() report EPIPE, which every write site here
      * already has to check for other reasons. */

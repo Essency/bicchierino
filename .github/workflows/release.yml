@@ -11,6 +11,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags — the Makefile's own `git describe`
+          # version derivation needs tag refs a shallow checkout won't
+          # have, and a release build with the WRONG version baked in
+          # is exactly the kind of thing worth failing loudly over, not
+          # shipping quietly.
+          fetch-depth: 0
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
@@ -19,6 +26,13 @@ jobs:
         run: |
           make clean
           make CFLAGS="-O2 -Werror"
+
+      - name: Verify the binary's own version matches this release tag
+        run: |
+          v=$(./bicchierino --version)
+          echo "$v"
+          echo "$v" | grep -q "bicchierino ${{ github.ref_name }}+" || \
+            (echo "built version does not start with the triggering tag ${{ github.ref_name }} — refusing to publish a mislabeled release" && exit 1)
 
       - name: Package
         run: |
