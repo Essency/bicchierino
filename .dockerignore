@@ -1,0 +1,16 @@
+# Private keys never enter a build context. Only test/certs/ca.pem — the
+# public certificate — belongs in the bicchierino image, and it is copied in
+# explicitly so the client can verify grappa's chain. The keys are also
+# unreadable to the build: gen-tls.sh runs as root in a container and leaves
+# them 600, so a context including them fails outright.
+test/certs/*.key
+test/certs/*.srl
+
+# Machine-local state, and the submodules' own histories.
+test/runtime/
+test/grappa/.git/
+test/azzurra-testnet/.git/
+.git/
+
+*.o
+bicchierino
