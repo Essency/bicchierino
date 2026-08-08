@@ -165,7 +165,7 @@ def main():
         # which is only reachable on a tls bind and which a plain-bind test
         # cannot touch at all. Found the hard way: breaking this decrement
         # left every assertion above still passing.
-        print("5. a failed TLS handshake releases its slot too")
+        print("4. a failed TLS handshake releases its slot too")
         for _ in range(CAP + 4):
             try:
                 s2 = socket.create_connection(("127.0.0.1", TLS_PORT), timeout=3)
@@ -184,7 +184,7 @@ def main():
         else:
             ok("failed TLS handshakes do not consume slots permanently")
 
-        print("4. the process is still alive and serving")
+        print("5. the process is still alive and serving")
         if proc.poll() is None:
             ok("bicchierino survived the whole thing")
         else:
