@@ -287,6 +287,24 @@ static void send_line(int fd, const char *fmt, ...) {
      * (see `send_tagged_line`); this is the backstop that keeps a
      * mis-sized one from being a memory-safety bug. */
     if ((size_t)n > sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    /* Harden against CR/LF/NUL embedded in grappa-sourced fields.
+     * Grappa's own send path already rejects these (its
+     * `safe_line_token?/1` gates every public send helper), so this
+     * never fires under normal operation — it is a defence-in-depth
+     * backstop for a compromised, older, or future-diverged grappa peer.
+     * Strip in-place so the rest of the payload still reaches the client
+     * rather than silently dropping the whole line.  No field ever has a
+     * legitimate CR, LF, or NUL inside an IRC payload; stripping is
+     * unambiguously correct. */
+    {
+        int out = 0;
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\r' || c == '\n' || c == '\0') continue;
+            buf[out++] = buf[i];
+        }
+        n = out;
+    }
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
