@@ -287,6 +287,24 @@ static void send_line(int fd, const char *fmt, ...) {
      * (see `send_tagged_line`); this is the backstop that keeps a
      * mis-sized one from being a memory-safety bug. */
     if ((size_t)n > sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    /* Harden against CR/LF/NUL embedded in grappa-sourced fields.
+     * Grappa's own send path already rejects these (its
+     * `safe_line_token?/1` gates every public send helper), so this
+     * never fires under normal operation — it is a defence-in-depth
+     * backstop for a compromised, older, or future-diverged grappa peer.
+     * Strip in-place so the rest of the payload still reaches the client
+     * rather than silently dropping the whole line.  No field ever has a
+     * legitimate CR, LF, or NUL inside an IRC payload; stripping is
+     * unambiguously correct. */
+    {
+        int out = 0;
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\r' || c == '\n' || c == '\0') continue;
+            buf[out++] = buf[i];
+        }
+        n = out;
+    }
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
@@ -2521,23 +2539,33 @@ static const char *row_text(const json_value *message, const json_value *meta) {
  * shape available: `$server` is not a valid IRC target, so no per-kind arm
  * of `handle_grappa_message_event` can render one verbatim.
  *
- * Two distinct sub-cases by kind:
+ * Two distinct sub-cases by sender shape:
  *
- *   `:notice` — a private NOTICE addressed to our own nick that the
- *   upstream ircd/grappa filed on the `$server` window because it has no
- *   channel (the CP13 non-channel NOTICE cluster, `persist_server_notice/2`
- *   §4). Here `sender` is a USER nick, so the prefix must carry
- *   `nick!user@host` — emitting a bare nick makes every IRC client
- *   interpret the line as a server notice, routing it to the wrong buffer
- *   and discarding nick-derived tags/highlights (#24).  We use the same
- *   `bicchierino@bicchierino` placeholder as JOIN/PART/sibling-DM paths
- *   because the real user@host is not on the grappa wire for this kind.
+ *   User nick (no dot) — a private NOTICE addressed to our own nick that
+ *   the upstream ircd/grappa filed on the `$server` window because it has
+ *   no channel (the CP13 non-channel NOTICE cluster, `persist_server_notice/2`
+ *   §4).  The prefix must carry `nick!user@host` — emitting a bare nick
+ *   makes every IRC client interpret the line as a server notice, routing
+ *   it to the wrong buffer and discarding nick-derived tags/highlights (#24).
+ *   We use the same `bicchierino@bicchierino` placeholder as JOIN/PART/
+ *   sibling-DM paths because the real user@host is not on the grappa wire
+ *   for this kind.
  *
- *   all other kinds (`:server_event` — KILL, WALLOPS, GLOBOPS, ERROR,
- *   CHGHOST, vendor verbs) — `sender` IS a server hostname or `"*"`.  A
- *   bare server hostname is the correct prefix for a server-sourced line;
- *   `"*"` (prefix-less) becomes IRCD_SERVER because `"*"` is not a valid
- *   IRC prefix and the bridge is speaking on its own behalf.
+ *   Server hostname (contains a dot) OR `"*"` — grappa's `sender_nick/1`
+ *   also collapses server-prefixed lines (MOTD, global notices, services
+ *   output, `server_event` verbs — KILL, WALLOPS, GLOBOPS, ERROR, CHGHOST)
+ *   into a bare string and files them here with `kind = "notice"` (#29).
+ *   A real server hostname ALWAYS contains at least one dot; a bare
+ *   hostname is the correct prefix for a server-sourced line.  `"*"`
+ *   (prefix-less) becomes IRCD_SERVER.
+ *
+ * Discriminating on kind alone (#26) was wrong: grappa uses `kind =
+ * "notice"` for BOTH user nicks and server hostnames when routing to
+ * `$server`. The dot heuristic is the only discriminator available on
+ * this side of the wire: `sender_nick/1` in grappa drops the {:nick,…} /
+ * {:server,…} tag before the row reaches bicchierino, making recovery
+ * impossible without a grappa-side change (#29 option 1). The heuristic
+ * is correct for every network that does not permit dots in nicks.
  *
  * The structured `meta` is deliberately not unpacked: grappa fills `body`
  * with a plain spelling for exactly this reason ("the wire is
@@ -2551,10 +2579,11 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
 
     char nick_prefix[196];
     const char *prefix;
-    if (kind && strcmp(kind, "notice") == 0 && sender && sender[0] && strcmp(sender, "*") != 0) {
-        /* User nick — must carry !user@host so clients identify it as a
-         * user NOTICE rather than a server NOTICE (prefix shape is the
-         * only wire distinction). */
+    if (kind && strcmp(kind, "notice") == 0 && sender && sender[0] && strcmp(sender, "*") != 0
+        && !strchr(sender, '.')) {
+        /* User nick (no dot) — must carry !user@host so clients identify
+         * it as a user NOTICE rather than a server NOTICE (prefix shape
+         * is the only wire distinction). */
         snprintf(nick_prefix, sizeof(nick_prefix), "%s!bicchierino@bicchierino", sender);
         prefix = nick_prefix;
     } else {

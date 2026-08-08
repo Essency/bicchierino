@@ -1,0 +1,33 @@
+# weechat 4.10.0 with the operator's real setup — minus every real server.
+#
+# Pinned to the same version the operator runs, so a difference in where a
+# message lands is a difference in bicchierino or in the scripts, never a
+# difference in weechat.
+#
+# The config in test/weechat/ is deliberately minimal: one server,
+# pointing at the bicchierino in this compose. The point of a real
+# client here is that the bridge gets exercised by something which
+# speaks IRC properly — not that any particular routing setup is
+# reproduced. To validate your own, mount it over
+# /home/user/.config/weechat.
+FROM weechat/weechat:4.10.0
+
+USER root
+
+# expect drives weechat's TUI in the baseline run: it is a terminal
+# program, and /exec or a headless mode would exercise a different code
+# path than the one a human uses. procps for pgrep in the harness.
+RUN apk add --no-cache expect procps 2>/dev/null \
+    || (apt-get update && apt-get install -y --no-install-recommends expect procps \
+        && rm -rf /var/lib/apt/lists/*)
+
+ARG WEECHAT_HOME=/home/user
+
+COPY test/weechat/ ${WEECHAT_HOME}/.config/weechat/
+
+USER user
+WORKDIR ${WEECHAT_HOME}
+
+# Idle by default: the baseline harness execs into this and drives weechat
+# itself, so the container is a place to run from, not a run.
+CMD ["sleep", "infinity"]
