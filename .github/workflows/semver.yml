@@ -15,6 +15,17 @@ jobs:
           # bump correctly — a shallow clone would silently miscount
           # commits since the last tag or miss the last tag entirely.
           fetch-depth: 0
+          # A tag pushed using the default GITHUB_TOKEN deliberately
+          # does NOT trigger other workflows (GitHub's own anti-
+          # recursion protection on the bot token) — confirmed live:
+          # the first real run of this workflow pushed a real,
+          # correctly-formed vX.Y.Z tag, but release.yml's tags:
+          # ['v*.*.*'] trigger never fired, silently, no release ever
+          # built. RELEASE_PAT is a fine-grained PAT (Contents:
+          # read/write, scoped to just this repo) — a push
+          # authenticated as an actual identity instead of the bot
+          # token triggers downstream workflows normally.
+          token: ${{ secrets.RELEASE_PAT }}
 
       # Pinned static binary, not a marketplace action — same reasoning
       # as this project's other CI jobs that download a pinned tool
