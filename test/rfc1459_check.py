@@ -15,7 +15,8 @@ Mechanically checkable invariants verified here:
   6. NOTICE — user NOTICE: nick!user@host;     (#29 fix)
      server NOTICE: bare hostname prefix
      (dot-containing, no !), never a nick.
-     Triggered actively via PRIVMSG OperServ :UPDATE
+     Triggered by the services scheduled write
+     cycle (UPDATE:20 in services.conf.tmpl)
   7. CTCP ACTION (/me) — exactly one           (CTCP spec; bicchierino
      \\x01ACTION ...\\x01 frame, no             regression guard)
      double-wrapping
@@ -413,36 +414,41 @@ def check_notice_server(bicc: IRCConn) -> None:
     Rule 6b: server NOTICE (#29 fix) — prefix must be a bare server hostname
     (contains a dot, no '!') for NOTICEs originating from the ircd or services.
 
-    Rather than relying on passive $server window history (which grappa does NOT
-    replay on Phoenix Channel join — only real-time pushes flow), we actively
-    trigger a server NOTICE by sending PRIVMSG OperServ :UPDATE through
-    bicchierino.  bicc-grappa is the SERVICES_MASTER in the test stack, so
-    OperServ processes the command and broadcasts a Global NOTICE from
-    services.azzurra.chat — a real server-hostname-prefixed line that exercises
-    handle_grappa_server_window_row's dot-heuristic end to end.
+    We rely on the services SCHEDULED database-write cycle rather than on a
+    manual OperServ UPDATE command.  The manual UPDATE command only writes the
+    database and sends a private reply to the requester; the network-wide
+    Global NOTICE (":services.azzurra.chat NOTICE * :*** Global -- from
+    services.azzurra.chat: Completed database write ...") is emitted ONLY by
+    the scheduler (services' internal store-and-expire cycle).
 
-    The expected wire path:
-      bicc →[REST]→ grappa → bahamut → OperServ (processes UPDATE)
-      → services.azzurra.chat NOTICE * :*** Global -- from services.azzurra.chat: ...
+    test/services.conf.tmpl sets UPDATE:20 so the scheduler fires every 20
+    seconds, guaranteeing at most ~20s until the next write.  We wait up to
+    SERVER_NOTICE_TIMEOUT (60s) — more than enough headroom even if a write
+    just finished.
+
+    The expected wire path (no client action required):
+      services scheduler fires every UPDATE:20s
+      → services writes database
+      → :services.azzurra.chat NOTICE * :*** Global -- ... Completed database write
       → bahamut → grappa $server window (live push) → bicchierino WS
       → handle_grappa_server_window_row (sender=services.azzurra.chat, has dot)
       → :services.azzurra.chat NOTICE bicc-grappa :... → rfc-check
     """
+    SERVER_NOTICE_TIMEOUT = 60  # > UPDATE:20 worst-case window
+
     print("\n─ NOTICE (server/#29 fix) check ─", flush=True)
 
-    # Request an OperServ database update. bicc-grappa is SERVICES_MASTER so
-    # OperServ accepts the command. Services then writes the database and sends
-    # a Global NOTICE back to the network (services.azzurra.chat has a dot,
-    # no '!' — exactly the server-prefix shape handle_grappa_server_window_row
-    # must preserve verbatim rather than appending !bicchierino@bicchierino).
-    bicc.send("PRIVMSG OperServ :UPDATE")
-
+    # No active trigger needed — just wait for the next scheduled write.
     # Wait for a NOTICE whose prefix contains a dot and no '!'.
-    # OperServ's personal acknowledge ("Access granted", "Update started") uses
-    # nick!user@host (OperServ!service@azzurra.chat) so it is skipped here.
-    # The Global NOTICE from services.azzurra.chat matches.
+    # Any user-sourced NOTICE (nick!user@host) is skipped.
+    # The periodic Global NOTICE from services.azzurra.chat matches.
+    print(
+        f"  waiting up to {SERVER_NOTICE_TIMEOUT}s for scheduled services "
+        "database-write NOTICE…",
+        flush=True,
+    )
     server_notice = bicc.recv_match(
-        RELAY_TIMEOUT,
+        SERVER_NOTICE_TIMEOUT,
         lambda t: (
             t.startswith(":")
             and " NOTICE " in t
@@ -454,8 +460,8 @@ def check_notice_server(bicc: IRCConn) -> None:
     if not server_notice:
         fail(
             "NOTICE server (#29): no server-hostname-prefixed NOTICE received within "
-            f"{RELAY_TIMEOUT}s after triggering OperServ UPDATE — "
-            "expected :services.azzurra.chat NOTICE ... from services Global broadcast"
+            f"{SERVER_NOTICE_TIMEOUT}s — expected :services.azzurra.chat NOTICE ... "
+            "from scheduled services Global broadcast (UPDATE:20 in services.conf)"
         )
         return
 

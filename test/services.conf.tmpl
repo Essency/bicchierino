@@ -30,7 +30,12 @@ SS:SeenServ
 Global:Azzurra
 
 # Tunables — sensible testnet defaults.
-UPDATE:1200
+# UPDATE set to 20s (not 1200s) so the scheduled database-write cycle fires
+# within the rfc1459_check.py server-NOTICE test window.  The check waits up
+# to 60s for the :services.azzurra.chat NOTICE that services broadcasts after
+# every write; with UPDATE:20 the worst-case wait is <20s.  1200s is correct
+# for a real deployment; 20s is the minimum that makes the test reliably fast.
+UPDATE:20
 TIMEOUT:2
 P:5:300:5:30
 MEMOMAX:32
