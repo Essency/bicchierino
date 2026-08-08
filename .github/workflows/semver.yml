@@ -1,0 +1,56 @@
+name: Cut release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cut-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full commit + tag history to compute the
+          # bump correctly — a shallow clone would silently miscount
+          # commits since the last tag or miss the last tag entirely.
+          fetch-depth: 0
+
+      # Pinned static binary, not a marketplace action — same reasoning
+      # as this project's other CI jobs that download a pinned tool
+      # directly (see release.yml): one less third party in the trust
+      # chain for something this simple, and a version bump deliberately
+      # tied to a version WE chose, not "whatever tag the action
+      # currently points at".
+      - name: Install git-cliff
+        run: |
+          GIT_CLIFF_VERSION=2.13.1
+          curl -fsSL "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -o /tmp/git-cliff.tar.gz
+          tar -xzf /tmp/git-cliff.tar.gz -C /tmp
+          sudo mv "/tmp/git-cliff-${GIT_CLIFF_VERSION}/git-cliff" /usr/local/bin/git-cliff
+          git-cliff --version
+
+      # bicchierino's version is entirely git-tag-derived (see the
+      # Makefile's own comment) — unlike a project with a version FILE
+      # to bump (Cargo.toml, package.json, ...), there is nothing to
+      # edit or commit here. Compute the next tag from Conventional
+      # Commits history and push it; that push triggers release.yml
+      # (tags: ['v*.*.*']), which does the actual build + publish.
+      - name: Compute next version from Conventional Commits
+        id: version
+        run: |
+          NEXT_VERSION="$(git-cliff --bumped-version)"
+          if [ -z "$NEXT_VERSION" ]; then
+            echo "No conventional commits (feat/fix/...) since the last tag — nothing to release"
+            exit 1
+          fi
+          echo "Next version: $NEXT_VERSION"
+          echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
