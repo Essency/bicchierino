@@ -268,6 +268,13 @@ static void send_line(int fd, const char *fmt, ...) {
     int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
     va_end(ap);
     if (n < 0) return;
+    /* vsnprintf returns what it WOULD have written, not what it did — so
+     * on truncation `n` points past the buffer and the CRLF below would
+     * land outside it. Clamp to the byte budget the call actually had.
+     * A caller with a line worth truncating should have sized it itself
+     * (see `send_tagged_line`); this is the backstop that keeps a
+     * mis-sized one from being a memory-safety bug. */
+    if ((size_t)n > sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
@@ -536,13 +543,14 @@ static void format_server_time_tag(long unix_ms, char *out, size_t out_sz) {
  * them either. */
 static void send_tagged_line(int fd, const struct grappa_session *sess, long server_time_ms,
                               const char *fmt, ...) {
-    char body[IRC_LINE_MAX];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(body, sizeof(body), fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-
+    /* The tag is built FIRST because it decides how much room is left for
+     * the body. Formatting the body to the full line length and prepending
+     * the tag afterwards overflows the line budget by exactly the tag's
+     * own width, and `send_line` can then only drop the tail it was handed
+     * — the caller is the one place that still knows the line is a
+     * formatted whole, so the truncation belongs here. */
+    char tag[96] = "";
+    size_t tag_len = 0;
     if (sess->cap_message_tags && sess->cap_server_time) {
         char ts[64]; /* "YYYY-MM-DDTHH:MM:SS.sssZ" is 24 bytes + NUL;
                       * generous past that so gcc's fortify checker can
@@ -550,10 +558,23 @@ static void send_tagged_line(int fd, const struct grappa_session *sess, long ser
                       * tm_year's width statically. */
         format_server_time_tag(server_time_ms > 0 ? server_time_ms : now_unix_ms(), ts,
                                 sizeof(ts));
-        send_line(fd, "@time=%s %s", ts, body);
-    } else {
-        send_line(fd, "%s", body);
+        int t = snprintf(tag, sizeof(tag), "@time=%s ", ts);
+        if (t > 0 && (size_t)t < sizeof(tag)) tag_len = (size_t)t;
+        else tag[0] = '\0'; /* unrepresentable timestamp: send untagged
+                              * rather than half a tag */
     }
+
+    /* `send_line`'s own budget is `IRC_LINE_MAX - 3` payload bytes (two
+     * reserved for CRLF, one for the NUL), and the tag eats into it. */
+    char body[IRC_LINE_MAX];
+    size_t body_sz = sizeof(body) - 2 - tag_len;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(body, body_sz, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+
+    send_line(fd, "%s%s", tag, body);
 }
 
 /* IRCv3 `cap-3.2` — CAP LS/REQ/END/LIST, the gate registration waits on
