@@ -287,6 +287,21 @@ static void send_line(int fd, const char *fmt, ...) {
      * (see `send_tagged_line`); this is the backstop that keeps a
      * mis-sized one from being a memory-safety bug. */
     if ((size_t)n > sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    /* Strip any embedded CR, LF, or NUL so a grappa-sourced field cannot
+     * inject an attacker-chosen IRC line — hardening against a compromised
+     * or version-mismatched grappa, which guards the same invariant on its
+     * own side (`Grappa.IRC.Identifier.safe_line_token?/1`) but is a
+     * separately-versioned binary.  One pass here covers every render arm
+     * without a call-site audit, and composes cleanly with the truncation
+     * clamp above. */
+    {
+        int out = 0;
+        for (int i = 0; i < n; i++) {
+            if (buf[i] != '\r' && buf[i] != '\n' && buf[i] != '\0')
+                buf[out++] = buf[i];
+        }
+        n = out;
+    }
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
