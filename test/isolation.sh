@@ -25,6 +25,12 @@
 #   - a probe container this script chooses (alpine, tools guaranteed),
 #     attached to the stack's own networks.
 #
+# Egress is probed with a TCP connect rather than ICMP. Not cosmetic:
+# outbound ICMP is commonly blocked on cloud-hosted CI runners, and there
+# the control below would fail and abort the whole script — reporting that
+# it cannot prove anything, which is true but reads like a broken stack.
+# A TCP connect answers the same question and survives that network.
+#
 # And the probe itself is verified against a normal bridge first: if it
 # cannot detect egress where egress definitely exists, its silence on the
 # sealed networks means nothing either.
@@ -47,11 +53,11 @@ fi
 # A probe that cannot see a leak on an OPEN network would report every
 # sealed one as fine. Establish it can before trusting anything below.
 echo "control (must succeed, or every result below is meaningless):"
-if docker run --rm "$PROBE" sh -c 'ping -c1 -W2 1.1.1.1 >/dev/null 2>&1'; then
-    ok "the probe reaches 1.1.1.1 on a normal bridge"
+if docker run --rm "$PROBE" sh -c 'nc -z -w3 1.1.1.1 443 >/dev/null 2>&1'; then
+    ok "the probe reaches 1.1.1.1:443 on a normal bridge"
 else
-    echo "  BROKEN: the probe cannot reach 1.1.1.1 even unsealed." >&2
-    echo "  Either this host has no egress or $PROBE lacks ping; either way" >&2
+    echo "  BROKEN: the probe cannot reach 1.1.1.1:443 even unsealed." >&2
+    echo "  Either this host has no egress or $PROBE lacks nc; either way" >&2
     echo "  this script cannot prove anything. Fix that before trusting it." >&2
     exit 1
 fi
@@ -88,17 +94,24 @@ done
 echo "egress, probed from inside each network:"
 for n in $nets; do
     if docker run --rm --network "$n" "$PROBE" \
-        sh -c 'ping -c1 -W2 1.1.1.1 >/dev/null 2>&1'; then
-        bad "reached 1.1.1.1 from $n"
+        sh -c 'nc -z -w3 1.1.1.1 443 >/dev/null 2>&1'; then
+        bad "reached 1.1.1.1:443 from $n"
     else
-        ok "no route to 1.1.1.1 from $n"
+        ok "no route to 1.1.1.1:443 from $n"
     fi
 
+    # 443 and 6667: the two an escaped container would plausibly want, and
+    # a sealed network refuses both before DNS even matters. A failure here
+    # does not distinguish "did not resolve" from "resolved but
+    # unreachable" — for proving no egress that is the same answer, and the
+    # alias check below is what covers resolution.
     for host in azzurra.chat www.azzurra.chat staff.azzurra.chat helper.azzurra.chat; do
-        if docker run --rm --network "$n" "$PROBE" \
-            sh -c "ping -c1 -W2 $host >/dev/null 2>&1"; then
-            bad "reached $host from $n"
-        fi
+        for port in 443 6667; do
+            if docker run --rm --network "$n" "$PROBE" \
+                sh -c "nc -z -w3 $host $port >/dev/null 2>&1"; then
+                bad "reached $host:$port from $n"
+            fi
+        done
     done
     ok "no route to any real azzurra.chat host from $n"
 done
