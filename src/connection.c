@@ -2417,28 +2417,45 @@ static const char *row_text(const json_value *message, const json_value *meta) {
  * shape available: `$server` is not a valid IRC target, so no per-kind arm
  * of `handle_grappa_message_event` can render one verbatim.
  *
- * Kind-blind on purpose. Everything grappa files here is a line of server
- * chrome addressed to us — `:notice` rows from `persist_server_notice/2`
- * (connect MOTD, unsolicited INFO/VERSION/ADMIN bursts, 402, and the CP13
- * non-channel NOTICE cluster) and `:server_event` rows from the router
- * fallthrough (KILL, WALLOPS, GLOBOPS, ERROR, CHGHOST, vendor verbs) alike
- * — and a NOTICE is how all of it reaches a client that negotiated no
- * grappa-specific capability. The structured `meta` is deliberately not
- * unpacked: grappa fills `body` with a plain spelling for exactly this
- * reason ("the wire is additive-only — an old client ignores the meta and
- * shows the body").
+ * Two distinct sub-cases by kind:
  *
- * `sender` is `Message.sender_nick/1`: the upstream server's hostname for
- * a server-prefixed line, or the `"*"` sentinel for a prefix-less one.
- * `"*"` is not a usable IRC prefix, and a prefix-less line is one this
- * bridge is speaking on its own behalf anyway, so it becomes IRCD_SERVER. */
+ *   `:notice` — a private NOTICE addressed to our own nick that the
+ *   upstream ircd/grappa filed on the `$server` window because it has no
+ *   channel (the CP13 non-channel NOTICE cluster, `persist_server_notice/2`
+ *   §4). Here `sender` is a USER nick, so the prefix must carry
+ *   `nick!user@host` — emitting a bare nick makes every IRC client
+ *   interpret the line as a server notice, routing it to the wrong buffer
+ *   and discarding nick-derived tags/highlights (#24).  We use the same
+ *   `bicchierino@bicchierino` placeholder as JOIN/PART/sibling-DM paths
+ *   because the real user@host is not on the grappa wire for this kind.
+ *
+ *   all other kinds (`:server_event` — KILL, WALLOPS, GLOBOPS, ERROR,
+ *   CHGHOST, vendor verbs) — `sender` IS a server hostname or `"*"`.  A
+ *   bare server hostname is the correct prefix for a server-sourced line;
+ *   `"*"` (prefix-less) becomes IRCD_SERVER because `"*"` is not a valid
+ *   IRC prefix and the bridge is speaking on its own behalf.
+ *
+ * The structured `meta` is deliberately not unpacked: grappa fills `body`
+ * with a plain spelling for exactly this reason ("the wire is
+ * additive-only — an old client ignores the meta and shows the body"). */
 static void handle_grappa_server_window_row(int fd, const struct grappa_session *sess,
-                                             const char *sender, const json_value *message,
+                                             const char *kind, const char *sender,
+                                             const json_value *message,
                                              const json_value *meta, long server_time_ms) {
     const char *text = row_text(message, meta);
     if (!text) return;
 
-    const char *prefix = sender && sender[0] && strcmp(sender, "*") != 0 ? sender : IRCD_SERVER;
+    char nick_prefix[196];
+    const char *prefix;
+    if (kind && strcmp(kind, "notice") == 0 && sender && sender[0] && strcmp(sender, "*") != 0) {
+        /* User nick — must carry !user@host so clients identify it as a
+         * user NOTICE rather than a server NOTICE (prefix shape is the
+         * only wire distinction). */
+        snprintf(nick_prefix, sizeof(nick_prefix), "%s!bicchierino@bicchierino", sender);
+        prefix = nick_prefix;
+    } else {
+        prefix = sender && sender[0] && strcmp(sender, "*") != 0 ? sender : IRCD_SERVER;
+    }
     const char *target = sess->network_nick[0] ? sess->network_nick : "*";
     send_tagged_line(fd, sess, server_time_ms, ":%s NOTICE %s :%s", prefix, target, text);
 }
@@ -2474,7 +2491,7 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
      * reasoning below applies to a `$server` row, and its `channel` can
      * never be used as an IRC target. */
     if (strcmp(channel, GRAPPA_SERVER_WINDOW) == 0) {
-        handle_grappa_server_window_row(fd, sess, sender, message, meta, server_time_ms);
+        handle_grappa_server_window_row(fd, sess, kind, sender, message, meta, server_time_ms);
         return;
     }
 
