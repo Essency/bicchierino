@@ -144,3 +144,62 @@ jobs:
           fi
           kill $BICCHIERINO_PID
           wait $BICCHIERINO_PID 2>/dev/null || true
+
+  e2e:
+    name: e2e — sealed azzurra stack
+    runs-on: ubuntu-latest
+    # Gate on the cheap build first — no point spending minutes on a cold
+    # Elixir compile and a 6-container stack if the binary itself is broken.
+    needs: build
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # test/grappa/{_build,deps} are bind-mounted from the checkout, not
+      # baked into an image (grappa runs from source — see prepare.sh) —
+      # so they live on the runner's filesystem and can be cached directly.
+      # The cold compile this saves is the slow part of this job; the
+      # pinned submodule commit's own mix.lock is the right cache key,
+      # since a bumped grappa submodule invalidates it exactly when it
+      # should.
+      - name: Cache grappa build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            test/grappa/_build
+            test/grappa/deps
+          key: grappa-build-${{ hashFiles('test/grappa/mix.lock') }}
+
+      - name: Resolve container uid/gid
+        run: |
+          echo "CONTAINER_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "CONTAINER_GID=$(id -g)" >> "$GITHUB_ENV"
+
+      # Needs the network (Hex/rebar/deps, the throwaway CA) — done here,
+      # unsealed and explicit, same reasoning as test/README.md: opening a
+      # gateway inside the stack itself "just for setup" would leave the
+      # ircds one config mistake away from production.
+      - name: Prepare (certs + grappa deps/compile)
+        run: cd test && ./prepare.sh
+
+      - name: Bring up the sealed stack
+        run: cd test && docker compose up -d --wait
+
+      # test/isolation.sh is the point of this job as much as functional
+      # correctness is: it proves every network is internal (no gateway),
+      # every container sits only on those networks, and egress to
+      # azzurra.chat or anywhere else is actually impossible, not just
+      # configured to be — verifying its own probe first so a broken
+      # detector can't read as a sealed stack.
+      - name: Prove the seal
+        run: cd test && ./isolation.sh
+
+      - name: Stack logs
+        if: failure()
+        run: cd test && docker compose logs --tail=300
+
+      - name: Tear down
+        if: always()
+        run: cd test && docker compose down -v
