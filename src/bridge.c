@@ -20,10 +20,23 @@ bool bridge_join(struct bridge *br, const char *topic, unsigned long *join_ref_o
      * both fields of the envelope get this one new ref. */
     unsigned long ref = ++br->ws_ref;
 
-    char esc_topic[256];
-    json_escape_into(topic, esc_topic, sizeof(esc_topic));
+    /* BRIDGE_TOPIC_MAX, not 256. connection.c assembles per-channel topics
+     * as `grappa:user:<subject>/network:<slug>/channel:<chan>` out of
+     * subject_name[128], network_slug[64] and a folded channel[128], which
+     * reaches 347 bytes before escaping — all three sourced from the
+     * connecting client (USER, PASS, JOIN). A 256-byte buffer truncated
+     * those silently, and grappa imposes no topic length limit of its own
+     * (Grappa.PubSub.Topic.parse pattern-matches a prefix and splits the
+     * rest), so the bound has to be ours and it has to fit the real
+     * worst case. Past it, refuse: a shortened topic is not a degraded
+     * message, it is a join on a DIFFERENT channel reported as success. */
+    char esc_topic[BRIDGE_TOPIC_MAX];
+    if (!json_escape_into(topic, esc_topic, sizeof(esc_topic))) {
+        fprintf(stderr, "bicchierino: join refused: topic too long (%zu bytes)\n", strlen(topic));
+        return false;
+    }
 
-    char frame[512];
+    char frame[BRIDGE_FRAME_MAX];
     int n = snprintf(frame, sizeof(frame), "[\"%lu\",\"%lu\",\"%s\",\"phx_join\",{}]", ref, ref,
                       esc_topic);
     if (n < 0 || (size_t)n >= sizeof(frame)) return false;
@@ -120,10 +133,19 @@ bool bridge_push(struct bridge *br, const char *topic, unsigned long join_ref, c
                   const char *json_payload) {
     unsigned long ref = ++br->ws_ref;
 
-    char esc_topic[256];
-    json_escape_into(topic, esc_topic, sizeof(esc_topic));
-    char esc_event[64];
-    json_escape_into(event, esc_event, sizeof(esc_event));
+    /* Same reasoning as bridge_join: a push whose topic was shortened
+     * lands on another channel's topic, and one whose event was shortened
+     * asks grappa for a different operation. Both refuse. */
+    char esc_topic[BRIDGE_TOPIC_MAX];
+    if (!json_escape_into(topic, esc_topic, sizeof(esc_topic))) {
+        fprintf(stderr, "bicchierino: push refused: topic too long (%zu bytes)\n", strlen(topic));
+        return false;
+    }
+    char esc_event[BRIDGE_EVENT_MAX];
+    if (!json_escape_into(event, esc_event, sizeof(esc_event))) {
+        fprintf(stderr, "bicchierino: push refused: event too long (%zu bytes)\n", strlen(event));
+        return false;
+    }
 
     /* join_ref == 0 is the sentinel for "not tied to any joined
      * topic" — encoded as JSON `null`, not the string "0", matching
@@ -131,7 +153,7 @@ bool bridge_push(struct bridge *br, const char *topic, unsigned long join_ref, c
      * push on topic "phoenix", never joined, uses this same sentinel).
      * A real join_ref is never 0 (br->ws_ref starts at 0, the first
      * one ever assigned is 1), so the two cases can't collide. */
-    char frame[512];
+    char frame[BRIDGE_FRAME_MAX];
     int n;
     if (join_ref) {
         n = snprintf(frame, sizeof(frame), "[\"%lu\",\"%lu\",\"%s\",\"%s\",%s]", join_ref, ref,
