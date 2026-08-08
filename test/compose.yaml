@@ -114,7 +114,11 @@ services:
       # database-write global ships without its trailing "-> <tagline>" —
       # and that trailing part is precisely the branch notice_route.py
       # special-cases. Without this the rule cannot be exercised at all.
-      - ./services.conf.tmpl:/opt/azzurra/services/services.conf.tmpl:ro
+      #
+      # Volume paths in this file are relative to the Docker Compose project
+      # directory (test/azzurra-testnet/), NOT this file's own directory
+      # (test/). All paths use `../` to step up to test/ first.
+      - ../services.conf.tmpl:/opt/azzurra/services/services.conf.tmpl:ro
     networks:
       svc-net: null
       bicc-net:
@@ -147,8 +151,8 @@ services:
       leaf-v4:
         condition: service_started
     volumes:
-      - ./grappa:/app
-      - ./runtime/grappa:/app/runtime
+      - ../grappa:/app
+      - ../runtime/grappa:/app/runtime
     environment:
       MIX_ENV: dev
       ELIXIR_ERL_OPTIONS: "+fnu"
@@ -210,8 +214,8 @@ services:
       grappa-seed:
         condition: service_completed_successfully
     volumes:
-      - ./grappa:/app
-      - ./runtime/grappa:/app/runtime
+      - ../grappa:/app
+      - ../runtime/grappa:/app/runtime
     environment:
       MIX_ENV: dev
       ELIXIR_ERL_OPTIONS: "+fnu"
@@ -231,7 +235,7 @@ services:
   tls-init:
     image: bicchierino-test-certinit
     volumes:
-      - ./certs:/certs
+      - ../certs:/certs
     entrypoint: ["/bin/sh"]
     command: ["/certs/gen-tls.sh"]
     networks:
@@ -246,8 +250,8 @@ services:
       grappa:
         condition: service_healthy
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/certs:ro
+      - ../nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../certs:/certs:ro
     networks:
       bicc-net:
         aliases: [grappa-tls]
