@@ -46,12 +46,18 @@ fi
 # ── 0. The detector works ────────────────────────────────────────────────
 # A probe that cannot see a leak on an OPEN network would report every
 # sealed one as fine. Establish it can before trusting anything below.
+#
+# TCP (nc) rather than ICMP (ping): GitHub Actions runners and many CI
+# environments filter ICMP from Docker containers even when outbound TCP
+# is fine. `nc -w2 1.1.1.1 80` opens a TCP connection (no raw socket
+# needed, exits 0 on connect success), which is equally informative about
+# route existence and reliable across all tested environments.
 echo "control (must succeed, or every result below is meaningless):"
-if docker run --rm "$PROBE" sh -c 'ping -c1 -W2 1.1.1.1 >/dev/null 2>&1'; then
-    ok "the probe reaches 1.1.1.1 on a normal bridge"
+if docker run --rm "$PROBE" sh -c 'nc -w2 1.1.1.1 80 </dev/null >/dev/null 2>&1'; then
+    ok "the probe reaches 1.1.1.1:80 on a normal bridge (TCP)"
 else
-    echo "  BROKEN: the probe cannot reach 1.1.1.1 even unsealed." >&2
-    echo "  Either this host has no egress or $PROBE lacks ping; either way" >&2
+    echo "  BROKEN: the probe cannot reach 1.1.1.1:80 even unsealed." >&2
+    echo "  Either this host has no egress or TCP port 80 is blocked; either way" >&2
     echo "  this script cannot prove anything. Fix that before trusting it." >&2
     exit 1
 fi
@@ -85,18 +91,24 @@ done
 
 # ── 3. Egress really is impossible, measured from those networks ─────────
 # docker inspect says there is no gateway; this says no packet gets out.
+# TCP probe (nc), same reasoning as the control above: ICMP is often
+# filtered in CI while TCP connectivity is a reliable egress signal.
+# An internal: true network has no default route at all, so TCP
+# connections to any external host fail at the IP layer just as ICMP
+# would, producing a non-zero exit from nc — same evidence, better
+# portability.
 echo "egress, probed from inside each network:"
 for n in $nets; do
     if docker run --rm --network "$n" "$PROBE" \
-        sh -c 'ping -c1 -W2 1.1.1.1 >/dev/null 2>&1'; then
-        bad "reached 1.1.1.1 from $n"
+        sh -c 'nc -w2 1.1.1.1 80 </dev/null >/dev/null 2>&1'; then
+        bad "reached 1.1.1.1:80 (TCP) from $n"
     else
         ok "no route to 1.1.1.1 from $n"
     fi
 
     for host in azzurra.chat www.azzurra.chat staff.azzurra.chat helper.azzurra.chat; do
         if docker run --rm --network "$n" "$PROBE" \
-            sh -c "ping -c1 -W2 $host >/dev/null 2>&1"; then
+            sh -c "nc -w2 $host 80 </dev/null >/dev/null 2>&1"; then
             bad "reached $host from $n"
         fi
     done
