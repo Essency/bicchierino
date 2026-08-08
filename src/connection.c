@@ -29,6 +29,26 @@
 #define MAX_DM_PEERS 64  /* one per person ever DMed on this network — same
                            * "hostile-response backstop, not a real ceiling"
                            * posture as MAX_CHANNELS */
+#define CHATHISTORY_RING_SIZE 256 /* every (id, server_time) pair this
+                                    * connection has seen live, oldest
+                                    * evicted on overflow — same
+                                    * best-effort-bound posture as
+                                    * `pending_self_msg_ids`. Backs a
+                                    * CHATHISTORY `timestamp=` selector,
+                                    * which grappa's REST cursor has no
+                                    * native equivalent for (bicchierino#3
+                                    * — cursors are `id`-only, post-CP29):
+                                    * resolve the requested timestamp to
+                                    * the nearest `id` this ring has
+                                    * actually seen, then let that id
+                                    * anchor a normal REST page. `id` is
+                                    * one global monotonic sequence across
+                                    * every channel on `messages`, not
+                                    * per-channel, so an id observed on
+                                    * ANY channel this connection joined is
+                                    * a valid anchor for a timestamp query
+                                    * on any OTHER channel — one flat ring
+                                    * is correct, not a per-channel one. */
 #define IRCD_SERVER "bicchierino"
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
@@ -476,6 +496,21 @@ struct grappa_session {
     size_t dm_peer_count;
     char pending_dm_peer_names[MAX_DM_PEERS][64];
     size_t pending_dm_peer_count;
+
+    /* CHATHISTORY_RING_SIZE's own doc explains the why; this is the
+     * storage. Parallel arrays (same convention as dm_peer_names/
+     * dm_peer_join_refs above), written circularly at `ring_head`,
+     * oldest overwritten once `ring_count` saturates at the array size —
+     * `ring_head` is always the NEXT write slot, never a valid read
+     * index on its own. Populated once, unconditionally, at the single
+     * call site every kind already flows through
+     * (`handle_grappa_message_event`) for every kind carrying a real
+     * `id` — not just privmsg/notice/action — so a `msgid=`/`timestamp=`
+     * selector anchored on a join/part/kick/etc. row still resolves. */
+    long chathistory_ring_ids[CHATHISTORY_RING_SIZE];
+    long chathistory_ring_times[CHATHISTORY_RING_SIZE];
+    size_t chathistory_ring_head;
+    size_t chathistory_ring_count;
 };
 
 /* Current wall-clock time as unix milliseconds — the fallback
@@ -1366,6 +1401,20 @@ static bool consume_pending_self_id(struct grappa_session *sess, long id) {
         return true;
     }
     return false;
+}
+
+/* See `chathistory_ring_ids`'s own doc on `struct grappa_session`. A
+ * true circular buffer (unlike `remember_pending_self_id`'s shift-based
+ * 16-entry set above): 256 entries is past the point where a per-insert
+ * `memmove` is free, and the ring is walked in id order for lookup
+ * regardless of where `ring_head` currently sits, so there's no need to
+ * keep it "dense from index 0" the way the pending-self set does. */
+static void remember_chathistory_ring(struct grappa_session *sess, long id, long server_time_ms) {
+    size_t cap = CHATHISTORY_RING_SIZE;
+    sess->chathistory_ring_ids[sess->chathistory_ring_head] = id;
+    sess->chathistory_ring_times[sess->chathistory_ring_head] = server_time_ms;
+    sess->chathistory_ring_head = (sess->chathistory_ring_head + 1) % cap;
+    if (sess->chathistory_ring_count < cap) sess->chathistory_ring_count++;
 }
 
 static void send_privmsg_rest(struct http_client *hc, const struct config *cfg,
@@ -2366,6 +2415,17 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
      * `handle_grappa_links_bundle_event`'s `hopcount`). */
     long server_time_ms = 0;
     json_long_opt(message, "server_time", &server_time_ms, NULL);
+
+    /* Feeds `chathistory_ring_ids`/`chathistory_ring_times` — every kind
+     * on this one wire shape carries `id` (`Grappa.Scrollback.Wire`), so
+     * this is unconditional, not scoped to privmsg/notice/action the way
+     * the is_self dedup below is. A `msgid=`/`timestamp=` CHATHISTORY
+     * selector anchored on a join/kick/topic row must resolve too, not
+     * just a chat line. */
+    long ring_id = 0;
+    bool has_ring_id = false;
+    json_long_opt(message, "id", &ring_id, &has_ring_id);
+    if (has_ring_id) remember_chathistory_ring(sess, ring_id, server_time_ms);
 
     /* Every nick/channel-key identity compare in this codebase mirrors
      * grappa's own rule (its CLAUDE.md: "EVERY server-side nick compare
