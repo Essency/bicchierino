@@ -1,3 +1,7 @@
 /bicchierino
 src/*.o
 /test.config
+
+# Internal process doc, mirrored from the private repo — local reference
+# only, never published to this public repo.
+/CLAUDE.md
