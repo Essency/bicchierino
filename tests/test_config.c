@@ -151,6 +151,68 @@ TEST(loopback_means_127_slash_8) {
     CHECK(strstr(err, "refusing to start") != NULL);
 }
 
+/* The mirror of the bind gate above, on the other leg: an `http://`
+ * grappa-url puts grappa's own bearer token on the wire in the clear, so
+ * it is allowed only towards a loopback literal. Same override, same
+ * wording, deliberately — one rule, stated twice because there are two
+ * directions a secret can leave this process by. */
+TEST(a_plaintext_grappa_url_is_loopback_only) {
+    struct config cfg;
+    CHECK(load("grappa-url http://127.0.0.1:4000\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, NULL,
+               0));
+    CHECK(load("grappa-url http://127.10.20.30:4000\nbind 127.0.0.1 6667 plain\n", &cfg, NULL,
+               NULL, 0));
+    /* A port is not required, and neither is a path. */
+    CHECK(load("grappa-url http://127.0.0.1\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, NULL, 0));
+
+    char err[512];
+    CHECK(!load("grappa-url http://grappa.example\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, err,
+                sizeof(err)));
+    CHECK(strstr(err, "refusing to start") != NULL);
+    CHECK(strstr(err, "--insecure") != NULL);
+
+    /* Not just a name: a routable literal is refused too. */
+    CHECK(!load("grappa-url http://192.168.1.10:4000\nbind 127.0.0.1 6667 plain\n", &cfg, NULL,
+                err, sizeof(err)));
+    CHECK(strstr(err, "refusing to start") != NULL);
+
+    /* "localhost" is a resolver claim, not a verifiable fact — same
+     * reasoning that keeps it out of the bind gate. */
+    CHECK(!load("grappa-url http://localhost:4000\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, err,
+                sizeof(err)));
+    CHECK(strstr(err, "refusing to start") != NULL);
+
+    /* https:// anywhere stays fine — the gate is about plaintext only. */
+    CHECK(load("grappa-url https://grappa.example\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, NULL,
+               0));
+}
+
+TEST(insecure_also_opens_the_plaintext_url_gate) {
+    struct config cfg;
+    CHECK(load("grappa-url http://grappa.example\nbind 127.0.0.1 6667 plain\n", &cfg,
+               "--insecure", NULL, 0));
+    CHECK(strcmp(cfg.grappa_url, "http://grappa.example") == 0);
+}
+
+/* Before this gate existed an unknown scheme parsed fine here and only
+ * failed later, as an unexplained connection failure at the first REST
+ * call. Failing at startup names the actual problem. */
+TEST(an_unknown_url_scheme_is_refused_at_startup) {
+    struct config cfg;
+    char err[512];
+    CHECK(!load("grappa-url ftp://grappa.example\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, err,
+                sizeof(err)));
+    CHECK(strstr(err, "https:// or http://") != NULL);
+
+    CHECK(!load("grappa-url grappa.example\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, err,
+                sizeof(err)));
+    CHECK(strstr(err, "https:// or http://") != NULL);
+
+    /* A scheme with nothing after it is a host-less URL, not a host. */
+    CHECK(!load("grappa-url http://\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, err, sizeof(err)));
+    CHECK(strstr(err, "no host") != NULL);
+}
+
 TEST(both_required_directives_are_required) {
     struct config cfg;
     char err[512];
@@ -309,6 +371,9 @@ int main(void) {
     RUN(a_plain_bind_off_loopback_is_refused);
     RUN(insecure_opens_the_gate_and_only_that_gate);
     RUN(loopback_means_127_slash_8);
+    RUN(a_plaintext_grappa_url_is_loopback_only);
+    RUN(insecure_also_opens_the_plaintext_url_gate);
+    RUN(an_unknown_url_scheme_is_refused_at_startup);
     RUN(both_required_directives_are_required);
     RUN(an_unknown_directive_fails_loudly);
     RUN(malformed_binds_are_rejected);
