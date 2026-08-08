@@ -8,12 +8,18 @@
 #ifndef BICCHIERINO_CONNECTION_H
 #define BICCHIERINO_CONNECTION_H
 
+#include <stdatomic.h>
+
 #include "config.h"
 
 struct connection_args {
     int client_fd;
     const struct bind_config *listener; /* which bind accepted this client */
     const struct config *cfg;           /* whole config, for grappa_url etc. */
+    /* Pointer to the process-wide live-connection counter owned by main.c.
+     * connection_run decrements it at every exit path so the slot is freed
+     * regardless of how the connection ends. */
+    atomic_int *live_connections;
 };
 
 /* pthread entry point. Takes ownership of a heap-allocated
