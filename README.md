@@ -63,6 +63,24 @@ grappa-irc's own `shottino` frontend (MIT-licensed; see
 make
 ```
 
+### Debian/Ubuntu: install as a systemd service
+
+Each [release](https://github.com/Essency/bicchierino/releases) ships a
+`.deb` with a hardened systemd unit alongside the binary tarball:
+
+```sh
+sudo dpkg -i bicchierino_*.deb
+sudo $EDITOR /etc/bicchierino/bicchierino.config   # set a real grappa-url
+sudo systemctl enable --now bicchierino
+```
+
+The package creates a dedicated `bicchierino` system user, does NOT
+auto-start (the shipped config has a placeholder `grappa-url` that can
+never connect), and logs to the systemd journal
+(`journalctl -u bicchierino`) rather than a separate log file. See
+[`packaging/`](packaging/) for the unit file and `postinst`/`postrm`
+scripts, or `packaging/build-deb.sh` to build one yourself.
+
 ## Configuring
 
 See [`example.config`](example.config) for the full directive format. A

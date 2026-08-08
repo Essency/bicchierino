@@ -1,0 +1,40 @@
+#!/bin/sh
+# postinst — create the dedicated system user/group, own the log
+# directory, reload systemd. Deliberately does NOT enable or start the
+# service: the shipped /etc/bicchierino/bicchierino.config has a
+# placeholder grappa-url that can never connect, so auto-starting would
+# just produce a crash-looping unit. The admin edits the config, then
+# enables it themselves.
+set -e
+
+if ! getent group bicchierino >/dev/null; then
+    addgroup --quiet --system bicchierino
+fi
+
+if ! getent passwd bicchierino >/dev/null; then
+    adduser --quiet --system --ingroup bicchierino --home /var/lib/bicchierino \
+        --no-create-home --shell /usr/sbin/nologin bicchierino
+fi
+
+install -d -o bicchierino -g bicchierino -m 0750 /var/log/bicchierino
+
+# The config file ships root:root 0640 in the archive (the bicchierino
+# group doesn't exist yet at package-build time, so its real gid can't
+# be baked into the .deb) — fix the group here, now that it does, or
+# the service (running as bicchierino:bicchierino) can never read its
+# own config. Re-applied on every postinst run, not just first install:
+# harmless if already correct, self-healing if it somehow isn't.
+chgrp bicchierino /etc/bicchierino/bicchierino.config
+chmod 0640 /etc/bicchierino/bicchierino.config
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+cat <<'EOF'
+bicchierino installed but not started: /etc/bicchierino/bicchierino.config
+still has a placeholder grappa-url. Edit it, then:
+  systemctl enable --now bicchierino
+EOF
+
+exit 0

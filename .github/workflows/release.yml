@@ -34,16 +34,39 @@ jobs:
           echo "$v" | grep -q "bicchierino ${{ github.ref_name }}+" || \
             (echo "built version does not start with the triggering tag ${{ github.ref_name }} — refusing to publish a mislabeled release" && exit 1)
 
+      # Read the version straight out of the Makefile's own computation
+      # (the exact value already baked into the binary via
+      # -DBICCHIERINO_VERSION) rather than recomputing it here — one
+      # source of truth, so the .deb's Version field can never drift
+      # from what the binary itself reports via --version. Debian
+      # version syntax doesn't use the "v" prefix git tags do; strip it
+      # here, not in the Makefile (which has its own reasons to keep
+      # the "v" — it matches the tag name directly).
+      - name: Compute package versions
+        id: pkgver
+        run: |
+          DEB_VERSION="$(make version | sed 's/^v//')"
+          SOURCE_VERSION="${GITHUB_REF_NAME#v}"
+          echo "deb_version=$DEB_VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb
+        run: ./packaging/build-deb.sh "${{ steps.pkgver.outputs.deb_version }}"
+
       - name: Package
         run: |
           mkdir -p dist
-          tar -C . -czf "dist/bicchierino-${{ github.ref_name }}-linux-x86_64.tar.gz" \
-            bicchierino example.config README.md LICENSE THIRD_PARTY_LICENSES
+          mv "bicchierino_${{ steps.pkgver.outputs.deb_version }}_amd64.deb" dist/
+          git archive --format=tar.gz \
+            --prefix="bicchierino-${{ steps.pkgver.outputs.source_version }}/" \
+            -o "dist/bicchierino-${{ steps.pkgver.outputs.source_version }}-source.tar.gz" \
+            "${{ github.ref_name }}"
 
       - name: Create GitHub release
         run: |
           gh release create "${{ github.ref_name }}" \
-            dist/bicchierino-${{ github.ref_name }}-linux-x86_64.tar.gz \
+            dist/bicchierino_${{ steps.pkgver.outputs.deb_version }}_amd64.deb \
+            dist/bicchierino-${{ steps.pkgver.outputs.source_version }}-source.tar.gz \
             --title "${{ github.ref_name }}" \
             --generate-notes
         env:
