@@ -135,6 +135,64 @@ TEST(a_one_byte_buffer_holds_only_the_empty_string) {
     CHECK_STR(dst, "");
 }
 
+/* connection.c escapes client-supplied IRC parameters into fixed-size
+ * buffers (300 bytes for channel/target/nick, 192 for JOIN keys, 600 for
+ * topic/reason text, 1024 for message bodies).  IRC params can be up to
+ * 511 bytes (IRC_LINE_MAX - 1); a param made entirely of control bytes
+ * expands 6× under \u00xx encoding, so 51 control bytes already overflow
+ * a 300-byte buffer (51 × 6 = 306).  These tests pin the truncation
+ * detection at each of the sizes connection.c actually uses. */
+TEST(truncation_detected_at_connection_c_buffer_sizes) {
+    /* 300-byte buffer (esc_channel, esc_target, esc_nick, …):
+     * 51 control chars × 6 bytes = 306 > 300 → must truncate. */
+    {
+        char src[52];
+        for (int i = 0; i < 51; i++) src[i] = '\x01'; /* CTCP delimiter */
+        src[51] = '\0';
+        char dst[300];
+        CHECK(!json_escape_into(src, dst, sizeof(dst)));
+    }
+
+    /* 192-byte buffer (esc_key in send_join_rest):
+     * 33 control chars × 6 = 198 > 192 → must truncate. */
+    {
+        char src[34];
+        for (int i = 0; i < 33; i++) src[i] = '\x02'; /* bold */
+        src[33] = '\0';
+        char dst[192];
+        CHECK(!json_escape_into(src, dst, sizeof(dst)));
+    }
+
+    /* 600-byte buffer (esc_text in send_topic_rest, esc_reason in
+     * handle_kick): 101 control chars × 6 = 606 > 600 → must truncate. */
+    {
+        char src[102];
+        for (int i = 0; i < 101; i++) src[i] = '\x03'; /* colour */
+        src[101] = '\0';
+        char dst[600];
+        CHECK(!json_escape_into(src, dst, sizeof(dst)));
+    }
+
+    /* 1024-byte buffer (esc_body in send_privmsg_rest, IRC_LINE_MAX * 2):
+     * 171 control chars × 6 = 1026 > 1024 → must truncate. */
+    {
+        char src[172];
+        for (int i = 0; i < 171; i++) src[i] = '\x1f'; /* underline */
+        src[171] = '\0';
+        char dst[1024];
+        CHECK(!json_escape_into(src, dst, sizeof(dst)));
+    }
+
+    /* Boundary: 299 plain bytes fit in 300 (300th byte is the NUL). */
+    {
+        char src[300];
+        for (int i = 0; i < 299; i++) src[i] = 'x';
+        src[299] = '\0';
+        char dst[300];
+        CHECK(json_escape_into(src, dst, sizeof(dst)));
+    }
+}
+
 /* dst_sz == 0 has nowhere to put even the terminator: it must write
  * nothing at all. Run under ASan, this is the case that catches a
  * one-past-the-end store. */
@@ -157,5 +215,6 @@ int main(void) {
     RUN(the_exact_fit_succeeds_and_one_byte_less_does_not);
     RUN(a_one_byte_buffer_holds_only_the_empty_string);
     RUN(a_zero_byte_buffer_is_not_written_to);
+    RUN(truncation_detected_at_connection_c_buffer_sizes);
     return test_report();
 }
