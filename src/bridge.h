@@ -13,6 +13,24 @@
 
 #include "ws_client.h"
 
+/* Escaped-topic room. connection.c's longest topic shape is
+ * `grappa:user:<subject>/network:<slug>/channel:<chan>`, which from
+ * subject_name[128] + network_slug[64] + a folded channel[128] reaches
+ * 347 bytes unescaped. Grappa sets no topic limit of its own, so this is
+ * the bound, and it is sized to fit every topic connection.c can legally
+ * build plus room for the escaping to expand a few bytes. Anything past
+ * it is refused rather than shortened — see bridge_join. */
+#define BRIDGE_TOPIC_MAX 512
+
+/* Event names are literals in this codebase ("phx_join", "heartbeat",
+ * "new_message"), never client-sourced — this is a bound, not a budget. */
+#define BRIDGE_EVENT_MAX 64
+
+/* Envelope, both escaped fields at their maximum, and a small payload:
+ * `["<ref>","<ref>","<topic>","<event>",<payload>]`. A push whose raw
+ * json_payload overflows this still fails closed on snprintf's return. */
+#define BRIDGE_FRAME_MAX 1024
+
 struct bridge {
     struct ws_client wsc;
     unsigned long ws_ref; /* monotonic — every outbound frame gets the next one */
