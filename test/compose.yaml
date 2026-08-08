@@ -17,10 +17,23 @@
 # RUNTIME that is sealed.
 name: bicchierino-test
 
-include:
-  # hub + leaf-v4 + leaf-v6 + services, bahamut built from source.
-  # Pinned as a submodule at test/azzurra-testnet.
-  - path: ./azzurra-testnet/compose.yaml
+# ── How to use this file ──────────────────────────────────────────────────────
+# This file is an OVERRIDE layer on top of azzurra-testnet/compose.yaml.
+# Run it with both files every time — the testnet's services (hub, leaf-v4,
+# leaf-v6, services) come from azzurra-testnet; this file seals, extends and
+# supplements them:
+#
+#   docker compose -f azzurra-testnet/compose.yaml -f compose.yaml <cmd>
+#
+# Or, equivalently, set the env var before any docker compose call:
+#
+#   export COMPOSE_FILE=azzurra-testnet/compose.yaml:compose.yaml
+#
+# Using `include:` was the original approach, but Docker Compose 2.27+
+# validates that parent files cannot redefine services (or networks) that
+# come from an included file — the exact pattern this override layer needs.
+# The multi-file (-f) merge predates `include:` and is designed for exactly
+# this: the second file overrides matching keys in the first.
 
 services:
   # The testnet's cert-init runs `apk add openssl` as its first step, which
@@ -37,7 +50,10 @@ services:
   cert-init:
     image: bicchierino-test-certinit
     build:
-      context: .
+      # Context is relative to the project directory Docker Compose infers
+      # from the first file in COMPOSE_FILE: test/azzurra-testnet/.
+      # So `..` resolves to test/, where Dockerfile.certinit lives.
+      context: ..
       dockerfile: Dockerfile.certinit
     entrypoint: ["/bin/sh"]
     command: ["/certs/gen-cert.sh"]
@@ -98,7 +114,11 @@ services:
       # database-write global ships without its trailing "-> <tagline>" —
       # and that trailing part is precisely the branch notice_route.py
       # special-cases. Without this the rule cannot be exercised at all.
-      - ./services.conf.tmpl:/opt/azzurra/services/services.conf.tmpl:ro
+      #
+      # Volume paths in this file are relative to the Docker Compose project
+      # directory (test/azzurra-testnet/), NOT this file's own directory
+      # (test/). All paths use `../` to step up to test/ first.
+      - ../services.conf.tmpl:/opt/azzurra/services/services.conf.tmpl:ro
     networks:
       svc-net: null
       bicc-net:
@@ -117,7 +137,9 @@ services:
   # tree is bind-mounted rather than baked — the image is toolchain-only.
   grappa-seed:
     build:
-      context: ./grappa
+      # ../grappa resolves to test/grappa (the submodule) from project dir
+      # test/azzurra-testnet/.
+      context: ../grappa
       args:
         CONTAINER_UID: ${CONTAINER_UID:-1000}
         CONTAINER_GID: ${CONTAINER_GID:-1000}
@@ -129,8 +151,8 @@ services:
       leaf-v4:
         condition: service_started
     volumes:
-      - ./grappa:/app
-      - ./runtime/grappa:/app/runtime
+      - ../grappa:/app
+      - ../runtime/grappa:/app/runtime
     environment:
       MIX_ENV: dev
       ELIXIR_ERL_OPTIONS: "+fnu"
@@ -192,8 +214,8 @@ services:
       grappa-seed:
         condition: service_completed_successfully
     volumes:
-      - ./grappa:/app
-      - ./runtime/grappa:/app/runtime
+      - ../grappa:/app
+      - ../runtime/grappa:/app/runtime
     environment:
       MIX_ENV: dev
       ELIXIR_ERL_OPTIONS: "+fnu"
@@ -213,7 +235,7 @@ services:
   tls-init:
     image: bicchierino-test-certinit
     volumes:
-      - ./certs:/certs
+      - ../certs:/certs
     entrypoint: ["/bin/sh"]
     command: ["/certs/gen-tls.sh"]
     networks:
@@ -228,8 +250,8 @@ services:
       grappa:
         condition: service_healthy
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/certs:ro
+      - ../nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../certs:/certs:ro
     networks:
       bicc-net:
         aliases: [grappa-tls]
@@ -237,7 +259,9 @@ services:
   # ── bicchierino, the thing under test ─────────────────────────────────
   bicchierino:
     build:
-      context: ..
+      # ../.. resolves to the repo root from project dir test/azzurra-testnet/,
+      # which is what Dockerfile.bicchierino's COPY test/... paths expect.
+      context: ../..
       dockerfile: test/Dockerfile.bicchierino
     image: bicchierino:test
     pull_policy: never
@@ -259,7 +283,9 @@ services:
   # It reaches exactly one thing: bicchierino, on this sealed network.
   weechat:
     build:
-      context: ..
+      # ../.. resolves to the repo root from project dir test/azzurra-testnet/,
+      # matching Dockerfile.weechat's COPY test/weechat/ path.
+      context: ../..
       dockerfile: test/Dockerfile.weechat
     image: weechat:bicchierino-test
     pull_policy: never

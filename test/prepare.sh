@@ -51,6 +51,21 @@ docker run --rm \
     --entrypoint /bin/sh \
     bicchierino-test-certinit /certs/gen-tls.sh
 
+# The image itself, before anything is run against it. `docker run` below
+# does not build on demand the way `docker compose up` does for the same
+# service (grappa-seed/grappa share this tag) — it fails outright if the
+# tag does not already exist locally. That was invisible from a dev
+# machine that already had it cached from an earlier compose run; a truly
+# clean environment (a fresh CI runner, in particular) has no such cache.
+# Same build context/args compose.yaml uses for grappa-seed, so the image
+# this step produces is the one `docker compose up` will also select
+# (pull_policy: never means compose reuses this tag rather than pulling).
+echo "prepare: building the grappa image (toolchain only, needs network for apk)"
+docker build -q -t "$IMAGE" \
+    --build-arg CONTAINER_UID="$(id -u)" \
+    --build-arg CONTAINER_GID="$(id -g)" \
+    "$GRAPPA_SRC" >/dev/null
+
 echo "prepare: fetching Hex, rebar and deps (needs network, runs unsealed)"
 # --network bridge, NOT one of the stack's networks: this container is
 # doing the fetching precisely because the stack's own networks cannot.
