@@ -156,7 +156,13 @@ static bool growbuf_append(struct growbuf *gb, const char *bytes, size_t n) {
         gb->data = grown;
         gb->cap = new_cap;
     }
-    memcpy(gb->data + gb->len, bytes, n);
+    /* n == 0 leaves gb->data NULL (nothing above allocated), and memcpy
+     * declares both pointers nonnull regardless of the count — so the
+     * zero-length case is undefined behaviour even though it copies
+     * nothing. Caught by UBSan via tests/test_http.c. Harmless on glibc
+     * today; the risk is a compiler that infers gb->data != NULL from the
+     * call and drops a later check on that basis. */
+    if (n) memcpy(gb->data + gb->len, bytes, n);
     gb->len += n;
     return true;
 }
@@ -293,7 +299,11 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
         free(body.data);
         return false;
     }
-    memcpy(out->body, body.data, body.len);
+    /* Same nonnull rule as growbuf_append above, and THIS one a live
+     * grappa reaches: any response with `Content-Length: 0` (or a 204 —
+     * the logout DELETE is the obvious one) appends nothing, so body.data
+     * is still NULL here while body.len is 0. */
+    if (body.len) memcpy(out->body, body.data, body.len);
     out->body[body.len] = '\0';
     out->body_len = body.len;
     free(body.data);
