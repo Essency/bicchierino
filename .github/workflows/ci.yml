@@ -160,19 +160,15 @@ jobs:
     #
     # COMPOSE_FILE lists both files; all steps cd into test/ first, so these
     # paths resolve to test/azzurra-testnet/compose.yaml and test/compose.yaml.
-    #
-    # --project-directory is critical: without it Docker Compose infers the
-    # project directory from the first file in COMPOSE_FILE, giving
-    # test/azzurra-testnet/ — which makes relative build contexts in
-    # test/compose.yaml (e.g. `context: ..` for the bicchierino and weechat
-    # images) resolve one level too deep (test/ instead of repo root).
-    # Forcing it to `.` pins it to the CWD (test/) where all steps run from.
+    # Docker Compose infers the project directory from the first file's location
+    # (test/azzurra-testnet/), so ALL relative build contexts in test/compose.yaml
+    # are authored as paths from that directory — see the context: values there.
     #
     # COMPOSE is also set so isolation.sh (which reads `COMPOSE` to learn
-    # how to invoke docker compose) inherits the same flags automatically.
+    # how to invoke docker compose) inherits the same env automatically.
     env:
       COMPOSE_FILE: azzurra-testnet/compose.yaml:compose.yaml
-      COMPOSE: docker compose --project-directory .
+      COMPOSE: docker compose
     steps:
       - uses: actions/checkout@v4
         with:

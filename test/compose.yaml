@@ -50,7 +50,10 @@ services:
   cert-init:
     image: bicchierino-test-certinit
     build:
-      context: .
+      # Context is relative to the project directory Docker Compose infers
+      # from the first file in COMPOSE_FILE: test/azzurra-testnet/.
+      # So `..` resolves to test/, where Dockerfile.certinit lives.
+      context: ..
       dockerfile: Dockerfile.certinit
     entrypoint: ["/bin/sh"]
     command: ["/certs/gen-cert.sh"]
@@ -130,7 +133,9 @@ services:
   # tree is bind-mounted rather than baked — the image is toolchain-only.
   grappa-seed:
     build:
-      context: ./grappa
+      # ../grappa resolves to test/grappa (the submodule) from project dir
+      # test/azzurra-testnet/.
+      context: ../grappa
       args:
         CONTAINER_UID: ${CONTAINER_UID:-1000}
         CONTAINER_GID: ${CONTAINER_GID:-1000}
@@ -250,7 +255,9 @@ services:
   # ── bicchierino, the thing under test ─────────────────────────────────
   bicchierino:
     build:
-      context: ..
+      # ../.. resolves to the repo root from project dir test/azzurra-testnet/,
+      # which is what Dockerfile.bicchierino's COPY test/... paths expect.
+      context: ../..
       dockerfile: test/Dockerfile.bicchierino
     image: bicchierino:test
     pull_policy: never
@@ -272,7 +279,9 @@ services:
   # It reaches exactly one thing: bicchierino, on this sealed network.
   weechat:
     build:
-      context: ..
+      # ../.. resolves to the repo root from project dir test/azzurra-testnet/,
+      # matching Dockerfile.weechat's COPY test/weechat/ path.
+      context: ../..
       dockerfile: test/Dockerfile.weechat
     image: weechat:bicchierino-test
     pull_policy: never
