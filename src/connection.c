@@ -287,6 +287,31 @@ static void send_line(int fd, const char *fmt, ...) {
      * (see `send_tagged_line`); this is the backstop that keeps a
      * mis-sized one from being a memory-safety bug. */
     if ((size_t)n > sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    /* ONE line in, one line out (#9).
+     *
+     * Every render arm formats grappa-sourced strings through here —
+     * body, channel, sender, topic, kick reason. A CR or LF inside one
+     * of them ends this line early and starts another, chosen by
+     * whoever controls the field, and the client cannot tell it apart
+     * from a line the bridge meant to send.
+     *
+     * grappa refuses those bytes in every public send helper today
+     * (`Grappa.IRC.Identifier.safe_line_token?/1`), so nothing should
+     * arrive carrying one. That is exactly why this is here: without
+     * it the correctness of this side rests on an invariant held by a
+     * separate codebase, versioned separately, and a compromised,
+     * older or newer grappa turns silently into IRC injection. The
+     * Makefile already names frames from grappa as hostile input.
+     *
+     * At the single choke point rather than per arm: there are dozens
+     * of call sites and adding one is routine, so a per-site rule is a
+     * rule that will be missed. Replaced with a space rather than
+     * removed, so offsets and any length a caller already computed
+     * stay valid and the operator still sees the text. After the
+     * truncation clamp, so a byte revealed BY truncation cannot slip
+     * past it. */
+    for (int i = 0; i < n; i++)
+        if (buf[i] == '\r' || buf[i] == '\n') buf[i] = ' ';
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
