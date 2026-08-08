@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render
 
 .PHONY: all clean install version check
 
@@ -95,6 +95,14 @@ tests/test_http: tests/test_http.c tests/test.h src/http.c src/http.h
 # reader would only test the stub.
 tests/test_bridge: tests/test_bridge.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/bridge.c src/bridge.h src/json.c src/jsonw.c src/ws.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_bridge.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c -lssl -lcrypto
+
+# Compiles connection.c into the suite, so send_line — static, and the
+# choke point every render arm passes through — can be driven directly.
+# Needs the modules connection.c calls plus the same libraries the binary
+# links; nothing is stubbed, because the property under test is what the
+# real formatter puts on a real fd.
+tests/test_render: tests/test_render.c tests/test.h src/connection.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_render.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)
