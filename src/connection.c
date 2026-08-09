@@ -2678,15 +2678,21 @@ static const char *row_text(const json_value *message, const json_value *meta) {
  *
  * Discriminating on kind alone (#26) was wrong: grappa uses `kind =
  * "notice"` for BOTH user nicks and server hostnames when routing to
- * `$server`. The dot heuristic is the only discriminator available on
- * this side of the wire: `sender_nick/1` in grappa drops the {:nick,…} /
- * {:server,…} tag before the row reaches bicchierino, making recovery
- * impossible without a grappa-side change (#29 option 1). The heuristic
- * is correct for every network that does not permit dots in nicks.
+ * `$server`. grappa v0.15.0 (vjt/grappa-irc#1070, commits 11ef1eac/ca2554d0)
+ * resolved this by threading `meta.sender_kind` ("user" or "server") through
+ * all three NOTICE persist paths, providing an authoritative discriminator
+ * that replaces the guess below. `sender_kind` is used when present; the
+ * dot heuristic (`sender_nick/1` in grappa drops the {:nick,…}/{:server,…}
+ * tag before the row reaches bicchierino — making recovery impossible on the
+ * old wire) is kept as a fallback for rows persisted before v0.15.0 or
+ * instances not yet upgraded. The heuristic is correct for every network
+ * that does not permit dots in nicks (#29 option 1).
  *
- * The structured `meta` is deliberately not unpacked: grappa fills `body`
- * with a plain spelling for exactly this reason ("the wire is
- * additive-only — an old client ignores the meta and shows the body"). */
+ * The structured `meta` is deliberately not unpacked for the body: grappa
+ * fills `body` with a plain spelling for exactly this reason ("the wire is
+ * additive-only — an old client ignores the meta and shows the body").
+ * `sender_kind` is the one meta key we DO read here, because it carries
+ * semantic information that is not expressed anywhere else on the wire. */
 static void handle_grappa_server_window_row(int fd, const struct grappa_session *sess,
                                              const char *kind, const char *sender,
                                              const json_value *message,
@@ -2694,13 +2700,27 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
     const char *text = row_text(message, meta);
     if (!text) return;
 
+    /* Determine whether `sender` is a user nick or a server hostname.
+     * Prefer meta.sender_kind ("user"/"server") from grappa >= v0.15.0;
+     * fall back to the dot heuristic for older rows that lack the key. */
+    const char *sender_kind = meta ? json_string(json_get(meta, "sender_kind")) : NULL;
+    bool is_user_nick;
+    if (sender_kind) {
+        is_user_nick = (strcmp(sender_kind, "user") == 0);
+    } else {
+        /* Dot heuristic: a real server hostname always contains at least
+         * one dot; a user nick never does (on networks that enforce this). */
+        is_user_nick = kind && strcmp(kind, "notice") == 0
+                       && sender && sender[0] && strcmp(sender, "*") != 0
+                       && !strchr(sender, '.');
+    }
+
     char nick_prefix[196];
     const char *prefix;
-    if (kind && strcmp(kind, "notice") == 0 && sender && sender[0] && strcmp(sender, "*") != 0
-        && !strchr(sender, '.')) {
-        /* User nick (no dot) — must carry !user@host so clients identify
-         * it as a user NOTICE rather than a server NOTICE (prefix shape
-         * is the only wire distinction). */
+    if (is_user_nick) {
+        /* User nick — must carry !user@host so clients identify it as a
+         * user NOTICE rather than a server NOTICE (prefix shape is the
+         * only wire distinction). */
         snprintf(nick_prefix, sizeof(nick_prefix), "%s!bicchierino@bicchierino", sender);
         prefix = nick_prefix;
     } else {
