@@ -43,18 +43,33 @@ struct listener {
 };
 
 static int open_listener(const struct bind_config *b) {
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)b->port);
+    struct sockaddr_in  addr4;
+    struct sockaddr_in6 addr6;
+    struct sockaddr    *addr;
+    socklen_t           addrlen;
+    int                 family;
 
-    if (inet_pton(AF_INET, b->ip, &addr.sin_addr) != 1) {
-        fprintf(stderr, "bicchierino: cannot parse bind address '%s' (IPv6 not wired up yet)\n",
-                b->ip);
+    memset(&addr4, 0, sizeof(addr4));
+    memset(&addr6, 0, sizeof(addr6));
+
+    if (inet_pton(AF_INET, b->ip, &addr4.sin_addr) == 1) {
+        family           = AF_INET;
+        addr4.sin_family = AF_INET;
+        addr4.sin_port   = htons((uint16_t)b->port);
+        addr    = (struct sockaddr *)&addr4;
+        addrlen = sizeof(addr4);
+    } else if (inet_pton(AF_INET6, b->ip, &addr6.sin6_addr) == 1) {
+        family            = AF_INET6;
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port   = htons((uint16_t)b->port);
+        addr    = (struct sockaddr *)&addr6;
+        addrlen = sizeof(addr6);
+    } else {
+        fprintf(stderr, "bicchierino: cannot parse bind address '%s'\n", b->ip);
         return -1;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(family, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
         return -1;
@@ -63,7 +78,20 @@ static int open_listener(const struct bind_config *b) {
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (family == AF_INET6) {
+        /* Explicitly disable IPv4-mapped connections on this IPv6 socket.
+         * Without IPV6_V6ONLY, Linux's default lets a `::` wildcard also
+         * accept IPv4-mapped peers, silently changing what the bind line
+         * means depending on OS defaults.  Bicchierino's `bind` is
+         * deliberately repeatable so one process can listen on several
+         * independent (ip, port, tls) combinations — a user wanting both
+         * IPv4 and IPv6 on the same port writes two bind lines; the OS
+         * default must not conflate them behind our back. */
+        int v6only = 1;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    }
+
+    if (bind(fd, addr, addrlen) < 0) {
         fprintf(stderr, "bicchierino: bind %s:%d: %s\n", b->ip, b->port, strerror(errno));
         close(fd);
         return -1;
