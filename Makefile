@@ -114,8 +114,8 @@ tests/test_server_window: tests/test_server_window.c tests/test.h src/connection
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_window.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 # Compiles connection.c in to reach the static admin handlers: grappa_admin_notice,
-# render_live_list, parse_positive_long, handle_grappa_admin. Same pattern as
-# test_render and test_server_window.
+# render_session_list, parse_positive_long, is_safe_path_segment, handle_grappa_admin.
+# Same pattern as test_render and test_server_window.
 tests/test_grappa_admin: tests/test_grappa_admin.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_grappa_admin.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
