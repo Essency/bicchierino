@@ -2964,36 +2964,135 @@ static void grappa_admin_vhosts(int fd, const char *nick, struct http_client *hc
     json_free(doc);
 }
 
-/* /grappa vhost grant <address> <user> — POST /admin/vhosts
- * The grant is "availability-only, not a security-state transition"
- * (per grappa's own VhostsController moduledoc, cited in issue #56). */
+/* /grappa vhost grant <address> <user> — resolves address→vhost id via
+ * GET /admin/vhosts, resolves username→subject_id (UUID) via GET /admin/users,
+ * then calls the real grant endpoint: POST /admin/vhosts/:id/grants with
+ * {subject_type: "user", subject_id: <uuid>}. (#62) */
 static void grappa_admin_vhost_grant(int fd, const char *nick, struct http_client *hc,
                                       const struct config *cfg, const struct grappa_session *sess,
                                       const char *address, const char *user) {
-    char esc_address[300], esc_user[300];
-    if (!json_escape_into(address, esc_address, sizeof(esc_address)) ||
-        !json_escape_into(user, esc_user, sizeof(esc_user))) {
-        grappa_admin_notice(fd, nick, "address or user too long");
+    char err[128];
+
+    /* Step 1: resolve address → vhost id */
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/vhosts", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    json_doc *vhosts_doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!vhosts_doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    long vhost_id = 0;
+    const json_value *vroot = json_root(vhosts_doc);
+    const json_value *varr = json_get(vroot, "vhosts");
+    if (!varr) varr = vroot;
+    size_t vcount = json_len(varr);
+    for (size_t i = 0; i < vcount; i++) {
+        const json_value *v = json_at(varr, i);
+        const char *addr = json_string(json_get(v, "address"));
+        if (addr && strcasecmp(addr, address) == 0) {
+            json_long_req(v, "id", &vhost_id);
+            break;
+        }
+    }
+    json_free(vhosts_doc);
+
+    if (vhost_id == 0) {
+        grappa_admin_notice(fd, nick, "no vhost with address %s found", address);
         return;
     }
-    char body[700];
-    snprintf(body, sizeof(body),
-             "{\"address\":\"%s\",\"user_login\":\"%s\"}", esc_address, esc_user);
 
-    struct http_response resp;
-    if (!admin_request(fd, nick, hc, cfg, sess, "POST", "/admin/vhosts", body, &resp)) return;
+    /* Step 2: resolve username → subject_id (UUID) */
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/users", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    json_doc *users_doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!users_doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    char subject_id[128] = {0};
+    const json_value *uroot = json_root(users_doc);
+    const json_value *uarr = json_get(uroot, "users");
+    if (!uarr) uarr = uroot;
+    size_t ucount = json_len(uarr);
+    for (size_t i = 0; i < ucount; i++) {
+        const json_value *u = json_at(uarr, i);
+        const char *name = json_string(json_get(u, "name"));
+        if (name && strcasecmp(name, user) == 0) {
+            const char *uid = json_string(json_get(u, "id"));
+            if (uid) snprintf(subject_id, sizeof(subject_id), "%s", uid);
+            break;
+        }
+    }
+    json_free(users_doc);
+
+    if (!subject_id[0]) {
+        grappa_admin_notice(fd, nick, "no user named %s found", user);
+        return;
+    }
+
+    /* Step 3: POST /admin/vhosts/:id/grants with {subject_type, subject_id} */
+    char esc_subject_id[300];
+    if (!json_escape_into(subject_id, esc_subject_id, sizeof(esc_subject_id))) {
+        grappa_admin_notice(fd, nick, "subject_id too long");
+        return;
+    }
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"subject_type\":\"user\",\"subject_id\":\"%s\"}", esc_subject_id);
+
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/vhosts/%ld/grants", vhost_id);
+
+    if (!admin_request(fd, nick, hc, cfg, sess, "POST", path, body, &resp)) return;
     if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
     http_response_free(&resp);
     grappa_admin_notice(fd, nick, "vhost %s granted to %s", address, user);
 }
 
-/* /grappa vhost revoke <grant_id> — DELETE /admin/vhosts/:id */
+/* /grappa vhost revoke <grant_id> — DELETE /admin/vhosts/grants/:grant_id.
+ *
+ * Defense in depth: verifies the id appears in the flat root-level grants
+ * array from GET /admin/vhosts before issuing the delete. The grants are
+ * returned as a flat top-level array (siblings to "vhosts"), NOT nested
+ * inside each vhost object. Without this check, a mistyped grant id could
+ * collide with a vhost id and silently delete an entire vhost
+ * (DELETE /admin/vhosts/:id cascades every grant on it). (#62) */
 static void grappa_admin_vhost_revoke(int fd, const char *nick, struct http_client *hc,
                                        const struct config *cfg, const struct grappa_session *sess,
                                        long grant_id) {
-    char path[128];
-    snprintf(path, sizeof(path), "/admin/vhosts/%ld", grant_id);
     struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/vhosts", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    bool found = false;
+    const json_value *root = json_root(doc);
+    const json_value *grants = json_get(root, "grants");
+    if (grants) {
+        size_t n = json_len(grants);
+        for (size_t i = 0; i < n && !found; i++) {
+            const json_value *g = json_at(grants, i);
+            long gid = 0;
+            if (json_long_req(g, "id", &gid) && gid == grant_id)
+                found = true;
+        }
+    }
+    json_free(doc);
+
+    if (!found) {
+        grappa_admin_notice(fd, nick,
+                            "grant id %ld not found in vhost list — not revoking (id collision risk)",
+                            grant_id);
+        return;
+    }
+
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/vhosts/grants/%ld", grant_id);
     if (!admin_request(fd, nick, hc, cfg, sess, "DELETE", path, NULL, &resp)) return;
     if (!admin_check_status(fd, nick, &resp, "vhost grant")) { http_response_free(&resp); return; }
     http_response_free(&resp);
