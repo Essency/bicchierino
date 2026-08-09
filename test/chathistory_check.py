@@ -242,7 +242,9 @@ def irc_register_with_caps(
 
     Sends CAP LS 302, PASS (if given), NICK, USER, then waits for the server's
     CAP LS reply, sends CAP REQ for the requested caps, waits for ACK/NAK,
-    then CAP END.  Waits for 004.
+    then CAP END.  Reads until RPL_ENDOFMOTD (376) or ERR_NOMOTD (422) so that
+    the 005 (ISUPPORT) line — which the IRC spec places AFTER 004 — is included
+    in the returned all_lines.
 
     Returns (all_lines, got_004, acked_caps) where acked_caps maps cap_name →
     "" (value if the server sends one, or "" for valueless caps).
@@ -256,10 +258,15 @@ def irc_register_with_caps(
     all_lines: list[str] = []
     ls_seen = False
     acked: dict[str, str] = {}
+    got_004 = False
 
-    def is_004(text: str) -> bool:
+    def is_end_of_registration(text: str) -> bool:
+        """Stop at RPL_ENDOFMOTD (376) or ERR_NOMOTD (422).
+        Both signals mean the server considers registration complete and any
+        further 005/ISUPPORT lines have already been delivered — unlike 004,
+        which the IRC spec sends BEFORE the one or more 005 lines that follow it."""
         p = text.split()
-        return len(p) >= 2 and p[1] == "004"
+        return len(p) >= 2 and p[1] in ("376", "422")
 
     deadline = time.monotonic() + READ_TIMEOUT
     while time.monotonic() < deadline:
@@ -303,8 +310,11 @@ def irc_register_with_caps(
         elif command == "PING":
             conn.send(f"PONG :{params[0] if params else ''}")
 
-        if is_004(line):
-            return all_lines, True, acked
+        if command == "004":
+            got_004 = True
+
+        if is_end_of_registration(line):
+            return all_lines, got_004, acked
 
     return all_lines, False, acked
 
@@ -790,7 +800,7 @@ def main() -> None:
         bicc.close()
         sys.exit(1)
 
-    print(f"Received {len(reg_lines)} line(s) through 004.", flush=True)
+    print(f"Received {len(reg_lines)} line(s) through end of MOTD (376/422).", flush=True)
 
     # Check 1 + 2: CAP negotiation and ISUPPORT
     check_cap_negotiation(bicc, reg_lines, acked)
@@ -824,23 +834,20 @@ def main() -> None:
     peer.drain(2.0)
 
     # ── Set up the test channel ───────────────────────────────────────────────
-    # Peer joins first to get auto-op, then bicc joins.
+    # ch-peer joins first to get auto-op (required for the channel to exist on
+    # bahamut with a valid channel op so grappa can bridge it).
     print(f"\nch-peer joining {TEST_CHAN} (to get auto-op)…", flush=True)
     peer.send(f"JOIN {TEST_CHAN}")
     peer.drain(3.0)
 
-    # ── Seed real message history via ch-peer ─────────────────────────────────
-    # We send N_SEED messages through the real ircd (bahamut) so grappa
-    # has something to return for our CHATHISTORY queries.
+    # bicc-ch joins BEFORE any messages are seeded — this is the critical
+    # ordering: grappa only stores messages for channels it is subscribed to,
+    # and grappa subscribes when bicchierino issues a JOIN.  Seeding messages
+    # before bicc-ch has joined means grappa has not yet opened a WebSocket
+    # topic for this channel and therefore never receives (or stores) those
+    # messages — causing CHATHISTORY LATEST to return an empty batch.
     N_SEED = 5
     SEED_TAG = "chathistory-check-seed"
-    print(f"\nSeeding {N_SEED} messages into {TEST_CHAN} via ch-peer…", flush=True)
-    for i in range(N_SEED):
-        peer.send(f"PRIVMSG {TEST_CHAN} :{SEED_TAG}-{i}")
-        time.sleep(0.3)   # brief gap so messages get distinct timestamps
-
-    # bicc joins the test channel — this triggers grappa to subscribe to its
-    # topic, which is what makes the channel visible to chathistory queries.
     print(f"\nbicc-ch joining {TEST_CHAN}…", flush=True)
     bicc.send(f"JOIN {TEST_CHAN}")
     join_lines, got_join = bicc.recv_until(
@@ -852,6 +859,19 @@ def main() -> None:
         fail(f"bicc-ch: no JOIN echo or NAMES for {TEST_CHAN} within 15s")
     snapshot = join_lines + bicc.drain(8.0)
     print(f"  {TEST_CHAN} snapshot: {len(snapshot)} line(s).", flush=True)
+
+    # ── Seed real message history via ch-peer ─────────────────────────────────
+    # Now that grappa is subscribed to the channel topic, messages sent by
+    # ch-peer will be received by grappa and stored for CHATHISTORY queries.
+    print(f"\nSeeding {N_SEED} messages into {TEST_CHAN} via ch-peer…", flush=True)
+    for i in range(N_SEED):
+        peer.send(f"PRIVMSG {TEST_CHAN} :{SEED_TAG}-{i}")
+        time.sleep(0.3)   # brief gap so messages get distinct timestamps
+
+    # Drain the seeded messages arriving at bicc-ch from the grappa bridge —
+    # this also populates the chathistory ring so timestamp= selectors work.
+    seeded_lines = bicc.drain(5.0)
+    print(f"  bicc-ch received {len(seeded_lines)} seeded line(s) from bridge.", flush=True)
 
     # Give grappa a moment to store all seeded messages before we query them
     time.sleep(2.0)
