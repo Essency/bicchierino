@@ -1,5 +1,5 @@
 /* test_grappa_admin.c — /grappa admin command NOTICE format and input
- * validation. (#56)
+ * validation. (#56, updated for #63)
  *
  * Every /grappa admin response reaches the client through
  * `grappa_admin_notice`, which calls `send_line` — the same bottleneck
@@ -8,11 +8,14 @@
  *   - The NOTICE prefix is always `grappa!grappa@grappa`, never the
  *     server name or a bare nick, so clients file it under the right
  *     source rather than routing it as a server notice.
- *   - `render_live_list` formats session/visitor rows consistently: [id]
- *     label @netN — channels, mailbox, alive/dead — peer.
+ *   - `render_session_list` formats rows using real wire fields
+ *     (subject_kind, subject_id, network_id) to build a composite id
+ *     "[kind:subid:net]" and falls back to "@netN" when no slug cache.
  *   - `subject_label: null` renders as "<orphan pid>", not blank.
  *   - `parse_positive_long` rejects non-integers, zero, negative values
  *     and trailing junk without crashing.
+ *   - `is_safe_path_segment` accepts valid composite / UUID ids and
+ *     rejects path-injection attempts.
  *   - Unknown subcommands produce a "try /quote GRAPPA help" reply, not
  *     silence.
  *   - The help text contains at least one line mentioning "whoami".
@@ -136,15 +139,52 @@ TEST(parse_positive_long_rejects_non_numeric) {
     CHECK(!parse_positive_long("abc", &v));
 }
 
-/* ── render_live_list ────────────────────────────────────────────────── */
+/* ── is_safe_path_segment ────────────────────────────────────────────── */
 
-/* Builds a JSON session array with one alive entry and checks the NOTICE
- * output contains the expected fields: [id], label, @netN, channels,
- * mailbox, alive, peer. */
+/* A composite session id "user:uuid:netid" must pass — colons, hyphens
+ * and alphanumerics are all allowed characters. */
+TEST(is_safe_path_segment_accepts_composite_session_id) {
+    CHECK(is_safe_path_segment("user:aaaabbbb-cccc-dddd-eeee-ffffffffffff:2", 128));
+}
+
+/* A UUID for visitor kick must also pass. */
+TEST(is_safe_path_segment_accepts_uuid) {
+    CHECK(is_safe_path_segment("550e8400-e29b-41d4-a716-446655440000", 40));
+}
+
+/* A path traversal attempt must be rejected — '/' is not in the allowed set. */
+TEST(is_safe_path_segment_rejects_path_traversal) {
+    CHECK(!is_safe_path_segment("../../etc/passwd", 128));
+}
+
+/* A NULL pointer must be rejected without crashing. */
+TEST(is_safe_path_segment_rejects_null) {
+    CHECK(!is_safe_path_segment(NULL, 128));
+}
+
+/* An empty string must be rejected — a URL segment must have at least one char. */
+TEST(is_safe_path_segment_rejects_empty) {
+    CHECK(!is_safe_path_segment("", 128));
+}
+
+/* Exceeding max_len must be rejected even if all chars are safe. */
+TEST(is_safe_path_segment_rejects_overlong) {
+    CHECK(!is_safe_path_segment("aaaaaaaaaa", 5)); /* 10 chars, limit 5 */
+}
+
+/* ── render_session_list ─────────────────────────────────────────────── */
+
+/* Builds a JSON session array with the real grappa wire format (#63) and
+ * checks the NOTICE output contains: composite [kind:subid:netid], label,
+ * @netN fallback, channels, mailbox, alive, peer. */
 TEST(render_session_list_full_row) {
+    /* Real wire shape from Grappa.LiveIntrospection.AdminWire:
+     * subject_kind, subject_id, subject_label, network_id, live_state{...} */
     const char *json =
         "{\"sessions\":["
-        "{\"id\":1,\"subject_label\":\"Sonic\",\"network_id\":2,"
+        "{\"subject_kind\":\"user\","
+        "\"subject_id\":\"aaaabbbb-cccc-dddd-eeee-ffffffffffff\","
+        "\"subject_label\":\"Sonic\",\"network_id\":2,"
         "\"live_state\":{\"alive\":true,\"peer_address\":\"203.0.113.4\","
         "\"joined_channels\":[\"#bicc\"],\"mailbox_len\":0}}"
         "]}";
@@ -156,12 +196,15 @@ TEST(render_session_list_full_row) {
     char buf[1024];
     int tx = open_client();
     if (tx < 0) { json_free(doc); return; }
-    render_live_list(tx, "testnick", "sessions", "session", json_root(doc));
+    /* NULL slug cache → @netN fallback */
+    render_session_list(tx, "testnick", json_root(doc), NULL);
     drain(tx, buf, sizeof(buf));
     json_free(doc);
 
-    CHECK(strstr(buf, "[1]") != NULL);
+    /* Composite id must appear in brackets */
+    CHECK(strstr(buf, "[user:aaaabbbb-cccc-dddd-eeee-ffffffffffff:2]") != NULL);
     CHECK(strstr(buf, "Sonic") != NULL);
+    /* Without a slug cache, falls back to @net<id> */
     CHECK(strstr(buf, "@net2") != NULL);
     CHECK(strstr(buf, "1 channel") != NULL);
     CHECK(strstr(buf, "mailbox=0") != NULL);
@@ -174,7 +217,9 @@ TEST(render_session_list_full_row) {
 TEST(render_session_list_null_label_becomes_orphan_pid) {
     const char *json =
         "{\"sessions\":["
-        "{\"id\":7,\"subject_label\":null,\"network_id\":1,"
+        "{\"subject_kind\":\"visitor\","
+        "\"subject_id\":\"00000000-0000-0000-0000-000000000007\","
+        "\"subject_label\":null,\"network_id\":1,"
         "\"live_state\":{\"alive\":false,\"peer_address\":\"198.51.100.1\","
         "\"joined_channels\":[],\"mailbox_len\":3}}"
         "]}";
@@ -186,7 +231,7 @@ TEST(render_session_list_null_label_becomes_orphan_pid) {
     char buf[1024];
     int tx = open_client();
     if (tx < 0) { json_free(doc); return; }
-    render_live_list(tx, "testnick", "sessions", "session", json_root(doc));
+    render_session_list(tx, "testnick", json_root(doc), NULL);
     drain(tx, buf, sizeof(buf));
     json_free(doc);
 
@@ -207,21 +252,26 @@ TEST(render_session_list_empty_produces_notice) {
     char buf[512];
     int tx = open_client();
     if (tx < 0) { json_free(doc); return; }
-    render_live_list(tx, "testnick", "sessions", "session", json_root(doc));
+    render_session_list(tx, "testnick", json_root(doc), NULL);
     drain(tx, buf, sizeof(buf));
     json_free(doc);
 
     CHECK(strstr(buf, "(no sessions)") != NULL);
 }
 
-/* Multiple sessions: each row on its own CRLF-terminated NOTICE. */
+/* Multiple sessions: each row on its own CRLF-terminated NOTICE.
+ * Second entry has 2 channels and mailbox=5. */
 TEST(render_session_list_multiple_rows) {
     const char *json =
         "{\"sessions\":["
-        "{\"id\":1,\"subject_label\":\"Alice\",\"network_id\":1,"
+        "{\"subject_kind\":\"user\","
+        "\"subject_id\":\"11111111-1111-1111-1111-111111111111\","
+        "\"subject_label\":\"Alice\",\"network_id\":1,"
         "\"live_state\":{\"alive\":true,\"peer_address\":\"10.0.0.1\","
         "\"joined_channels\":[],\"mailbox_len\":0}},"
-        "{\"id\":2,\"subject_label\":\"Bob\",\"network_id\":1,"
+        "{\"subject_kind\":\"user\","
+        "\"subject_id\":\"22222222-2222-2222-2222-222222222222\","
+        "\"subject_label\":\"Bob\",\"network_id\":1,"
         "\"live_state\":{\"alive\":true,\"peer_address\":\"10.0.0.2\","
         "\"joined_channels\":[\"#a\",\"#b\"],\"mailbox_len\":5}}"
         "]}";
@@ -233,16 +283,130 @@ TEST(render_session_list_multiple_rows) {
     char buf[2048];
     int tx = open_client();
     if (tx < 0) { json_free(doc); return; }
-    render_live_list(tx, "testnick", "sessions", "session", json_root(doc));
+    render_session_list(tx, "testnick", json_root(doc), NULL);
     drain(tx, buf, sizeof(buf));
     json_free(doc);
 
-    CHECK(strstr(buf, "[1]") != NULL);
+    CHECK(strstr(buf, "[user:11111111-1111-1111-1111-111111111111:1]") != NULL);
     CHECK(strstr(buf, "Alice") != NULL);
-    CHECK(strstr(buf, "[2]") != NULL);
+    CHECK(strstr(buf, "[user:22222222-2222-2222-2222-222222222222:1]") != NULL);
     CHECK(strstr(buf, "Bob") != NULL);
     CHECK(strstr(buf, "2 channels") != NULL);
     CHECK(strstr(buf, "mailbox=5") != NULL);
+}
+
+/* ── session kick / reconnect input validation ───────────────────────── */
+
+/* Helper: build a minimal scaffolding for handle_grappa_admin calls that
+ * exercise input-validation paths (no HTTP call ever reaches the network). */
+static void build_admin_scaffolding(struct http_client *hc, struct config *cfg,
+                                     struct grappa_session *sess) {
+    http_client_init(hc);
+    memset(cfg, 0, sizeof(*cfg));
+    snprintf(cfg->grappa_url, sizeof(cfg->grappa_url), "https://grappa.test");
+    memset(sess, 0, sizeof(*sess));
+    sess->network_resolved = true;
+}
+
+/* "session kick" with no id arg must produce a usage message, not crash. */
+TEST(session_kick_missing_id_shows_usage) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "session");
+    strcpy(msg.params[1], "kick");
+    msg.param_count = 2;  /* id missing */
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, "usage") != NULL);
+    CHECK(strstr(buf, "session-id") != NULL);
+}
+
+/* "session kick" with a path-injection id must produce an error, not crash. */
+TEST(session_kick_path_injection_shows_error) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "session");
+    strcpy(msg.params[1], "kick");
+    /* Attempt to inject a path segment */
+    strcpy(msg.params[2], "user:abc:1/../../etc/passwd");
+    msg.param_count = 3;
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    /* Must produce a notice (not silence), must NOT mention "disconnect" success */
+    CHECK(strstr(buf, ":grappa!grappa@grappa NOTICE testnick :") != NULL);
+    CHECK(strstr(buf, "invalid") != NULL);
+}
+
+/* "visitor kick" with no id arg must produce a usage message. */
+TEST(visitor_kick_missing_id_shows_usage) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "visitor");
+    strcpy(msg.params[1], "kick");
+    msg.param_count = 2;  /* id missing */
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, "usage") != NULL);
+    CHECK(strstr(buf, "visitor-uuid") != NULL);
+}
+
+/* "visitor kick" with a path-injection id must be rejected by
+ * is_safe_path_segment before any HTTP call. */
+TEST(visitor_kick_path_injection_shows_error) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "visitor");
+    strcpy(msg.params[1], "kick");
+    strcpy(msg.params[2], "../../etc/passwd");
+    msg.param_count = 3;
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, ":grappa!grappa@grappa NOTICE testnick :") != NULL);
+    CHECK(strstr(buf, "invalid") != NULL);
 }
 
 /* ── vhost revoke — flat grants array shape (#62) ───────────────────── */
@@ -300,17 +464,6 @@ TEST(vhost_revoke_flat_grants_array_accessible_from_root) {
 }
 
 /* ── vhost grant/revoke input validation (#62) ───────────────────────── */
-
-/* Helper: build a minimal scaffolding for handle_grappa_admin calls that
- * exercise input-validation paths (no HTTP call ever reaches the network). */
-static void build_admin_scaffolding(struct http_client *hc, struct config *cfg,
-                                     struct grappa_session *sess) {
-    http_client_init(hc);
-    memset(cfg, 0, sizeof(*cfg));
-    snprintf(cfg->grappa_url, sizeof(cfg->grappa_url), "https://grappa.test");
-    memset(sess, 0, sizeof(*sess));
-    sess->network_resolved = true;
-}
 
 /* "vhost grant" with fewer than 4 params must print a usage message rather
  * than silently forwarding to the (now multi-step) HTTP logic. This guards
@@ -509,10 +662,20 @@ int main(void) {
     RUN(parse_positive_long_rejects_null);
     RUN(parse_positive_long_rejects_trailing_junk);
     RUN(parse_positive_long_rejects_non_numeric);
+    RUN(is_safe_path_segment_accepts_composite_session_id);
+    RUN(is_safe_path_segment_accepts_uuid);
+    RUN(is_safe_path_segment_rejects_path_traversal);
+    RUN(is_safe_path_segment_rejects_null);
+    RUN(is_safe_path_segment_rejects_empty);
+    RUN(is_safe_path_segment_rejects_overlong);
     RUN(render_session_list_full_row);
     RUN(render_session_list_null_label_becomes_orphan_pid);
     RUN(render_session_list_empty_produces_notice);
     RUN(render_session_list_multiple_rows);
+    RUN(session_kick_missing_id_shows_usage);
+    RUN(session_kick_path_injection_shows_error);
+    RUN(visitor_kick_missing_id_shows_usage);
+    RUN(visitor_kick_path_injection_shows_error);
     RUN(vhost_revoke_flat_grants_array_accessible_from_root);
     RUN(vhost_grant_missing_args_shows_usage);
     RUN(vhost_revoke_invalid_id_shows_usage);
