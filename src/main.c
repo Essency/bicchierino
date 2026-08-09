@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,20 @@
 #include "config.h"
 #include "connection.h"
 #include "version.h"
+
+/* Hard cap on simultaneous downstream IRC connections.  A personal
+ * bouncer facade has no legitimate use case for hundreds of concurrent
+ * IRC clients; this number is generous relative to any realistic
+ * deployment while still bounding the resource cost an unauthenticated
+ * peer can impose before it even sends a NICK line. */
+#define MAX_CONNECTIONS 64
+
+/* Process-wide count of live connection threads.  Incremented here
+ * (under the accept loop, single-threaded) before pthread_create, and
+ * decremented by connection_run at every exit path.  Atomic because
+ * the decrements happen on the connection threads, not the accept
+ * thread. */
+static atomic_int g_live_connections = 0;
 
 struct listener {
     int fd;
@@ -134,18 +149,40 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            /* Check and claim a connection slot atomically.
+             * fetch_add returns the value BEFORE the add; if it was
+             * already at the cap we undo and refuse this connection. */
+            int prev = atomic_fetch_add(&g_live_connections, 1);
+            if (prev >= MAX_CONNECTIONS) {
+                atomic_fetch_sub(&g_live_connections, 1);
+                fprintf(stderr,
+                        "bicchierino: connection limit (%d) reached, refusing new client\n",
+                        MAX_CONNECTIONS);
+                /* Best-effort IRC ERROR before closing; may arrive as
+                 * plaintext even on a tls bind (TLS hasn't been set up
+                 * yet), but a refused client gets the message. */
+                const char *err = "ERROR :Too many connections\r\n";
+                ssize_t unused = write(client_fd, err, strlen(err));
+                (void)unused;
+                close(client_fd);
+                continue;
+            }
+
             struct connection_args *args = malloc(sizeof(*args));
             if (!args) {
+                atomic_fetch_sub(&g_live_connections, 1);
                 close(client_fd);
                 continue;
             }
             args->client_fd = client_fd;
             args->listener = listeners[i].bind;
             args->cfg = &cfg;
+            args->live_connections = &g_live_connections;
 
             pthread_t tid;
             if (pthread_create(&tid, NULL, connection_run, args) != 0) {
                 perror("pthread_create");
+                atomic_fetch_sub(&g_live_connections, 1);
                 close(client_fd);
                 free(args);
                 continue;

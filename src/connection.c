@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h> /* strcasecmp — slug matching is case-insensitive */
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -60,6 +61,13 @@
                                      * as any other server-side cap a spec
                                      * explicitly permits). */
 #define IRCD_SERVER "bicchierino"
+/* grappa's synthetic per-network window for everything that belongs to no
+ * channel and no query: server notices, connect MOTD, unsolicited
+ * INFO/VERSION/ADMIN bursts, and the event router's catch-all rows. It is
+ * a window KEY, never an IRC target — `GrappaWeb.Validation`'s own
+ * `validate_post_target_name("$server")` refuses a write to it. Folds to
+ * itself under both sides' ASCII fold (only `A-Z` folds). */
+#define GRAPPA_SERVER_WINDOW "$server"
 #define IRC_MAX_PARAMS 15
 #define LINEBUF_CAP (IRC_LINE_MAX * 4)
 
@@ -74,6 +82,17 @@
  * already pings bicchierino on its own every 30-60s, resetting this
  * same timer via "any traffic counts") almost never triggers this path
  * at all — it exists for the client that's actually gone. */
+/* How long a client has to complete PASS/NICK/USER (plus CAP END if it
+ * opened CAP negotiation) before the connection is closed.  Protects
+ * against two distinct resource-exhaustion scenarios:
+ *   1. A peer that connects and sends nothing — the recv() in next_line
+ *      blocks forever without this timeout (SO_RCVTIMEO on the fd).
+ *   2. A peer that is chatty but never finishes (e.g. sends CAP LS and
+ *      then goes silent) — the wall-clock deadline check in the Phase 1
+ *      loop catches this even if individual recv() calls return quickly.
+ * Cleared after registration so Phase 2's poll()-gated recv() calls are
+ * unaffected. */
+#define REGISTRATION_TIMEOUT 30   /* seconds total for the registration phase */
 #define CLIENT_PING_THRESHOLD 180 /* seconds of client silence before WE ping */
 #define CLIENT_PING_TIMEOUT 60    /* seconds to wait for a reply before giving up */
 
@@ -291,6 +310,31 @@ static void send_line(int fd, const char *fmt, ...) {
     int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
     va_end(ap);
     if (n < 0) return;
+    /* vsnprintf returns what it WOULD have written, not what it did — so
+     * on truncation `n` points past the buffer and the CRLF below would
+     * land outside it. Clamp to the byte budget the call actually had.
+     * A caller with a line worth truncating should have sized it itself
+     * (see `send_tagged_line`); this is the backstop that keeps a
+     * mis-sized one from being a memory-safety bug. */
+    if ((size_t)n > sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    /* Harden against CR/LF/NUL embedded in grappa-sourced fields.
+     * Grappa's own send path already rejects these (its
+     * `safe_line_token?/1` gates every public send helper), so this
+     * never fires under normal operation — it is a defence-in-depth
+     * backstop for a compromised, older, or future-diverged grappa peer.
+     * Strip in-place so the rest of the payload still reaches the client
+     * rather than silently dropping the whole line.  No field ever has a
+     * legitimate CR, LF, or NUL inside an IRC payload; stripping is
+     * unambiguously correct. */
+    {
+        int out = 0;
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c == '\r' || c == '\n' || c == '\0') continue;
+            buf[out++] = buf[i];
+        }
+        n = out;
+    }
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
@@ -333,7 +377,7 @@ static bool next_space_token(const char **cursor, char *out, size_t out_sz) {
  * clients) and flips true on the FIRST `CAP` line of any kind; from
  * then on registration is gated on `cap_done` too. See
  * `handle_cap_command`'s own doc for the supported capability set and
- * REQ/ACK/NAK semantics (bicchierino#2's step 1). */
+ * REQ/ACK/NAK semantics. */
 struct registration {
     char pass_raw[IRC_LINE_MAX]; /* "network:password" or bare "password" */
     char account[IRC_LINE_MAX];  /* USER's first param */
@@ -588,13 +632,14 @@ static void format_server_time_tag(long unix_ms, char *out, size_t out_sz) {
  * them either. */
 static void send_tagged_line(int fd, const struct grappa_session *sess, long server_time_ms,
                               const char *fmt, ...) {
-    char body[IRC_LINE_MAX];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(body, sizeof(body), fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-
+    /* The tag is built FIRST because it decides how much room is left for
+     * the body. Formatting the body to the full line length and prepending
+     * the tag afterwards overflows the line budget by exactly the tag's
+     * own width, and `send_line` can then only drop the tail it was handed
+     * — the caller is the one place that still knows the line is a
+     * formatted whole, so the truncation belongs here. */
+    char tag[96] = "";
+    size_t tag_len = 0;
     if (sess->cap_message_tags && sess->cap_server_time) {
         char ts[64]; /* "YYYY-MM-DDTHH:MM:SS.sssZ" is 24 bytes + NUL;
                       * generous past that so gcc's fortify checker can
@@ -602,10 +647,23 @@ static void send_tagged_line(int fd, const struct grappa_session *sess, long ser
                       * tm_year's width statically. */
         format_server_time_tag(server_time_ms > 0 ? server_time_ms : now_unix_ms(), ts,
                                 sizeof(ts));
-        send_line(fd, "@time=%s %s", ts, body);
-    } else {
-        send_line(fd, "%s", body);
+        int t = snprintf(tag, sizeof(tag), "@time=%s ", ts);
+        if (t > 0 && (size_t)t < sizeof(tag)) tag_len = (size_t)t;
+        else tag[0] = '\0'; /* unrepresentable timestamp: send untagged
+                              * rather than half a tag */
     }
+
+    /* `send_line`'s own budget is `IRC_LINE_MAX - 3` payload bytes (two
+     * reserved for CRLF, one for the NUL), and the tag eats into it. */
+    char body[IRC_LINE_MAX];
+    size_t body_sz = sizeof(body) - 2 - tag_len;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(body, body_sz, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+
+    send_line(fd, "%s%s", tag, body);
 }
 
 /* IRCv3 `cap-3.2` — CAP LS/REQ/END/LIST, the gate registration waits on
@@ -757,18 +815,25 @@ static void split_network_password(const char *raw, char *network, size_t networ
 #define LOGIN_IDENTIFIER_MAX (IRC_LINE_MAX + 32) /* account + "@bicchierino.local" */
 #define LOGIN_BODY_MAX (IRC_LINE_MAX * 2 * 2 + 64) /* both escaped fields + the JSON template */
 
-static void build_login_body(const char *account, const char *password, char *body,
+static bool build_login_body(const char *account, const char *password, char *body,
                               size_t body_sz) {
     char identifier[LOGIN_IDENTIFIER_MAX];
     snprintf(identifier, sizeof(identifier), "%s@bicchierino.local", account);
 
     char esc_identifier[IRC_LINE_MAX * 2];
     char esc_password[IRC_LINE_MAX * 2];
-    json_escape_into(identifier, esc_identifier, sizeof(esc_identifier));
-    json_escape_into(password, esc_password, sizeof(esc_password));
+    if (!json_escape_into(identifier, esc_identifier, sizeof(esc_identifier))) {
+        fprintf(stderr, "bicchierino: login refused: identifier too long to escape\n");
+        return false;
+    }
+    if (!json_escape_into(password, esc_password, sizeof(esc_password))) {
+        fprintf(stderr, "bicchierino: login refused: password too long to escape\n");
+        return false;
+    }
 
     snprintf(body, body_sz, "{\"identifier\":\"%s\",\"password\":\"%s\"}", esc_identifier,
              esc_password);
+    return true;
 }
 
 /* POST /auth/login (WIRE.md §1) and report what happened on the IRC
@@ -788,7 +853,10 @@ static bool attempt_grappa_login(int fd, struct http_client *hc, const char *acc
                                   const char *password, const struct config *cfg,
                                   struct grappa_session *sess) {
     char body[LOGIN_BODY_MAX];
-    build_login_body(account, password, body, sizeof(body));
+    if (!build_login_body(account, password, body, sizeof(body))) {
+        send_line(fd, "ERROR :Credentials contain characters that cannot be encoded");
+        return false;
+    }
 
     struct http_response resp;
     if (!http_client_request(hc, cfg->grappa_url, "POST", "/auth/login", NULL, body, &resp)) {
@@ -1304,6 +1372,28 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
         fprintf(stderr, "bicchierino: join %s failed\n", user_topic);
     }
 
+    /* The `$server` window is NOT derived from the channel list and never
+     * appears in it: `GET /networks/:slug/channels` merges the credential
+     * autojoin list with `Session.list_channels/2` (grappa's
+     * `channels_controller.ex`), both of which are real channels only.
+     * `$server` is synthetic and always exists, so it is joined
+     * unconditionally — grappa broadcasts its rows on the per-channel
+     * topic like any other window (`Session.Persistor`'s
+     * `Topic.channel(subject, slug, attrs.channel)`), which means without
+     * this join every server notice, MOTD line and catch-all row is
+     * dropped one layer below the renderer. Nothing is ever pushed on this
+     * topic, so its join_ref is local — unlike the user topic's, which the
+     * heartbeat/visibility pushes need. */
+    char server_topic[512];
+    snprintf(server_topic, sizeof(server_topic), "grappa:user:%s/network:%s/channel:%s",
+             sess->subject_name, sess->network_slug, GRAPPA_SERVER_WINDOW);
+    unsigned long server_join_ref = 0;
+    if (bridge_join(br, server_topic, &server_join_ref, bridge_event_dispatch, &ctx)) {
+        fprintf(stderr, "bicchierino: joined %s (join_ref=%lu)\n", server_topic, server_join_ref);
+    } else {
+        fprintf(stderr, "bicchierino: join %s failed\n", server_topic);
+    }
+
     for (size_t i = 0; i < sess->channel_count; i++) {
         char folded_channel[128];
         ascii_fold_lower(sess->channels[i], folded_channel, sizeof(folded_channel));
@@ -1479,9 +1569,9 @@ static bool chathistory_ring_nearest_id(const struct grappa_session *sess, long 
     return true;
 }
 
-static void send_privmsg_rest(struct http_client *hc, const struct config *cfg,
-                               struct grappa_session *sess, const char *target,
-                               const char *body) {
+static void send_privmsg_rest(int fd, const char *nick, struct http_client *hc,
+                               const struct config *cfg, struct grappa_session *sess,
+                               const char *target, const char *body) {
     char encoded_slug[192];
     url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
     char encoded_target[300];
@@ -1491,7 +1581,11 @@ static void send_privmsg_rest(struct http_client *hc, const struct config *cfg,
              encoded_target);
 
     char esc_body[IRC_LINE_MAX * 2];
-    json_escape_into(body, esc_body, sizeof(esc_body));
+    if (!json_escape_into(body, esc_body, sizeof(esc_body))) {
+        fprintf(stderr, "bicchierino: PRIVMSG to %s: body too long to escape\n", target);
+        send_line(fd, ":%s 417 %s :Input line was too long", IRCD_SERVER, nick);
+        return;
+    }
     char json_body[IRC_LINE_MAX * 2 + 32];
     snprintf(json_body, sizeof(json_body), "{\"body\":\"%s\"}", esc_body);
 
@@ -1539,11 +1633,17 @@ static bool send_join_rest(struct http_client *hc, const struct config *cfg,
     snprintf(path, sizeof(path), "/networks/%s/channels", encoded_slug);
 
     char esc_channel[300];
-    json_escape_into(channel, esc_channel, sizeof(esc_channel));
+    if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+        fprintf(stderr, "bicchierino: JOIN %s: channel name too long to escape\n", channel);
+        return false;
+    }
     char json_body[600];
     if (key && key[0]) {
         char esc_key[192];
-        json_escape_into(key, esc_key, sizeof(esc_key));
+        if (!json_escape_into(key, esc_key, sizeof(esc_key))) {
+            fprintf(stderr, "bicchierino: JOIN %s: key too long to escape\n", channel);
+            return false;
+        }
         snprintf(json_body, sizeof(json_body), "{\"name\":\"%s\",\"key\":\"%s\"}", esc_channel,
                  esc_key);
     } else {
@@ -1612,7 +1712,10 @@ static bool send_topic_rest(struct http_client *hc, const struct config *cfg,
     snprintf(path, sizeof(path), "/networks/%s/channels/%s/topic", encoded_slug, encoded_channel);
 
     char esc_text[600];
-    json_escape_into(text, esc_text, sizeof(esc_text));
+    if (!json_escape_into(text, esc_text, sizeof(esc_text))) {
+        fprintf(stderr, "bicchierino: TOPIC %s: topic text too long to escape\n", channel);
+        return false;
+    }
     char json_body[700];
     snprintf(json_body, sizeof(json_body), "{\"body\":\"%s\"}", esc_text);
 
@@ -1760,13 +1863,19 @@ static void handle_mode(struct bridge *br, bool br_connected, struct grappa_sess
 
     const char *modes = msg->params[1];
     char esc_modes[300];
-    json_escape_into(modes, esc_modes, sizeof(esc_modes));
+    if (!json_escape_into(modes, esc_modes, sizeof(esc_modes))) {
+        fprintf(stderr, "bicchierino: MODE %s: mode string too long to escape\n", target);
+        return;
+    }
 
     char params_json[600];
     size_t params_len = (size_t)snprintf(params_json, sizeof(params_json), "[");
     for (int i = 2; i < msg->param_count; i++) {
         char esc_param[200];
-        json_escape_into(msg->params[i], esc_param, sizeof(esc_param));
+        if (!json_escape_into(msg->params[i], esc_param, sizeof(esc_param))) {
+            fprintf(stderr, "bicchierino: MODE %s: param[%d] too long to escape\n", target, i);
+            return;
+        }
         int written = snprintf(params_json + params_len, sizeof(params_json) - params_len,
                                 "%s\"%s\"", params_len > 1 ? "," : "", esc_param);
         if (written > 0 && (size_t)written < sizeof(params_json) - params_len)
@@ -1775,7 +1884,10 @@ static void handle_mode(struct bridge *br, bool br_connected, struct grappa_sess
     snprintf(params_json + params_len, sizeof(params_json) - params_len, "]");
 
     char esc_target[300];
-    json_escape_into(target, esc_target, sizeof(esc_target));
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: MODE %s: target too long to escape\n", target);
+        return;
+    }
     char payload[2048];
     snprintf(payload, sizeof(payload),
              "{\"network_id\":%ld,\"target\":\"%s\",\"modes\":\"%s\",\"params\":%s}",
@@ -1818,7 +1930,10 @@ static void handle_topic_clear(struct bridge *br, bool br_connected, struct grap
                                 const char *channel) {
     if (!br_connected) return;
     char esc_channel[300];
-    json_escape_into(channel, esc_channel, sizeof(esc_channel));
+    if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+        fprintf(stderr, "bicchierino: TOPIC-clear %s: channel too long to escape\n", channel);
+        return;
+    }
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\"}", sess->network_id,
              esc_channel);
@@ -1866,7 +1981,10 @@ static void handle_umode(struct bridge *br, bool br_connected, struct grappa_ses
     if (!br_connected || msg->param_count < 2) return;
     const char *modes = msg->params[1];
     char esc_modes[300];
-    json_escape_into(modes, esc_modes, sizeof(esc_modes));
+    if (!json_escape_into(modes, esc_modes, sizeof(esc_modes))) {
+        fprintf(stderr, "bicchierino: UMODE %s: mode string too long to escape\n", modes);
+        return;
+    }
     char payload[400];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"modes\":\"%s\"}", sess->network_id,
              esc_modes);
@@ -1894,9 +2012,18 @@ static void handle_kick(struct bridge *br, bool br_connected, const char *nick,
     const char *reason = msg->param_count >= 3 ? msg->params[2] : nick;
 
     char esc_channel[300], esc_target[300], esc_reason[600];
-    json_escape_into(channel, esc_channel, sizeof(esc_channel));
-    json_escape_into(target, esc_target, sizeof(esc_target));
-    json_escape_into(reason, esc_reason, sizeof(esc_reason));
+    if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+        fprintf(stderr, "bicchierino: KICK %s %s: channel too long to escape\n", channel, target);
+        return;
+    }
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: KICK %s %s: target too long to escape\n", channel, target);
+        return;
+    }
+    if (!json_escape_into(reason, esc_reason, sizeof(esc_reason))) {
+        fprintf(stderr, "bicchierino: KICK %s %s: reason too long to escape\n", channel, target);
+        return;
+    }
 
     char payload[1400];
     snprintf(payload, sizeof(payload),
@@ -1923,8 +2050,14 @@ static void handle_invite(struct bridge *br, bool br_connected, struct grappa_se
     const char *channel = msg->params[1];
 
     char esc_target[300], esc_channel[300];
-    json_escape_into(target, esc_target, sizeof(esc_target));
-    json_escape_into(channel, esc_channel, sizeof(esc_channel));
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: INVITE %s %s: target too long to escape\n", target, channel);
+        return;
+    }
+    if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+        fprintf(stderr, "bicchierino: INVITE %s %s: channel too long to escape\n", target, channel);
+        return;
+    }
 
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\",\"nick\":\"%s\"}",
@@ -1949,11 +2082,17 @@ static void handle_away(struct bridge *br, bool br_connected, struct grappa_sess
                          const struct irc_message *msg) {
     if (!br_connected) return;
     char esc_slug[128];
-    json_escape_into(sess->network_slug, esc_slug, sizeof(esc_slug));
+    if (!json_escape_into(sess->network_slug, esc_slug, sizeof(esc_slug))) {
+        fprintf(stderr, "bicchierino: AWAY: network slug too long to escape\n");
+        return;
+    }
     char payload[900];
     if (msg->param_count >= 1 && msg->params[0][0]) {
         char esc_reason[600];
-        json_escape_into(msg->params[0], esc_reason, sizeof(esc_reason));
+        if (!json_escape_into(msg->params[0], esc_reason, sizeof(esc_reason))) {
+            fprintf(stderr, "bicchierino: AWAY: reason too long to escape\n");
+            return;
+        }
         snprintf(payload, sizeof(payload), "{\"action\":\"set\",\"network\":\"%s\",\"reason\":\"%s\"}",
                  esc_slug, esc_reason);
     } else {
@@ -1976,8 +2115,14 @@ static void handle_oper(struct bridge *br, bool br_connected, struct grappa_sess
     const char *password = msg->params[1];
 
     char esc_name[300], esc_password[300];
-    json_escape_into(name, esc_name, sizeof(esc_name));
-    json_escape_into(password, esc_password, sizeof(esc_password));
+    if (!json_escape_into(name, esc_name, sizeof(esc_name))) {
+        fprintf(stderr, "bicchierino: OPER %s: name too long to escape\n", name);
+        return;
+    }
+    if (!json_escape_into(password, esc_password, sizeof(esc_password))) {
+        fprintf(stderr, "bicchierino: OPER %s: password too long to escape\n", name);
+        return;
+    }
 
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"name\":\"%s\",\"password\":\"%s\"}",
@@ -2028,7 +2173,10 @@ static void handle_raw(struct bridge *br, bool br_connected, struct grappa_sessi
     reconstruct_irc_line(msg, line, sizeof(line));
 
     char esc_line[IRC_LINE_MAX * 2];
-    json_escape_into(line, esc_line, sizeof(esc_line));
+    if (!json_escape_into(line, esc_line, sizeof(esc_line))) {
+        fprintf(stderr, "bicchierino: RAW: reconstructed line too long to escape\n");
+        return;
+    }
 
     char payload[IRC_LINE_MAX * 2 + 64];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"line\":\"%s\"}", sess->network_id,
@@ -2059,11 +2207,17 @@ static void handle_whois(struct bridge *br, bool br_connected, struct grappa_ses
     const char *nick_arg = msg->param_count >= 2 ? msg->params[1] : msg->params[0];
 
     char esc_nick[300];
-    json_escape_into(nick_arg, esc_nick, sizeof(esc_nick));
+    if (!json_escape_into(nick_arg, esc_nick, sizeof(esc_nick))) {
+        fprintf(stderr, "bicchierino: WHOIS %s: nick too long to escape\n", nick_arg);
+        return;
+    }
     char payload[700];
     if (server) {
         char esc_server[300];
-        json_escape_into(server, esc_server, sizeof(esc_server));
+        if (!json_escape_into(server, esc_server, sizeof(esc_server))) {
+            fprintf(stderr, "bicchierino: WHOIS %s: server too long to escape\n", nick_arg);
+            return;
+        }
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"nick\":\"%s\",\"server\":\"%s\"}",
                  sess->network_id, esc_nick, esc_server);
     } else {
@@ -2082,7 +2236,10 @@ static void handle_who(struct bridge *br, bool br_connected, struct grappa_sessi
     if (!br_connected || msg->param_count < 1) return;
     const char *target = msg->params[0];
     char esc_target[300];
-    json_escape_into(target, esc_target, sizeof(esc_target));
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: WHO %s: target too long to escape\n", target);
+        return;
+    }
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\"}", sess->network_id,
              esc_target);
@@ -2097,7 +2254,10 @@ static void handle_names(struct bridge *br, bool br_connected, struct grappa_ses
     char channel[128];
     while (next_csv_token(&cursor, channel, sizeof(channel))) {
         char esc_channel[300];
-        json_escape_into(channel, esc_channel, sizeof(esc_channel));
+        if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+            fprintf(stderr, "bicchierino: NAMES %s: channel too long to escape\n", channel);
+            continue;
+        }
         char payload[700];
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\"}",
                  sess->network_id, esc_channel);
@@ -2121,7 +2281,10 @@ static void handle_banlist(struct bridge *br, bool br_connected, struct grappa_s
     if (!br_connected) return;
     const char *channel = msg->params[0];
     char esc_channel[300];
-    json_escape_into(channel, esc_channel, sizeof(esc_channel));
+    if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+        fprintf(stderr, "bicchierino: BANLIST %s: channel too long to escape\n", channel);
+        return;
+    }
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\"}", sess->network_id,
              esc_channel);
@@ -2143,7 +2306,10 @@ static void handle_links(struct bridge *br, bool br_connected, struct grappa_ses
     char payload[700];
     if (msg->param_count >= 1 && msg->params[0][0]) {
         char esc_mask[300];
-        json_escape_into(msg->params[0], esc_mask, sizeof(esc_mask));
+        if (!json_escape_into(msg->params[0], esc_mask, sizeof(esc_mask))) {
+            fprintf(stderr, "bicchierino: LINKS: mask too long to escape\n");
+            return;
+        }
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"mask\":\"%s\"}", sess->network_id,
                  esc_mask);
     } else {
@@ -2160,7 +2326,10 @@ static void handle_whowas(struct bridge *br, bool br_connected, struct grappa_se
     if (!br_connected || msg->param_count < 1) return;
     const char *nick_arg = msg->params[0];
     char esc_nick[300];
-    json_escape_into(nick_arg, esc_nick, sizeof(esc_nick));
+    if (!json_escape_into(nick_arg, esc_nick, sizeof(esc_nick))) {
+        fprintf(stderr, "bicchierino: WHOWAS %s: nick too long to escape\n", nick_arg);
+        return;
+    }
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"nick\":\"%s\"}", sess->network_id,
              esc_nick);
@@ -2191,13 +2360,22 @@ static void handle_lusers(struct bridge *br, bool br_connected, struct grappa_se
     char payload[700];
     if (msg->param_count >= 2) {
         char esc_mask[300], esc_server[300];
-        json_escape_into(msg->params[0], esc_mask, sizeof(esc_mask));
-        json_escape_into(msg->params[1], esc_server, sizeof(esc_server));
+        if (!json_escape_into(msg->params[0], esc_mask, sizeof(esc_mask))) {
+            fprintf(stderr, "bicchierino: LUSERS: mask too long to escape\n");
+            return;
+        }
+        if (!json_escape_into(msg->params[1], esc_server, sizeof(esc_server))) {
+            fprintf(stderr, "bicchierino: LUSERS: server too long to escape\n");
+            return;
+        }
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"mask\":\"%s\",\"server\":\"%s\"}",
                  sess->network_id, esc_mask, esc_server);
     } else {
         char esc_mask[300];
-        json_escape_into(msg->params[0], esc_mask, sizeof(esc_mask));
+        if (!json_escape_into(msg->params[0], esc_mask, sizeof(esc_mask))) {
+            fprintf(stderr, "bicchierino: LUSERS: mask too long to escape\n");
+            return;
+        }
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"mask\":\"%s\"}", sess->network_id,
                  esc_mask);
     }
@@ -2236,7 +2414,10 @@ static void handle_motd_cmd(struct bridge *br, bool br_connected, struct grappa_
     char payload[700];
     if (msg->param_count >= 1 && msg->params[0][0]) {
         char esc_target[300];
-        json_escape_into(msg->params[0], esc_target, sizeof(esc_target));
+        if (!json_escape_into(msg->params[0], esc_target, sizeof(esc_target))) {
+            fprintf(stderr, "bicchierino: MOTD: target too long to escape\n");
+            return;
+        }
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"target\":\"%s\"}",
                  sess->network_id, esc_target);
     } else {
@@ -2299,7 +2480,10 @@ static void handle_channel_modes_query(int fd, struct bridge *br, bool br_connec
 
     if (!br_connected) return;
     char esc_channel[300];
-    json_escape_into(channel, esc_channel, sizeof(esc_channel));
+    if (!json_escape_into(channel, esc_channel, sizeof(esc_channel))) {
+        fprintf(stderr, "bicchierino: MODE %s (query): channel too long to escape\n", channel);
+        return;
+    }
     char payload[700];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"target\":\"%s\",\"modes\":\"\",\"params\":[]}",
              sess->network_id, esc_channel);
@@ -2340,7 +2524,7 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     }
 
     if (strcmp(msg->command, "PRIVMSG") == 0 && msg->param_count >= 2) {
-        send_privmsg_rest(hc, cfg, sess, msg->params[0], msg->params[1]);
+        send_privmsg_rest(fd, reg->nick, hc, cfg, sess, msg->params[0], msg->params[1]);
         return false;
     }
     if (strcmp(msg->command, "JOIN") == 0) {
@@ -2458,13 +2642,82 @@ static void format_prefix(const json_value *meta, const char *sender, char *out,
         snprintf(out, out_sz, "%s!bicchierino@bicchierino", sender);
 }
 
+/* The renderable text of a row whose `body` may legitimately be absent.
+ * `server_event` is the one kind grappa leaves `body` nullable for
+ * (`Scrollback.Message`'s `@body_required_kinds` excludes it, because a
+ * catch-all body is a verb-name fallback rather than user-meaningful
+ * text), so the catch-all `meta.raw_verb` is the substitute — naming the
+ * verb that produced the row beats rendering nothing. */
+static const char *row_text(const json_value *message, const json_value *meta) {
+    const char *text = NULL;
+    if (json_str_req(message, "body", &text)) return text;
+    if (meta && json_str_req(meta, "raw_verb", &text)) return text;
+    return NULL;
+}
+
+/* A row on the synthetic `$server` window, rendered as a NOTICE to our own
+ * nick — which is where a real ircd puts these same lines, and the only
+ * shape available: `$server` is not a valid IRC target, so no per-kind arm
+ * of `handle_grappa_message_event` can render one verbatim.
+ *
+ * Two distinct sub-cases by sender shape:
+ *
+ *   User nick (no dot) — a private NOTICE addressed to our own nick that
+ *   the upstream ircd/grappa filed on the `$server` window because it has
+ *   no channel (the CP13 non-channel NOTICE cluster, `persist_server_notice/2`
+ *   §4).  The prefix must carry `nick!user@host` — emitting a bare nick
+ *   makes every IRC client interpret the line as a server notice, routing
+ *   it to the wrong buffer and discarding nick-derived tags/highlights (#24).
+ *   We use the same `bicchierino@bicchierino` placeholder as JOIN/PART/
+ *   sibling-DM paths because the real user@host is not on the grappa wire
+ *   for this kind.
+ *
+ *   Server hostname (contains a dot) OR `"*"` — grappa's `sender_nick/1`
+ *   also collapses server-prefixed lines (MOTD, global notices, services
+ *   output, `server_event` verbs — KILL, WALLOPS, GLOBOPS, ERROR, CHGHOST)
+ *   into a bare string and files them here with `kind = "notice"` (#29).
+ *   A real server hostname ALWAYS contains at least one dot; a bare
+ *   hostname is the correct prefix for a server-sourced line.  `"*"`
+ *   (prefix-less) becomes IRCD_SERVER.
+ *
+ * Discriminating on kind alone (#26) was wrong: grappa uses `kind =
+ * "notice"` for BOTH user nicks and server hostnames when routing to
+ * `$server`. The dot heuristic is the only discriminator available on
+ * this side of the wire: `sender_nick/1` in grappa drops the {:nick,…} /
+ * {:server,…} tag before the row reaches bicchierino, making recovery
+ * impossible without a grappa-side change (#29 option 1). The heuristic
+ * is correct for every network that does not permit dots in nicks.
+ *
+ * The structured `meta` is deliberately not unpacked: grappa fills `body`
+ * with a plain spelling for exactly this reason ("the wire is
+ * additive-only — an old client ignores the meta and shows the body"). */
+static void handle_grappa_server_window_row(int fd, const struct grappa_session *sess,
+                                             const char *kind, const char *sender,
+                                             const json_value *message,
+                                             const json_value *meta, long server_time_ms) {
+    const char *text = row_text(message, meta);
+    if (!text) return;
+
+    char nick_prefix[196];
+    const char *prefix;
+    if (kind && strcmp(kind, "notice") == 0 && sender && sender[0] && strcmp(sender, "*") != 0
+        && !strchr(sender, '.')) {
+        /* User nick (no dot) — must carry !user@host so clients identify
+         * it as a user NOTICE rather than a server NOTICE (prefix shape
+         * is the only wire distinction). */
+        snprintf(nick_prefix, sizeof(nick_prefix), "%s!bicchierino@bicchierino", sender);
+        prefix = nick_prefix;
+    } else {
+        prefix = sender && sender[0] && strcmp(sender, "*") != 0 ? sender : IRCD_SERVER;
+    }
+    const char *target = sess->network_nick[0] ? sess->network_nick : "*";
+    send_tagged_line(fd, sess, server_time_ms, ":%s NOTICE %s :%s", prefix, target, text);
+}
+
 /* A `"message"` WS event's inner `message` object (WIRE.md §2.5's
  * corrected text — `Scrollback.Wire.message_payload/1`'s wire shape).
  * Per-kind `meta` shapes are `Grappa.Scrollback.Meta`'s own catalogue
- * (`meta.ex:68-131`), read directly rather than guessed. `server_event`
- * is the one kind still unhandled — its meta shape is a router-catchall
- * grab-bag (`raw_verb`/`raw_sender`/`raw_params`, or a numeric bundle),
- * not worth a render without a concrete case driving it. */
+ * (`meta.ex:68-131`), read directly rather than guessed. */
 static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa_session *sess,
                                          const json_value *message) {
     const char *kind = NULL;
@@ -2488,12 +2741,20 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
     long server_time_ms = 0;
     json_long_opt(message, "server_time", &server_time_ms, NULL);
 
+    /* Routed by WINDOW before kind: none of the identity/DM/self-echo
+     * reasoning below applies to a `$server` row, and its `channel` can
+     * never be used as an IRC target. */
+    if (strcmp(channel, GRAPPA_SERVER_WINDOW) == 0) {
+        handle_grappa_server_window_row(fd, sess, kind, sender, message, meta, server_time_ms);
+        return;
+    }
+
     /* Feeds `chathistory_ring_ids`/`chathistory_ring_times` — every kind
      * on this one wire shape carries `id` (`Grappa.Scrollback.Wire`), so
      * this is unconditional, not scoped to privmsg/notice/action the way
      * the is_self dedup below is. A `msgid=`/`timestamp=` CHATHISTORY
      * selector anchored on a join/kick/topic row must resolve too, not
-     * just a chat line. */
+     * just a chat line. $server rows are excluded above (early return). */
     long ring_id = 0;
     bool has_ring_id = false;
     json_long_opt(message, "id", &ring_id, &has_ring_id);
@@ -2763,7 +3024,19 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         return;
     }
 
-    /* :server_event and anything future/unrecognized — no render yet. */
+    if (strcmp(kind, "server_event") == 0) {
+        /* The channel-scoped half of the catch-all — the `$server`-scoped
+         * half never reaches here, intercepted above. Same reasoning as
+         * `handle_grappa_server_window_row`: `body` is a legible line by
+         * construction, so a NOTICE on the channel it belongs to beats
+         * discarding the row. Not a PRIVMSG: nobody said this. */
+        const char *text = row_text(message, meta);
+        if (!text) return;
+        send_tagged_line(fd, sess, server_time_ms, ":%s NOTICE %s :%s", prefix, channel, text);
+        return;
+    }
+
+    /* Anything future/unrecognized — no render yet. */
 }
 
 /* WIRE.md §3/§6: `topic_changed` payload is `{kind, network, channel,
@@ -4051,6 +4324,18 @@ void *connection_run(void *arg) {
     int fd = args->client_fd;
     const struct config *cfg = args->cfg;
 
+    /* Registration-phase timeout: a per-recv SO_RCVTIMEO breaks any
+     * single blocking recv() that would otherwise wait forever (the
+     * completely-idle peer case), and the wall-clock deadline below
+     * closes the gap for a peer that sends data slowly but never
+     * finishes registration (e.g. sends CAP LS then goes quiet).
+     * Cleared after Phase 1 so Phase 2's poll()-gated recv() calls,
+     * which should return immediately once poll() fires, are not
+     * accidentally timed out. */
+    struct timeval reg_tv = {REGISTRATION_TIMEOUT, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &reg_tv, sizeof(reg_tv));
+    time_t reg_deadline = time(NULL) + REGISTRATION_TIMEOUT;
+
     /* `client_ssl_ctx` is scoped to the whole function (not just the
      * setup block) because `client_tls_close` needs it at every exit
      * path from here on, including the ones below Phase 1. NULL for a
@@ -4059,6 +4344,7 @@ void *connection_run(void *arg) {
     if (args->listener->tls && !client_tls_accept(fd, args->listener, &client_ssl_ctx)) {
         client_tls_close(client_ssl_ctx);
         close(fd);
+        atomic_fetch_sub(args->live_connections, 1);
         free(args);
         return NULL;
     }
@@ -4076,6 +4362,11 @@ void *connection_run(void *arg) {
      * degrades to exactly the old condition. */
     bool registered = false;
     for (;;) {
+        /* Wall-clock deadline: catches a client that trickles data
+         * slowly enough to keep beating the per-recv SO_RCVTIMEO but
+         * never actually completes registration. */
+        if (time(NULL) >= reg_deadline) break;
+
         int r = next_line(fd, &lb, line, sizeof(line));
         if (r == NEXT_LINE_EOF || r == NEXT_LINE_ERROR) break;
 
@@ -4089,9 +4380,19 @@ void *connection_run(void *arg) {
         }
     }
 
+    /* Clear the registration timeout before Phase 2, which uses its
+     * own poll()-based timing and must not be disrupted by a stale
+     * SO_RCVTIMEO left over from Phase 1. */
+    struct timeval no_tv = {0, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
+
     if (!registered) {
+        /* Best-effort ERROR — the client may still be connected (just
+         * idle or slow), in which case this explains the disconnect. */
+        send_line(fd, "ERROR :Registration timeout");
         client_tls_close(client_ssl_ctx);
         close(fd);
+        atomic_fetch_sub(args->live_connections, 1);
         free(args);
         return NULL;
     }
@@ -4451,6 +4752,7 @@ cleanup:
     http_client_close(&hc);
     client_tls_close(client_ssl_ctx);
     close(fd);
+    atomic_fetch_sub(args->live_connections, 1);
     free(args);
     return NULL;
 }

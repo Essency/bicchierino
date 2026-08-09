@@ -34,6 +34,13 @@ jobs:
           make clean
           make CC=${{ matrix.cc }} CFLAGS="-O2 -Werror"
 
+      # Unit suites, built with the same -Werror strictness as the binary
+      # above: a warning introduced by a test is a warning either way, and
+      # letting tests compile dirtier than the code they check is how the
+      # baseline erodes.
+      - name: Unit tests
+        run: make CC=${{ matrix.cc }} CFLAGS="-O2 -Werror" check
+
       - name: Binary sanity check
         run: ./bicchierino --config /nonexistent-config 2>&1 | grep -q "cannot open config file" || (echo "unexpected startup behavior" && exit 1)
 
@@ -66,6 +73,18 @@ jobs:
         run: |
           make clean
           make CFLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      # The unit suites under instrumentation — where the hostile-input
+      # cases in tests/ actually earn their keep: a truncation or an
+      # over-read that a CHECK can't see is exactly what ASan reports.
+      #
+      # halt_on_error=1 matches the smoke step below: a UBSan report that
+      # only prints leaves a green build sitting on undefined behaviour,
+      # which is the same as not running UBSan at all.
+      - name: Unit tests under ASan/UBSan
+        run: |
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" check
 
       # No live grappa in CI, so this can't exercise a real login/bridge
       # round trip. What it CAN verify without one: the safety-default
@@ -125,3 +144,112 @@ jobs:
           fi
           kill $BICCHIERINO_PID
           wait $BICCHIERINO_PID 2>/dev/null || true
+
+      # The cap and the registration deadline from #20. Neither is
+      # unit-testable in any useful way — the cap arithmetic is inline in
+      # main.c's accept loop, and what actually breaks is the invariant
+      # that connection_run releases a slot on every exit path — so this
+      # drives the real binary over real sockets instead.
+      #
+      # In THIS job rather than the build matrix, for two reasons: the
+      # binary here is already instrumented, so the run doubles as
+      # ASan/UBSan coverage of the accept and teardown paths; and python3
+      # is already installed above for the smoke test. openssl, which the
+      # script uses to mint a throwaway cert for its tls bind, ships on
+      # the runner.
+      #
+      # Takes about a minute, most of it waiting out the 30s deadline it
+      # is measuring.
+      - name: Connection cap and registration deadline
+        run: |
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            BIN=./bicchierino python3 tests/caps.py
+
+  e2e:
+    name: e2e — sealed azzurra stack
+    runs-on: ubuntu-latest
+    # Gate on the cheap build first — no point spending minutes on a cold
+    # Elixir compile and a 6-container stack if the binary itself is broken.
+    needs: build
+    timeout-minutes: 30
+    # compose.yaml is an override layer on top of azzurra-testnet/compose.yaml.
+    # Docker Compose 2.27+ disallows redefining services/networks from a file
+    # brought in via `include:`, which the override pattern requires. The
+    # multi-file (-f) merge predates `include:` and handles overrides without
+    # that constraint: the second file's keys win over the first's.
+    #
+    # COMPOSE_FILE lists both files; all steps cd into test/ first, so these
+    # paths resolve to test/azzurra-testnet/compose.yaml and test/compose.yaml.
+    # Docker Compose infers the project directory from the first file's location
+    # (test/azzurra-testnet/), so ALL relative build contexts in test/compose.yaml
+    # are authored as paths from that directory — see the context: values there.
+    #
+    # COMPOSE is also set so isolation.sh (which reads `COMPOSE` to learn
+    # how to invoke docker compose) inherits the same env automatically.
+    env:
+      COMPOSE_FILE: azzurra-testnet/compose.yaml:compose.yaml
+      COMPOSE: docker compose
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # test/grappa/{_build,deps} are bind-mounted from the checkout, not
+      # baked into an image (grappa runs from source — see prepare.sh) —
+      # so they live on the runner's filesystem and can be cached directly.
+      # The cold compile this saves is the slow part of this job; the
+      # pinned submodule commit's own mix.lock is the right cache key,
+      # since a bumped grappa submodule invalidates it exactly when it
+      # should.
+      - name: Cache grappa build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            test/grappa/_build
+            test/grappa/deps
+          key: grappa-build-${{ hashFiles('test/grappa/mix.lock') }}
+
+      - name: Resolve container uid/gid
+        run: |
+          echo "CONTAINER_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "CONTAINER_GID=$(id -g)" >> "$GITHUB_ENV"
+
+      # Needs the network (Hex/rebar/deps, the throwaway CA) — done here,
+      # unsealed and explicit, same reasoning as test/README.md: opening a
+      # gateway inside the stack itself "just for setup" would leave the
+      # ircds one config mistake away from production.
+      - name: Prepare (certs + grappa deps/compile)
+        run: cd test && ./prepare.sh
+
+      - name: Bring up the sealed stack
+        run: cd test && $COMPOSE up -d --wait
+
+      # test/isolation.sh is the point of this job as much as functional
+      # correctness is: it proves every network is internal (no gateway),
+      # every container sits only on those networks, and egress to
+      # azzurra.chat or anywhere else is actually impossible, not just
+      # configured to be — verifying its own probe first so a broken
+      # detector can't read as a sealed stack.
+      - name: Prove the seal
+        run: cd test && ./isolation.sh
+
+      # Mechanically verify RFC 1459 wire compliance on the live bicchierino
+      # instance: CRLF termination, ≤512-byte lines, numeric format, and the
+      # mandatory 001-004 registration burst in order. Runs from inside
+      # bicc-net so it can reach the bicchierino container directly.
+      - name: RFC 1459 compliance check
+        run: |
+          cd test
+          bicc_net="$($COMPOSE ps --format '{{.Project}}' | head -1)_bicc-net"
+          docker run --rm \
+            --network "$bicc_net" \
+            -v "$(pwd)/rfc1459_check.py:/check.py:ro" \
+            python:3.12-slim python3 /check.py
+
+      - name: Stack logs
+        if: failure()
+        run: cd test && $COMPOSE logs --tail=300
+
+      - name: Tear down
+        if: always()
+        run: cd test && $COMPOSE down -v

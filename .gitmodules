@@ -1,0 +1,6 @@
+[submodule "test/azzurra-testnet"]
+	path = test/azzurra-testnet
+	url = https://github.com/vjt/azzurra-testnet.git
+[submodule "test/grappa"]
+	path = test/grappa
+	url = https://github.com/vjt/grappa-irc.git

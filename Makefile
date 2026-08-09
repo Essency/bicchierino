@@ -35,7 +35,22 @@ LDLIBS := -lssl -lcrypto -lpthread
 BIN := bicchierino
 OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_client.o src/ws.o src/json.o src/jsonw.o
 
-.PHONY: all clean install version
+# Each suite links ONLY the module under test plus what that module
+# actually needs — not $(OBJS). A test binary that drags in the whole
+# program stops being able to fail for one reason, and connection.c in
+# particular pulls a listener and a thread into a suite that wanted to
+# check a string.
+#
+# TEST_CFLAGS mirrors the reasoning above for CFLAGS: warnings and
+# hardening are appended, never left overridable, so `make check
+# CFLAGS=-O0` can't quietly drop -Wall from the tests alone. -g always,
+# because the first thing anyone does with a red suite is run it under a
+# debugger or a sanitizer.
+TEST_CFLAGS := $(CFLAGS) -g
+
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window
+
+.PHONY: all clean install version check
 
 all: $(BIN)
 
@@ -48,8 +63,55 @@ $(BIN): $(OBJS)
 install: $(BIN)
 	install -D -m 755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
 
+check: $(TESTS)
+	@fail=0; for t in $(TESTS); do \
+		printf '%s: ' "$$t"; \
+		./$$t || fail=1; \
+	done; \
+	exit $$fail
+
+tests/test_json: tests/test_json.c tests/test.h src/json.c src/json.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_json.c src/json.c
+
+tests/test_ws: tests/test_ws.c tests/test.h src/ws.c src/ws.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_ws.c src/ws.c
+
+tests/test_jsonw: tests/test_jsonw.c tests/test.h src/jsonw.c src/jsonw.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_jsonw.c src/jsonw.c
+
+tests/test_config: tests/test_config.c tests/test.h src/config.c src/config.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_config.c src/config.c
+
+# Compiles http.c INTO the suite: the functions worth testing here
+# (URL/status/Content-Length parsing, the growing buffer) are static, and
+# the alternative — exporting them just to test them — widens the header
+# for no caller's benefit. Needs -lssl/-lcrypto because http.c's other
+# half does TLS, even though none of it is exercised.
+tests/test_http: tests/test_http.c tests/test.h src/http.c src/http.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_http.c -lssl -lcrypto
+
+# ws_stub.c replaces ws_client.c at link time. The REAL ws.c comes along:
+# bridge_recv_buffered forwards straight into that reader, and a stubbed
+# reader would only test the stub.
+tests/test_bridge: tests/test_bridge.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/bridge.c src/bridge.h src/json.c src/jsonw.c src/ws.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_bridge.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c -lssl -lcrypto
+
+# Compiles connection.c into the suite, so send_line — static, and the
+# choke point every render arm passes through — can be driven directly.
+# Needs the modules connection.c calls plus the same libraries the binary
+# links; nothing is stubbed, because the property under test is what the
+# real formatter puts on a real fd.
+tests/test_render: tests/test_render.c tests/test.h src/connection.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_render.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_server_window_row,
+# which is static — the same approach test_http uses for the parsers.
+# Links what connection.c calls, plus the libraries the binary links.
+tests/test_server_window: tests/test_server_window.c tests/test.h src/connection.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_window.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c -lssl -lcrypto -lpthread
+
 clean:
-	rm -f $(BIN) src/*.o
+	rm -f $(BIN) src/*.o $(TESTS)
 
 version:
 	@echo $(BICCHIERINO_VERSION)

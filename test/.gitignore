@@ -1,0 +1,8 @@
+# Minted per stack, never shared: the CA and server key are throwaway, and
+# a private key has no business in a repo regardless.
+certs/*.pem
+certs/*.key
+certs/*.srl
+
+# grappa's sqlite and per-run state.
+runtime/
