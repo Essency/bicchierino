@@ -35,10 +35,13 @@ WebSocket pushes.
   anywhere except around the optional log file. The blocking REST login
   only stalls the thread handling that one connection; every other client
   is unaffected.
-- **TLS on both legs.** As a client, verifying grappa's own certificate
-  against the system trust store; as a server, presenting bicchierino's
-  own certificate to downstream IRC clients — two distinct roles, two
-  distinct `SSL_CTX` setups.
+- **TLS on both legs, off loopback.** As a client, verifying grappa's own
+  certificate against the system trust store; as a server, presenting
+  bicchierino's own certificate to downstream IRC clients — two distinct
+  roles, two distinct `SSL_CTX` setups. Plaintext is allowed on either
+  leg only towards `127.0.0.0/8`, where the "network" a credential would
+  cross is a loopback buffer: a `plain` bind and a `grappa-url http://…`
+  are both refused at startup for any other address.
 - **IRCv3-aware.** Full `CAP` negotiation (`cap-3.2`); `server-time` and
   `message-tags` are fully implemented — every relayed event carries a
   real `@time=` tag once a client negotiates both. `draft/chathistory`

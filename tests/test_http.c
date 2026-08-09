@@ -120,16 +120,49 @@ TEST(a_malformed_bracketed_host_is_refused) {
 
 /* Fails closed on anything unexpected — the header says so, and the
  * dangerous alternative is connecting to whatever the tail happened to
- * hold. Note http:// is refused outright: every grappa leg is TLS. */
-TEST(anything_that_is_not_https_is_refused) {
+ * hold.
+ *
+ * http:// is NOT refused here any more: the parser recognises it and
+ * reports it via pu.tls, and whether such a URL is allowed at all is
+ * decided in config.c, at startup, where the loopback rule lives (see
+ * a_plaintext_grappa_url_is_loopback_only in tests/test_config.c). Two
+ * different questions — "is this a URL I can parse" and "is this a URL
+ * you are allowed to point me at" — and they belong to different
+ * layers: only config.c can see --insecure. */
+TEST(anything_that_is_not_a_known_scheme_is_refused) {
     struct parsed_url pu;
-    CHECK(!parse_grappa_url("http://grappa.example.net", &pu));
     CHECK(!parse_grappa_url("ws://grappa.example.net", &pu));
     CHECK(!parse_grappa_url("grappa.example.net", &pu));
     CHECK(!parse_grappa_url("", &pu));
     CHECK(!parse_grappa_url("https://", &pu));      /* prefix, no host */
     CHECK(!parse_grappa_url("https:///path", &pu)); /* empty host */
     CHECK(!parse_grappa_url("https://:4000", &pu)); /* port, no host */
+    CHECK(!parse_grappa_url("http://", &pu));       /* same, plaintext */
+    CHECK(!parse_grappa_url("http:///path", &pu));
+    CHECK(!parse_grappa_url("http://:4000", &pu));
+}
+
+/* The plaintext scheme parses like the TLS one, differing only in the
+ * default port and in the flag the transport layer reads. */
+TEST(a_plaintext_url_parses_and_defaults_to_port_80) {
+    struct parsed_url pu;
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("http://127.0.0.1", &pu));
+    CHECK_STR(pu.host, "127.0.0.1");
+    CHECK_STR(pu.port, "80");
+    CHECK(pu.tls == false);
+
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("http://127.0.0.1:4000/api", &pu));
+    CHECK_STR(pu.host, "127.0.0.1");
+    CHECK_STR(pu.port, "4000");
+    CHECK(pu.tls == false);
+
+    /* The TLS default is unchanged, and so is its flag. */
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://grappa.example.net", &pu));
+    CHECK_STR(pu.port, "443");
+    CHECK(pu.tls == true);
 }
 
 TEST(an_empty_or_oversized_port_is_refused) {
@@ -663,8 +696,8 @@ TEST(tls_connect_bounds_reads_and_writes) {
     SSL *ssl = NULL;
     int fd = -1;
     char host[256] = { 0 };
-    if (!https_tls_connect(url, &ctx, &ssl, &fd, host, sizeof(host))) {
-        FAIL("https_tls_connect to the local test server failed");
+    if (!grappa_transport_connect(url, &ctx, &ssl, &fd, host, sizeof(host))) {
+        FAIL("grappa_transport_connect to the local test server failed");
     } else {
         CHECK_STR(host, "localhost");
 
@@ -702,7 +735,8 @@ int main(void) {
     RUN(a_bracketed_ipv6_literal_with_explicit_port_is_taken);
     RUN(a_bracketed_ipv6_literal_with_a_path_is_accepted);
     RUN(a_malformed_bracketed_host_is_refused);
-    RUN(anything_that_is_not_https_is_refused);
+    RUN(anything_that_is_not_a_known_scheme_is_refused);
+    RUN(a_plaintext_url_parses_and_defaults_to_port_80);
     RUN(an_empty_or_oversized_port_is_refused);
     RUN(an_oversized_host_is_refused_not_truncated);
     RUN(status_codes_across_the_valid_range_are_read);

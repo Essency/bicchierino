@@ -29,8 +29,8 @@ struct http_response {
 };
 
 struct http_client {
-    SSL_CTX *ctx;
-    SSL *ssl;
+    SSL_CTX *ctx; /* NULL when the connection is plaintext loopback */
+    SSL *ssl;     /* likewise — see conn_read/conn_write below */
     int fd;
     bool connected;
     char host[256];
@@ -65,21 +65,35 @@ bool http_client_request(struct http_client *hc, const char *grappa_url, const c
  * calls (that would defeat the entire point of this file). */
 void http_client_close(struct http_client *hc);
 
-/* Opens a verified TLS connection (same posture as every REST call
- * above — chain of trust + hostname, never skipped) to `<grappa_url>`'s
- * host:port and leaves it OPEN — for ws_client.c: the websocket
- * connection is persistent too (WIRE.md §2), but speaks WS framing, not
- * HTTP/1.1 keep-alive, so it needs the bare TLS setup, not
- * http_client_request's request/response machinery. Caller owns
- * *ssl_out, *ctx_out and *fd_out, and must tear down all three
- * (SSL_shutdown, SSL_free, SSL_CTX_free, close) when done.
+/* Opens a connection to `<grappa_url>`'s host:port and leaves it OPEN —
+ * for ws_client.c: the websocket connection is persistent too (WIRE.md
+ * §2), but speaks WS framing, not HTTP/1.1 keep-alive, so it needs the
+ * bare transport setup, not http_client_request's request/response
+ * machinery. Same posture as every REST call above: TLS with chain of
+ * trust + hostname verification, never skipped, for an `https://` URL.
+ *
+ * For an `http://` URL — which config.c only accepts towards a loopback
+ * host — there is no TLS at all: *ctx_out and *ssl_out come back NULL
+ * and *fd_out is a plain socket. Pass both to conn_read/conn_write and
+ * the difference disappears.
+ *
+ * Caller owns *ssl_out, *ctx_out and *fd_out, and must tear down
+ * whichever are non-NULL (SSL_shutdown, SSL_free, SSL_CTX_free, close).
  *
  * `host_out` receives the parsed hostname (NUL-terminated, truncated to
  * `host_out_sz` in the pathological case) — a caller building its own
  * request needs it for the `Host:` header, and this is the one place
  * the URL is parsed, not duplicated per caller. */
-bool https_tls_connect(const char *grappa_url, SSL_CTX **ctx_out, SSL **ssl_out, int *fd_out,
-                        char *host_out, size_t host_out_sz);
+bool grappa_transport_connect(const char *grappa_url, SSL_CTX **ctx_out, SSL **ssl_out, int *fd_out,
+                               char *host_out, size_t host_out_sz);
+
+/* Read/write on a connection returned by grappa_transport_connect (or
+ * held inside a struct http_client): `ssl` NULL means plaintext, and the
+ * fd is used directly. Both keep SSL_read/SSL_write's return contract —
+ * <= 0 means the connection is finished — so call sites need no
+ * per-transport branch of their own. */
+int conn_read(SSL *ssl, int fd, void *buf, size_t len);
+int conn_write(SSL *ssl, int fd, const void *buf, size_t len);
 
 void http_response_free(struct http_response *resp);
 

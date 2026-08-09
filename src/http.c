@@ -11,7 +11,12 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define GRAPPA_URL_PREFIX "https://"
+#define GRAPPA_URL_TLS_PREFIX "https://"
+/* Plaintext is accepted ONLY towards a loopback host — config.c refuses
+ * anything else at startup, for the mirror image of the reason it refuses
+ * a plaintext non-loopback `bind`: there the downstream PASS would cross
+ * the network in the clear, here it would be grappa's own bearer token. */
+#define GRAPPA_URL_PLAIN_PREFIX "http://"
 /* Timeout for the initial TCP connect() — bounds how long we wait if
  * grappa's host is unreachable or blackholes SYNs. */
 #define HTTP_CONNECT_TIMEOUT_SEC 30
@@ -34,14 +39,23 @@
 struct parsed_url {
     char host[256];
     char port[8];
+    bool tls;
 };
 
 /* grappa_url is config, not attacker input, but the parse still fails
  * closed on anything unexpected — a malformed config should error out
  * loudly, not connect to whatever str[8..] happened to contain. */
 static bool parse_grappa_url(const char *url, struct parsed_url *out) {
-    size_t prefix_len = strlen(GRAPPA_URL_PREFIX);
-    if (strncmp(url, GRAPPA_URL_PREFIX, prefix_len) != 0) return false;
+    size_t prefix_len;
+    if (strncmp(url, GRAPPA_URL_TLS_PREFIX, strlen(GRAPPA_URL_TLS_PREFIX)) == 0) {
+        prefix_len = strlen(GRAPPA_URL_TLS_PREFIX);
+        out->tls = true;
+    } else if (strncmp(url, GRAPPA_URL_PLAIN_PREFIX, strlen(GRAPPA_URL_PLAIN_PREFIX)) == 0) {
+        prefix_len = strlen(GRAPPA_URL_PLAIN_PREFIX);
+        out->tls = false;
+    } else {
+        return false;
+    }
     const char *rest = url + prefix_len;
     if (*rest == '\0') return false;
 
@@ -95,10 +109,39 @@ static bool parse_grappa_url(const char *url, struct parsed_url *out) {
         memcpy(out->port, port_start, port_len);
         out->port[port_len] = '\0';
     } else {
-        snprintf(out->port, sizeof(out->port), "443");
+        snprintf(out->port, sizeof(out->port), out->tls ? "443" : "80");
     }
 
     return true;
+}
+
+/* Read/write over a connection that may or may not be wrapped in TLS.
+ * `ssl == NULL` is the plaintext-loopback case; everywhere else in this
+ * file and in ws_client.c the two are indistinguishable, which is the
+ * point — the framing, timeout and error handling above must not fork
+ * per transport. Both keep SSL_read/SSL_write's contract: a return <= 0
+ * is "connection is done", which every caller already treats as fatal.
+ *
+ * The write path loops because a plain write(2) may transfer fewer bytes
+ * than asked, while SSL_write (without SSL_MODE_ENABLE_PARTIAL_WRITE,
+ * which this codebase never sets) is all-or-nothing. Without the loop
+ * the plaintext path would silently truncate a request under load. */
+int conn_read(SSL *ssl, int fd, void *buf, size_t len) {
+    if (ssl) return SSL_read(ssl, buf, (int)len);
+    ssize_t n = read(fd, buf, len);
+    return (int)n;
+}
+
+int conn_write(SSL *ssl, int fd, const void *buf, size_t len) {
+    if (ssl) return SSL_write(ssl, buf, (int)len);
+    const char *p = buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, p + sent, len - sent);
+        if (n <= 0) return (int)n;
+        sent += (size_t)n;
+    }
+    return (int)sent;
 }
 
 static int tcp_connect(const char *host, const char *port) {
@@ -126,15 +169,22 @@ static int tcp_connect(const char *host, const char *port) {
     return fd;
 }
 
-/* TLS connect + verify (chain of trust + hostname — ARCHITECTURE.md's
- * "OpenSSL, two distinct roles" client role, never skipped). Shared by
- * every caller in this file, and by ws_client.c via https_tls_connect
- * below — the persistent websocket connection needs the exact same
- * verification posture as a one-shot REST call, only what happens to
- * the connection afterwards differs. On success the caller owns
- * *ssl_out, *ctx_out and *fd_out, and must tear all three down. */
-static bool tls_connect(const struct parsed_url *pu, SSL_CTX **ctx_out, SSL **ssl_out,
-                         int *fd_out) {
+/* TCP connect, plus TLS connect + verify (chain of trust + hostname —
+ * ARCHITECTURE.md's "OpenSSL, two distinct roles" client role, never
+ * skipped) when the URL asked for it. Shared by every caller in this
+ * file, and by ws_client.c via grappa_transport_connect below — the
+ * persistent websocket connection needs the exact same verification
+ * posture as a one-shot REST call, only what happens to the connection
+ * afterwards differs. On success the caller owns *ssl_out, *ctx_out and
+ * *fd_out, and must tear down whichever are non-NULL.
+ *
+ * For a plaintext (loopback-only) URL there is no context and no
+ * handshake to do: *ctx_out and *ssl_out come back NULL and the socket
+ * is used directly. Verification is not "skipped" in that case, it is
+ * absent by construction — which is exactly why config.c refuses a
+ * plaintext URL pointing anywhere but loopback. */
+static bool transport_connect(const struct parsed_url *pu, SSL_CTX **ctx_out, SSL **ssl_out,
+                               int *fd_out) {
     int fd = tcp_connect(pu->host, pu->port);
     if (fd < 0) return false;
 
@@ -142,12 +192,19 @@ static bool tls_connect(const struct parsed_url *pu, SSL_CTX **ctx_out, SSL **ss
      * also arm SO_RCVTIMEO — from this point on any SSL_read or
      * SSL_write that blocks past HTTP_IO_TIMEOUT_SEC returns an error
      * rather than parking the thread forever.  Both paths through this
-     * function (http_client_connect for REST, https_tls_connect for the
-     * WebSocket leg) need this: an unresponsive grappa must not pin the
+     * function (http_client_connect for REST, grappa_transport_connect
+     * for the WebSocket leg) need this: an unresponsive grappa must not pin the
      * connection thread indefinitely regardless of how it was opened. */
     struct timeval io_tv = { .tv_sec = HTTP_IO_TIMEOUT_SEC, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_tv, sizeof(io_tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_tv, sizeof(io_tv));
+
+    if (!pu->tls) {
+        *ctx_out = NULL;
+        *ssl_out = NULL;
+        *fd_out = fd;
+        return true;
+    }
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
@@ -187,12 +244,12 @@ static bool tls_connect(const struct parsed_url *pu, SSL_CTX **ctx_out, SSL **ss
     return true;
 }
 
-bool https_tls_connect(const char *grappa_url, SSL_CTX **ctx_out, SSL **ssl_out, int *fd_out,
-                        char *host_out, size_t host_out_sz) {
+bool grappa_transport_connect(const char *grappa_url, SSL_CTX **ctx_out, SSL **ssl_out, int *fd_out,
+                               char *host_out, size_t host_out_sz) {
     struct parsed_url pu;
     if (!parse_grappa_url(grappa_url, &pu)) return false;
     if (host_out && host_out_sz > 0) snprintf(host_out, host_out_sz, "%s", pu.host);
-    return tls_connect(&pu, ctx_out, ssl_out, fd_out);
+    return transport_connect(&pu, ctx_out, ssl_out, fd_out);
 }
 
 /* Growing buffer, same shape as connection.c's line reader: a read() call
@@ -236,9 +293,13 @@ void http_client_init(struct http_client *hc) { memset(hc, 0, sizeof(*hc)); }
 
 static void http_client_disconnect(struct http_client *hc) {
     if (!hc->connected) return;
-    SSL_shutdown(hc->ssl);
-    SSL_free(hc->ssl);
-    SSL_CTX_free(hc->ctx);
+    /* NULL on a plaintext loopback connection — there is no session to
+     * shut down, only the socket. */
+    if (hc->ssl) {
+        SSL_shutdown(hc->ssl);
+        SSL_free(hc->ssl);
+    }
+    if (hc->ctx) SSL_CTX_free(hc->ctx);
     close(hc->fd);
     hc->ssl = NULL;
     hc->ctx = NULL;
@@ -253,12 +314,15 @@ static bool http_client_connect(struct http_client *hc, const char *grappa_url) 
     struct parsed_url pu;
     if (!parse_grappa_url(grappa_url, &pu)) return false;
     snprintf(hc->host, sizeof(hc->host), "%s", pu.host);
-    if (!tls_connect(&pu, &hc->ctx, &hc->ssl, &hc->fd)) return false;
+    if (!transport_connect(&pu, &hc->ctx, &hc->ssl, &hc->fd)) return false;
     hc->connected = true;
     /* One line per ACTUAL new TCP+TLS handshake — the whole point of
      * this file is that this should fire once per connection's life,
-     * not once per REST call. Cheap ops signal for exactly that. */
-    fprintf(stderr, "bicchierino: http: new keep-alive connection to %s\n", hc->host);
+     * not once per REST call. Cheap ops signal for exactly that. The
+     * transport is named because "keep-alive connection to localhost"
+     * should not leave an operator guessing whether TLS is in play. */
+    fprintf(stderr, "bicchierino: http: new keep-alive connection to %s (%s)\n", hc->host,
+            hc->ssl ? "tls" : "plaintext");
     return true;
 }
 
@@ -318,7 +382,8 @@ static bool find_chunked_encoding(const char *headers, size_t header_len) {
  * ahead of the body in a single header read) — HTTP_READ_CHUNK * 4 = 16384
  * satisfies that. */
 struct chunkbuf {
-    SSL   *ssl;
+    SSL   *ssl; /* NULL on a plaintext loopback connection — see conn_read */
+    int    fd;
     char   buf[HTTP_READ_CHUNK * 4];
     size_t len; /* valid bytes at buf[0..len) */
 };
@@ -339,8 +404,8 @@ static bool chunkbuf_readline(struct chunkbuf *cb, char *out, size_t out_cap) {
             }
         }
         if (cb->len >= sizeof(cb->buf)) return false; /* no CRLF, buf full */
-        int n = SSL_read(cb->ssl, cb->buf + cb->len,
-                         (int)(sizeof(cb->buf) - cb->len));
+        int n = conn_read(cb->ssl, cb->fd, cb->buf + cb->len,
+                          sizeof(cb->buf) - cb->len);
         if (n <= 0) return false;
         cb->len += (size_t)n;
     }
@@ -351,7 +416,7 @@ static bool chunkbuf_readline(struct chunkbuf *cb, char *out, size_t out_cap) {
 static bool chunkbuf_read_into(struct chunkbuf *cb, struct growbuf *gb, size_t n) {
     while (n > 0) {
         if (cb->len == 0) {
-            int r = SSL_read(cb->ssl, cb->buf, (int)sizeof(cb->buf));
+            int r = conn_read(cb->ssl, cb->fd, cb->buf, sizeof(cb->buf));
             if (r <= 0) return false;
             cb->len = (size_t)r;
         }
@@ -378,15 +443,15 @@ static bool chunkbuf_read_into(struct chunkbuf *cb, struct growbuf *gb, size_t n
  * request. */
 static bool http_client_exchange_once(struct http_client *hc, const char *request,
                                        size_t request_len, struct http_response *out) {
-    if (SSL_write(hc->ssl, request, (int)request_len) <= 0) return false;
+    if (conn_write(hc->ssl, hc->fd, request, request_len) <= 0) return false;
 
     char header_buf[HTTP_HEADER_MAX];
     size_t header_len = 0;
     const char *sep = NULL;
     for (;;) {
         if (header_len >= sizeof(header_buf) - 1) return false;
-        int n = SSL_read(hc->ssl, header_buf + header_len,
-                          (int)(sizeof(header_buf) - 1 - header_len));
+        int n = conn_read(hc->ssl, hc->fd, header_buf + header_len,
+                          sizeof(header_buf) - 1 - header_len);
         if (n <= 0) return false;
         header_len += (size_t)n;
         header_buf[header_len] = '\0';
@@ -425,6 +490,7 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
         struct chunkbuf cb;
         memset(&cb, 0, sizeof(cb));
         cb.ssl = hc->ssl;
+        cb.fd = hc->fd;
         if (already > 0) {
             memcpy(cb.buf, header_buf + headers_end, already);
             cb.len = already;
@@ -471,7 +537,8 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
         while (body.len < (size_t)content_length) {
             char chunk[HTTP_READ_CHUNK];
             size_t want = (size_t)content_length - body.len;
-            int n = SSL_read(hc->ssl, chunk, (int)(want < sizeof(chunk) ? want : sizeof(chunk)));
+            int n = conn_read(hc->ssl, hc->fd, chunk,
+                              want < sizeof(chunk) ? want : sizeof(chunk));
             if (n <= 0) {
                 free(body.data);
                 return false;
