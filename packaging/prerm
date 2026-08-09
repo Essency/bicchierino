@@ -1,9 +1,15 @@
 #!/bin/sh
 # prerm — stop the service before files are removed, so dpkg never
 # yanks a binary out from under a running process.
+#
+# Only stop on actual *removal* ($1 = remove).  During an upgrade dpkg
+# calls this script as "old-prerm upgrade <new-version>"; we deliberately
+# leave the service running through the file-replacement step so the new
+# binary inode is swapped in cleanly under a still-live process (safe on
+# Linux).  postinst handles the restart once the new files are in place.
 set -e
 
-if [ -d /run/systemd/system ]; then
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
     systemctl stop bicchierino >/dev/null 2>&1 || true
 fi
 

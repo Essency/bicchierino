@@ -29,6 +29,15 @@ chmod 0640 /etc/bicchierino/bicchierino.config
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # On upgrade ($1=configure, $2=old-version set): restart the service so
+    # the new binary is picked up.  deb-systemd-invoke try-restart is a
+    # no-op when the unit is not active, so this is safe on a fresh install
+    # where the service was never started — it preserves the existing
+    # "don't autostart into a crash loop with placeholder config" behaviour.
+    if [ "$1" = "configure" ] && [ -n "$2" ]; then
+        deb-systemd-invoke try-restart bicchierino.service >/dev/null 2>&1 || true
+    fi
 fi
 
 cat <<'EOF'
