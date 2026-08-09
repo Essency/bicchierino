@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who
 
 .PHONY: all clean install version check
 
@@ -118,6 +118,13 @@ tests/test_server_window: tests/test_server_window.c tests/test.h src/connection
 # Same pattern as test_render and test_server_window.
 tests/test_grappa_admin: tests/test_grappa_admin.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_grappa_admin.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_who (static); ws_stub.c
+# replaces ws_client.c at link time so bridge_push frames are captured
+# for inspection without hitting a real network. Same deps as test_bridge
+# plus everything connection.c calls.
+tests/test_who: tests/test_who.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_who.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)
