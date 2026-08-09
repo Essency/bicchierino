@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin
 
 .PHONY: all clean install version check
 
@@ -112,6 +112,12 @@ tests/test_render: tests/test_render.c tests/test.h src/connection.c src/registr
 # Links what connection.c calls, plus the libraries the binary links.
 tests/test_server_window: tests/test_server_window.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_window.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach the static admin handlers: grappa_admin_notice,
+# render_live_list, parse_positive_long, handle_grappa_admin. Same pattern as
+# test_render and test_server_window.
+tests/test_grappa_admin: tests/test_grappa_admin.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_grappa_admin.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)

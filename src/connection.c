@@ -2497,6 +2497,702 @@ static void handle_channel_modes_query(int fd, struct bridge *br, bool br_connec
         fprintf(stderr, "bicchierino: MODE %s (query): push failed\n", channel);
 }
 
+/* ── grappa admin API via /grappa IRC commands ─────────────────────────
+ *
+ * `/grappa <subcmd> [args]` in an IRC client sends the raw line
+ * `GRAPPA <subcmd> [args]\r\n`. bicchierino intercepts the GRAPPA verb
+ * here (same as WHOIS/NAMES/etc.) once the session is registered, makes
+ * the corresponding REST call to grappa's `:admin_authn`-gated `/admin/...`
+ * surface using the session's existing bearer token, and renders the
+ * response as NOTICE lines from the synthetic prefix `grappa!grappa@grappa`.
+ *
+ * Auth piggybacks on the existing session — no new secret handling in
+ * bicchierino. grappa's own `:admin_authn` pipeline collapses any call
+ * from a non-admin to a uniform 403, rendered as "you are not a grappa
+ * admin". Same trust boundary as every other REST call; no duplicate
+ * authorization logic to maintain.
+ *
+ * v1 command set:
+ *   /grappa whoami
+ *   /grappa sessions
+ *   /grappa session kick <id>
+ *   /grappa session reconnect <id>
+ *   /grappa visitors
+ *   /grappa visitor kick <id>
+ *   /grappa users
+ *   /grappa networks
+ *   /grappa circuit reset <network_id>
+ *   /grappa reaper run
+ *   /grappa dblatency
+ *   /grappa sessionlog [n]
+ *   /grappa vhosts
+ *   /grappa vhost grant <address> <user>
+ *   /grappa vhost revoke <grant_id>
+ *   /grappa help
+ */
+
+/* Synthetic IRC source for all admin command responses. One NOTICE per
+ * row, matching `WHO`/`NAMES`'s existing multi-row precedent — no
+ * batching, no new line-packing logic. */
+#define GRAPPA_ADMIN_PREFIX "grappa!grappa@grappa"
+
+/* Sends one NOTICE from the grappa synthetic source to the calling user.
+ * All admin command output goes through this single choke point, so the
+ * source prefix is set consistently and `send_line`'s existing CR/LF/NUL
+ * defence applies to every field. */
+static void grappa_admin_notice(int fd, const char *nick, const char *fmt, ...) {
+    char body[IRC_LINE_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    send_line(fd, ":" GRAPPA_ADMIN_PREFIX " NOTICE %s :%s", nick, body);
+}
+
+/* One-shot admin REST call. Handles transport failures inline (NOTICE +
+ * false return); on a completed HTTP exchange returns true and populates
+ * *resp — the caller must check resp->status and call
+ * http_response_free. */
+static bool admin_request(int fd, const char *nick, struct http_client *hc,
+                           const struct config *cfg, const struct grappa_session *sess,
+                           const char *method, const char *path, const char *body,
+                           struct http_response *resp) {
+    if (!http_client_request(hc, cfg->grappa_url, method, path, sess->token, body, resp)) {
+        grappa_admin_notice(fd, nick, "could not reach grappa");
+        return false;
+    }
+    return true;
+}
+
+/* Maps a grappa admin HTTP status to a NOTICE error and returns false;
+ * returns true for success statuses (200/201/204). `entity` names the
+ * resource type for 404 messages ("session", "visitor", ...). The 422
+ * case surfaces grappa's own message verbatim — documented specifically
+ * for the `cannot_disconnect_self` foot-gun gate on the sessions
+ * controller. */
+static bool admin_check_status(int fd, const char *nick, const struct http_response *resp,
+                                 const char *entity) {
+    if (resp->status == 200 || resp->status == 201 || resp->status == 204) return true;
+    if (resp->status == 403) {
+        grappa_admin_notice(fd, nick, "you are not a grappa admin");
+        return false;
+    }
+    if (resp->status == 404) {
+        if (entity)
+            grappa_admin_notice(fd, nick, "no %s found with that id", entity);
+        else
+            grappa_admin_notice(fd, nick, "not found");
+        return false;
+    }
+    if (resp->status == 422) {
+        /* Surface the server's own message verbatim rather than
+         * reinterpreting it — see issue #56's error-handling section. */
+        char err[128];
+        json_doc *doc = json_parse(resp->body, resp->body_len, err, sizeof(err));
+        const char *msg_text = NULL;
+        if (doc) {
+            const json_value *root = json_root(doc);
+            msg_text = json_string(json_get(root, "message"));
+            if (!msg_text) msg_text = json_string(json_get(root, "error"));
+        }
+        grappa_admin_notice(fd, nick, "%s", msg_text ? msg_text : "request rejected by grappa");
+        if (doc) json_free(doc);
+        return false;
+    }
+    grappa_admin_notice(fd, nick, "unexpected response from grappa (%d)", resp->status);
+    return false;
+}
+
+/* Renders a session/visitor list from grappa's `AdminWire` shape.
+ * Both `/admin/sessions` (`{"sessions": [...]}`) and `/admin/visitors`
+ * (`{"visitors": [...]}`) share this render path — same live_state
+ * sub-object shape confirmed against `Grappa.LiveIntrospection.AdminWire`.
+ * `arr_key` is "sessions" or "visitors"; `entity` is "session" or
+ * "visitor" for the empty-list message.
+ *
+ * `subject_label: null` (the documented "BEAM has a pid, DB doesn't"
+ * orphan signal) renders as "<orphan pid>" rather than blank — exactly
+ * the case an admin would want to notice. */
+static void render_live_list(int fd, const char *nick, const char *arr_key,
+                              const char *entity, const json_value *root) {
+    const json_value *arr = json_get(root, arr_key);
+    if (!arr) arr = root; /* accept a bare top-level array too */
+    size_t count = json_len(arr);
+    if (count == 0) {
+        grappa_admin_notice(fd, nick, "(no %ss)", entity);
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const json_value *s = json_at(arr, i);
+        long id = 0;
+        json_long_req(s, "id", &id);
+
+        const char *label = json_string(json_get(s, "subject_label"));
+        /* Null or empty subject_label: orphan process without a DB row */
+        const char *display_label = (label && label[0]) ? label : "<orphan pid>";
+
+        long network_id = 0;
+        json_long_req(s, "network_id", &network_id);
+
+        const json_value *live = json_get(s, "live_state");
+        bool alive = false;
+        const char *peer = NULL;
+        size_t nchan = 0;
+        long mlen = 0;
+        if (live) {
+            json_bool_req(live, "alive", &alive);
+            peer = json_string(json_get(live, "peer_address"));
+            const json_value *chans = json_get(live, "joined_channels");
+            if (chans) nchan = json_len(chans);
+            json_long_req(live, "mailbox_len", &mlen);
+        }
+
+        /* Format: [id] label @netN — N channel(s), mailbox=N, alive/dead — peer */
+        char line[IRC_LINE_MAX];
+        if (peer && peer[0]) {
+            snprintf(line, sizeof(line),
+                     "[%ld] %s @net%ld \xe2\x80\x94 %zu channel%s, mailbox=%ld, %s"
+                     " \xe2\x80\x94 %s",
+                     id, display_label, network_id, nchan, nchan == 1 ? "" : "s",
+                     mlen, alive ? "alive" : "dead", peer);
+        } else {
+            snprintf(line, sizeof(line),
+                     "[%ld] %s @net%ld \xe2\x80\x94 %zu channel%s, mailbox=%ld, %s",
+                     id, display_label, network_id, nchan, nchan == 1 ? "" : "s",
+                     mlen, alive ? "alive" : "dead");
+        }
+        grappa_admin_notice(fd, nick, "%s", line);
+    }
+}
+
+/* /grappa whoami — GET /admin/me */
+static void grappa_admin_whoami(int fd, const char *nick, struct http_client *hc,
+                                 const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/me", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    const json_value *root = json_root(doc);
+    const char *name = json_string(json_get(root, "name"));
+    bool is_admin = false;
+    json_bool_req(root, "is_admin", &is_admin);
+    grappa_admin_notice(fd, nick, "%s (admin: %s)",
+                         name ? name : "?", is_admin ? "yes" : "no");
+    json_free(doc);
+}
+
+/* /grappa sessions — GET /admin/sessions */
+static void grappa_admin_sessions(int fd, const char *nick, struct http_client *hc,
+                                   const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/sessions", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    render_live_list(fd, nick, "sessions", "session", json_root(doc));
+    json_free(doc);
+}
+
+/* /grappa session kick <id> — POST /admin/sessions/:id/disconnect */
+static void grappa_admin_session_kick(int fd, const char *nick, struct http_client *hc,
+                                       const struct config *cfg, const struct grappa_session *sess,
+                                       long id) {
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/sessions/%ld/disconnect", id);
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "POST", path, "{}", &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, "session")) { http_response_free(&resp); return; }
+    http_response_free(&resp);
+    grappa_admin_notice(fd, nick, "session %ld disconnected", id);
+}
+
+/* /grappa session reconnect <id> — POST /admin/sessions/:id/reconnect */
+static void grappa_admin_session_reconnect(int fd, const char *nick, struct http_client *hc,
+                                            const struct config *cfg,
+                                            const struct grappa_session *sess, long id) {
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/sessions/%ld/reconnect", id);
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "POST", path, "{}", &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, "session")) { http_response_free(&resp); return; }
+    http_response_free(&resp);
+    grappa_admin_notice(fd, nick, "session %ld reconnect triggered", id);
+}
+
+/* /grappa visitors — GET /admin/visitors */
+static void grappa_admin_visitors(int fd, const char *nick, struct http_client *hc,
+                                   const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/visitors", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    render_live_list(fd, nick, "visitors", "visitor", json_root(doc));
+    json_free(doc);
+}
+
+/* /grappa visitor kick <id> — DELETE /admin/visitors/:id */
+static void grappa_admin_visitor_kick(int fd, const char *nick, struct http_client *hc,
+                                       const struct config *cfg, const struct grappa_session *sess,
+                                       long id) {
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/visitors/%ld", id);
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "DELETE", path, NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, "visitor")) { http_response_free(&resp); return; }
+    http_response_free(&resp);
+    grappa_admin_notice(fd, nick, "visitor %ld removed", id);
+}
+
+/* /grappa users — GET /admin/users (read-only; create/delete stay in the
+ * web panel — confirmed as a resolved decision in issue #56). */
+static void grappa_admin_users(int fd, const char *nick, struct http_client *hc,
+                                const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/users", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    const json_value *root = json_root(doc);
+    const json_value *arr = json_get(root, "users");
+    if (!arr) arr = root;
+    size_t count = json_len(arr);
+    if (count == 0) { grappa_admin_notice(fd, nick, "(no users)"); json_free(doc); return; }
+    for (size_t i = 0; i < count; i++) {
+        const json_value *u = json_at(arr, i);
+        const char *name = json_string(json_get(u, "name"));
+        bool is_admin_u = false;
+        json_bool_req(u, "is_admin", &is_admin_u);
+        grappa_admin_notice(fd, nick, "%s (admin: %s)",
+                             name ? name : "?", is_admin_u ? "yes" : "no");
+    }
+    json_free(doc);
+}
+
+/* /grappa networks — GET /admin/networks (read; write stays out of v1 —
+ * multi-field forms don't map cleanly to a one-liner, per issue #56). */
+static void grappa_admin_networks(int fd, const char *nick, struct http_client *hc,
+                                   const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/networks", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    const json_value *root = json_root(doc);
+    const json_value *arr = json_get(root, "networks");
+    if (!arr) arr = root;
+    size_t count = json_len(arr);
+    if (count == 0) { grappa_admin_notice(fd, nick, "(no networks)"); json_free(doc); return; }
+    for (size_t i = 0; i < count; i++) {
+        const json_value *n = json_at(arr, i);
+        const char *slug = json_string(json_get(n, "slug"));
+        long net_id = 0;
+        json_long_req(n, "id", &net_id);
+        const char *state = json_string(json_get(n, "connection_state"));
+        grappa_admin_notice(fd, nick, "[%ld] %s (%s)", net_id,
+                             slug ? slug : "?", state ? state : "?");
+    }
+    json_free(doc);
+}
+
+/* /grappa circuit reset <network_id> — POST /admin/circuit/:id/reset */
+static void grappa_admin_circuit_reset(int fd, const char *nick, struct http_client *hc,
+                                        const struct config *cfg,
+                                        const struct grappa_session *sess, long network_id) {
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/circuit/%ld/reset", network_id);
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "POST", path, "{}", &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, "network")) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) {
+        grappa_admin_notice(fd, nick, "network %ld circuit reset", network_id);
+        return;
+    }
+
+    const json_value *root = json_root(doc);
+    const json_value *cs = json_get(root, "circuit_state");
+    if (!cs) cs = root;
+    const char *state = json_string(json_get(cs, "state"));
+    long failures = 0;
+    json_long_req(cs, "failure_count", &failures);
+    grappa_admin_notice(fd, nick, "network %ld circuit reset \xe2\x80\x94 state=%s, failures=%ld",
+                         network_id, state ? state : "?", failures);
+    json_free(doc);
+}
+
+/* /grappa reaper run — POST /admin/reaper/run */
+static void grappa_admin_reaper_run(int fd, const char *nick, struct http_client *hc,
+                                     const struct config *cfg,
+                                     const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "POST", "/admin/reaper/run", "{}", &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+    http_response_free(&resp);
+    grappa_admin_notice(fd, nick, "reaper run triggered");
+}
+
+/* /grappa dblatency — GET /admin/db_latency */
+static void grappa_admin_dblatency(int fd, const char *nick, struct http_client *hc,
+                                    const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/db_latency", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    const json_value *root = json_root(doc);
+    /* Render every top-level numeric field we find — the exact key names
+     * depend on grappa's DBLatencyController wire, which may change; this
+     * tolerates any shape that has at least one numeric field. */
+    bool rendered = false;
+    size_t n = json_len(root);
+    for (size_t i = 0; i < n; i++) {
+        const char *key = json_key_at(root, i);
+        const json_value *val = json_value_at(root, i);
+        double d = 0;
+        if (!key || !json_number(val, &d)) continue;
+        grappa_admin_notice(fd, nick, "%s: %.2f", key, d);
+        rendered = true;
+    }
+    if (!rendered) grappa_admin_notice(fd, nick, "db latency: (no data)");
+    json_free(doc);
+}
+
+/* /grappa sessionlog [n] — GET /admin/session_log
+ * Optional `n` is a row count limit; 0 means "no limit specified". */
+static void grappa_admin_sessionlog(int fd, const char *nick, struct http_client *hc,
+                                     const struct config *cfg, const struct grappa_session *sess,
+                                     long limit) {
+    char path[128];
+    if (limit > 0)
+        snprintf(path, sizeof(path), "/admin/session_log?limit=%ld", limit);
+    else
+        snprintf(path, sizeof(path), "/admin/session_log");
+
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", path, NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    const json_value *root = json_root(doc);
+    const json_value *arr = json_get(root, "entries");
+    if (!arr) arr = root;
+    size_t count = json_len(arr);
+    if (count == 0) { grappa_admin_notice(fd, nick, "(empty session log)"); json_free(doc); return; }
+    for (size_t i = 0; i < count; i++) {
+        const json_value *entry = json_at(arr, i);
+        /* Render as JSON text if we can't decode a structured shape — the
+         * exact wire shape of session_log entries is grappa-internal and
+         * may evolve; a verbose but honest fallback beats a silent gap. */
+        const char *at = json_string(json_get(entry, "inserted_at"));
+        const char *event = json_string(json_get(entry, "event"));
+        const char *subject = json_string(json_get(entry, "subject_label"));
+        if (at || event) {
+            grappa_admin_notice(fd, nick, "%s %s%s%s",
+                                 at ? at : "?",
+                                 subject ? subject : "",
+                                 subject ? " " : "",
+                                 event ? event : "?");
+        } else {
+            char raw[IRC_LINE_MAX];
+            if (json_write(entry, raw, sizeof(raw)))
+                grappa_admin_notice(fd, nick, "%s", raw);
+        }
+    }
+    json_free(doc);
+}
+
+/* /grappa vhosts — GET /admin/vhosts */
+static void grappa_admin_vhosts(int fd, const char *nick, struct http_client *hc,
+                                 const struct config *cfg, const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "GET", "/admin/vhosts", NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+
+    char err[128];
+    json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+    http_response_free(&resp);
+    if (!doc) { grappa_admin_notice(fd, nick, "malformed response from grappa"); return; }
+
+    const json_value *root = json_root(doc);
+    const json_value *arr = json_get(root, "vhosts");
+    if (!arr) arr = root;
+    size_t count = json_len(arr);
+    if (count == 0) { grappa_admin_notice(fd, nick, "(no vhosts)"); json_free(doc); return; }
+    for (size_t i = 0; i < count; i++) {
+        const json_value *v = json_at(arr, i);
+        long v_id = 0;
+        json_long_req(v, "id", &v_id);
+        const char *address = json_string(json_get(v, "address"));
+        const char *user_login = json_string(json_get(v, "user_login"));
+        if (!user_login) user_login = json_string(json_get(v, "user_name"));
+        grappa_admin_notice(fd, nick, "[%ld] %s \xe2\x80\x92 %s",
+                             v_id, address ? address : "?", user_login ? user_login : "?");
+    }
+    json_free(doc);
+}
+
+/* /grappa vhost grant <address> <user> — POST /admin/vhosts
+ * The grant is "availability-only, not a security-state transition"
+ * (per grappa's own VhostsController moduledoc, cited in issue #56). */
+static void grappa_admin_vhost_grant(int fd, const char *nick, struct http_client *hc,
+                                      const struct config *cfg, const struct grappa_session *sess,
+                                      const char *address, const char *user) {
+    char esc_address[300], esc_user[300];
+    if (!json_escape_into(address, esc_address, sizeof(esc_address)) ||
+        !json_escape_into(user, esc_user, sizeof(esc_user))) {
+        grappa_admin_notice(fd, nick, "address or user too long");
+        return;
+    }
+    char body[700];
+    snprintf(body, sizeof(body),
+             "{\"address\":\"%s\",\"user_login\":\"%s\"}", esc_address, esc_user);
+
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "POST", "/admin/vhosts", body, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, NULL)) { http_response_free(&resp); return; }
+    http_response_free(&resp);
+    grappa_admin_notice(fd, nick, "vhost %s granted to %s", address, user);
+}
+
+/* /grappa vhost revoke <grant_id> — DELETE /admin/vhosts/:id */
+static void grappa_admin_vhost_revoke(int fd, const char *nick, struct http_client *hc,
+                                       const struct config *cfg, const struct grappa_session *sess,
+                                       long grant_id) {
+    char path[128];
+    snprintf(path, sizeof(path), "/admin/vhosts/%ld", grant_id);
+    struct http_response resp;
+    if (!admin_request(fd, nick, hc, cfg, sess, "DELETE", path, NULL, &resp)) return;
+    if (!admin_check_status(fd, nick, &resp, "vhost grant")) { http_response_free(&resp); return; }
+    http_response_free(&resp);
+    grappa_admin_notice(fd, nick, "vhost grant %ld revoked", grant_id);
+}
+
+/* /grappa help — static command list, one NOTICE per command. */
+static void grappa_admin_help(int fd, const char *nick) {
+    static const char *const lines[] = {
+        "grappa admin commands (IRC /quote GRAPPA <subcommand>):",
+        "  whoami                         — show your identity and admin status",
+        "  sessions                       — list live grappa sessions",
+        "  session kick <id>              — disconnect session by id",
+        "  session reconnect <id>         — trigger reconnect for session by id",
+        "  visitors                       — list visitor sessions",
+        "  visitor kick <id>              — remove visitor by id",
+        "  users                          — list user accounts (read-only)",
+        "  networks                       — list configured networks",
+        "  circuit reset <network_id>     — force-reset circuit breaker for a network",
+        "  reaper run                     — run the session reaper immediately",
+        "  dblatency                      — show database latency",
+        "  sessionlog [n]                 — show last N session log entries",
+        "  vhosts                         — list vhost grants",
+        "  vhost grant <address> <user>   — grant a vhost address to a user",
+        "  vhost revoke <grant_id>        — revoke a vhost grant by id",
+        "  help                           — show this message",
+    };
+    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
+        grappa_admin_notice(fd, nick, "%s", lines[i]);
+}
+
+/* Parse a positive integer from a string — strict: only digits, no
+ * leading spaces, no junk. Returns false if `s` is NULL, empty, or
+ * contains anything other than digits. Used to validate IDs in admin
+ * subcommands so a mistyped id produces a clear error, not a silent
+ * path mismatch against the REST API. */
+static bool parse_positive_long(const char *s, long *out) {
+    if (!s || !s[0]) return false;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v <= 0) return false;
+    *out = v;
+    return true;
+}
+
+/* Main dispatcher for all post-registration `GRAPPA` subcommands.
+ * The `GRAPPA NETWORK <slug>` Case B selector is handled BEFORE this
+ * function is ever called (in the `!sess->network_resolved` block of
+ * `handle_irc_line`), so by the time we're here, the session is fully
+ * registered and the bridge is live.
+ *
+ * `nick` is `sess->network_nick` — the live nick that tracks nick_change
+ * events — not the initial registration nick, so NOTICE recipients are
+ * always the current nick, not a stale one. */
+static void handle_grappa_admin(int fd, struct http_client *hc, const struct config *cfg,
+                                 const char *nick, const struct grappa_session *sess,
+                                 const struct irc_message *msg) {
+    /* params[0] is the primary subcommand (lowercased by irc_parse_line
+     * only for the command field — params are case-preserved). We do a
+     * case-insensitive compare so `/grappa HELP` and `/grappa help` both
+     * work, matching IRC convention. */
+    const char *sub = msg->param_count >= 1 ? msg->params[0] : "";
+
+    if (strcasecmp(sub, "whoami") == 0) {
+        grappa_admin_whoami(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "sessions") == 0) {
+        grappa_admin_sessions(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "session") == 0) {
+        const char *action = msg->param_count >= 2 ? msg->params[1] : "";
+        const char *id_str = msg->param_count >= 3 ? msg->params[2] : "";
+        long id = 0;
+        if (!parse_positive_long(id_str, &id)) {
+            grappa_admin_notice(fd, nick,
+                                "usage: /quote GRAPPA session kick|reconnect <id>");
+            return;
+        }
+        if (strcasecmp(action, "kick") == 0) {
+            grappa_admin_session_kick(fd, nick, hc, cfg, sess, id);
+        } else if (strcasecmp(action, "reconnect") == 0) {
+            grappa_admin_session_reconnect(fd, nick, hc, cfg, sess, id);
+        } else {
+            grappa_admin_notice(fd, nick,
+                                "unknown session action '%s' — try kick or reconnect", action);
+        }
+        return;
+    }
+
+    if (strcasecmp(sub, "visitors") == 0) {
+        grappa_admin_visitors(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "visitor") == 0) {
+        const char *action = msg->param_count >= 2 ? msg->params[1] : "";
+        const char *id_str = msg->param_count >= 3 ? msg->params[2] : "";
+        long id = 0;
+        if (!parse_positive_long(id_str, &id)) {
+            grappa_admin_notice(fd, nick, "usage: /quote GRAPPA visitor kick <id>");
+            return;
+        }
+        if (strcasecmp(action, "kick") == 0) {
+            grappa_admin_visitor_kick(fd, nick, hc, cfg, sess, id);
+        } else {
+            grappa_admin_notice(fd, nick,
+                                "unknown visitor action '%s' — try kick", action);
+        }
+        return;
+    }
+
+    if (strcasecmp(sub, "users") == 0) {
+        grappa_admin_users(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "networks") == 0) {
+        grappa_admin_networks(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "circuit") == 0) {
+        const char *action = msg->param_count >= 2 ? msg->params[1] : "";
+        const char *id_str = msg->param_count >= 3 ? msg->params[2] : "";
+        long id = 0;
+        if (strcasecmp(action, "reset") != 0 || !parse_positive_long(id_str, &id)) {
+            grappa_admin_notice(fd, nick,
+                                "usage: /quote GRAPPA circuit reset <network_id>");
+            return;
+        }
+        grappa_admin_circuit_reset(fd, nick, hc, cfg, sess, id);
+        return;
+    }
+
+    if (strcasecmp(sub, "reaper") == 0) {
+        const char *action = msg->param_count >= 2 ? msg->params[1] : "";
+        if (strcasecmp(action, "run") != 0) {
+            grappa_admin_notice(fd, nick, "usage: /quote GRAPPA reaper run");
+            return;
+        }
+        grappa_admin_reaper_run(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "dblatency") == 0) {
+        grappa_admin_dblatency(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "sessionlog") == 0) {
+        long limit = 0;
+        if (msg->param_count >= 2) parse_positive_long(msg->params[1], &limit);
+        grappa_admin_sessionlog(fd, nick, hc, cfg, sess, limit);
+        return;
+    }
+
+    if (strcasecmp(sub, "vhosts") == 0) {
+        grappa_admin_vhosts(fd, nick, hc, cfg, sess);
+        return;
+    }
+
+    if (strcasecmp(sub, "vhost") == 0) {
+        const char *action = msg->param_count >= 2 ? msg->params[1] : "";
+        if (strcasecmp(action, "grant") == 0) {
+            if (msg->param_count < 4) {
+                grappa_admin_notice(fd, nick,
+                                    "usage: /quote GRAPPA vhost grant <address> <user>");
+                return;
+            }
+            grappa_admin_vhost_grant(fd, nick, hc, cfg, sess,
+                                     msg->params[2], msg->params[3]);
+        } else if (strcasecmp(action, "revoke") == 0) {
+            const char *id_str = msg->param_count >= 3 ? msg->params[2] : "";
+            long id = 0;
+            if (!parse_positive_long(id_str, &id)) {
+                grappa_admin_notice(fd, nick,
+                                    "usage: /quote GRAPPA vhost revoke <grant_id>");
+                return;
+            }
+            grappa_admin_vhost_revoke(fd, nick, hc, cfg, sess, id);
+        } else {
+            grappa_admin_notice(fd, nick,
+                                "unknown vhost action '%s' — try grant or revoke", action);
+        }
+        return;
+    }
+
+    if (strcasecmp(sub, "help") == 0 || sub[0] == '\0') {
+        grappa_admin_help(fd, nick);
+        return;
+    }
+
+    grappa_admin_notice(fd, nick, "unknown grappa command '%s' — try /quote GRAPPA help", sub);
+}
+
 /* ── /grappa clients / myclients / kill ─────────────────────────────────
  *
  * Commands that operate on bicchierino's own connection registry (see
@@ -2686,15 +3382,15 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
         return false;
     }
 
-    /* GRAPPA subcommands that operate on the local registry (clients,
-     * myclients, kill) — intercepted here before the RAW fall-through so
-     * they are never forwarded upstream. */
+    /* GRAPPA dispatch: registry subcommands (clients/myclients/kill) are
+     * handled locally and never forwarded upstream.  Everything else goes
+     * to the admin API handler, which makes REST calls to grappa's
+     * :admin_authn-gated surface.  The `GRAPPA NETWORK <slug>` Case B
+     * selector is handled in the `!sess->network_resolved` block above
+     * and never reaches this point. */
     if (strcmp(msg->command, "GRAPPA") == 0 && msg->param_count >= 1) {
-        if (!handle_grappa_registry_command(fd, hc, cfg, reg, sess, msg)) {
-            /* Not a registry subcommand — fall through to RAW so unknown
-             * /grappa verbs still reach grappa if it understands them. */
-            handle_raw(br, *br_connected, sess, msg);
-        }
+        if (!handle_grappa_registry_command(fd, hc, cfg, reg, sess, msg))
+            handle_grappa_admin(fd, hc, cfg, sess->network_nick, sess, msg);
         return false;
     }
 
