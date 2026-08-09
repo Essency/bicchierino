@@ -53,13 +53,9 @@
 #define CHATHISTORY_MAX_LIMIT 100 /* bicchierino-side ceiling on any one
                                      * CHATHISTORY reply — the spec allows
                                      * a server to return fewer rows than
-                                     * a client asked for. No ISUPPORT
-                                     * `CHATHISTORY=` token advertising
-                                     * this yet (a real gap, not hidden: a
-                                     * client that never checks just sees
-                                     * a page shorter than requested, same
-                                     * as any other server-side cap a spec
-                                     * explicitly permits). */
+                                     * a client asked for. Advertised via
+                                     * `CHATHISTORY=<N>` in `send_welcome`'s
+                                     * 005 so clients know the page size. */
 #define IRCD_SERVER "bicchierino"
 /* grappa's synthetic per-network window for everything that belongs to no
  * channel and no query: server notices, connect MOTD, unsolicited
@@ -1212,8 +1208,8 @@ static void send_welcome(int fd, const char *nick, const char *subject_name) {
     send_line(fd, ":%s 003 %s :This server has no particular birthday", IRCD_SERVER, nick);
     send_line(fd, ":%s 004 %s %s bicchierino-%s o o", IRCD_SERVER, nick, IRCD_SERVER,
               BICCHIERINO_VERSION);
-    send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii :are supported by this server",
-              IRCD_SERVER, nick);
+    send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii CHATHISTORY=%d :are supported by this server",
+              IRCD_SERVER, nick, CHATHISTORY_MAX_LIMIT);
     send_line(fd, ":%s 375 %s :- %s message of the day -", IRCD_SERVER, nick, IRCD_SERVER);
     send_line(fd, ":%s 372 %s :- bicchierino is bridging this connection to grappa.", IRCD_SERVER,
               nick);
@@ -3160,27 +3156,47 @@ static void chathistory_send_empty(int fd, struct grappa_session *sess, const ch
     chathistory_batch_close(fd, batch_ref);
 }
 
-/* `@batch=<ref>;time=<ts> ` / `@time=<ts> ` / `@batch=<ref> ` / "" —
- * whichever of the two tags this connection actually negotiated apply.
+/* `@batch=<ref>;msgid=<id>;time=<ts> ` and subsets — whichever tags this
+ * connection actually negotiated apply (cap_message_tags gates all three;
+ * cap_batch gates batch=; cap_server_time gates time=; msgid is always
+ * included when present — it is a message-tags tag, no separate CAP).
  * `batch_ref` NULL means "not inside a batch" (client didn't negotiate
- * `batch`, or `chathistory_send_empty`'s bare-close case). Written into
- * a caller-owned buffer rather than returned, so `render_chathistory_message`
+ * `batch`, or `chathistory_send_empty`'s bare-close case). `msgid` ≤ 0
+ * means "no id available for this row" (omit the tag). Written into a
+ * caller-owned buffer rather than returned, so `render_chathistory_message`
  * can compose it straight into one `send_line` call — same reasoning
  * `send_tagged_line` already established for the live path, extended
- * here for the second tag CHATHISTORY needs that live events don't. */
+ * here for the second/third tags CHATHISTORY needs that live events don't.
+ *
+ * Tag order: batch= first (wire carrier), then msgid= (per spec example:
+ * `@batch=ID;msgid=1234;time=...`), then time=. Buffer is 128 bytes —
+ * max layout: `@batch=ch<20>;msgid=<19>;time=<24> ` ≈ 87 bytes. */
 static void chathistory_tag_prefix(const struct grappa_session *sess, const char *batch_ref,
-                                    long server_time_ms, char *out, size_t out_sz) {
+                                    long msgid, long server_time_ms, char *out, size_t out_sz) {
     out[0] = '\0';
     if (!sess->cap_message_tags) return;
     bool have_time = sess->cap_server_time;
+    bool have_msgid = (msgid > 0);
     char ts[64];
     if (have_time)
         format_server_time_tag(server_time_ms > 0 ? server_time_ms : now_unix_ms(), ts,
                                 sizeof(ts));
-    if (batch_ref && have_time)
+
+    /* Build tag string incrementally; snprintf returns length written or
+     * would-write, so just compose the whole thing in one shot with the
+     * appropriate subset of tags present. */
+    if (batch_ref && have_msgid && have_time)
+        snprintf(out, out_sz, "@batch=%s;msgid=%ld;time=%s ", batch_ref, msgid, ts);
+    else if (batch_ref && have_msgid)
+        snprintf(out, out_sz, "@batch=%s;msgid=%ld ", batch_ref, msgid);
+    else if (batch_ref && have_time)
         snprintf(out, out_sz, "@batch=%s;time=%s ", batch_ref, ts);
     else if (batch_ref)
         snprintf(out, out_sz, "@batch=%s ", batch_ref);
+    else if (have_msgid && have_time)
+        snprintf(out, out_sz, "@msgid=%ld;time=%s ", msgid, ts);
+    else if (have_msgid)
+        snprintf(out, out_sz, "@msgid=%ld ", msgid);
     else if (have_time)
         snprintf(out, out_sz, "@time=%s ", ts);
 }
@@ -3219,12 +3235,14 @@ static void render_chathistory_message(int fd, const struct grappa_session *sess
 
     long server_time_ms = 0;
     json_long_opt(m, "server_time", &server_time_ms, NULL);
+    long msgid = 0;
+    json_long_opt(m, "id", &msgid, NULL);
     const json_value *meta = json_get(m, "meta");
     char prefix[196];
     format_prefix(meta, sender, prefix, sizeof(prefix));
 
-    char tags[96];
-    chathistory_tag_prefix(sess, batch_ref, server_time_ms, tags, sizeof(tags));
+    char tags[128];
+    chathistory_tag_prefix(sess, batch_ref, msgid, server_time_ms, tags, sizeof(tags));
 
     const char *verb = strcmp(kind, "notice") == 0 ? "NOTICE" : "PRIVMSG";
     send_line(fd, "%s:%s %s %s :%s", tags, prefix, verb, target, body);
