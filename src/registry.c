@@ -95,17 +95,11 @@ bool registry_kill(int target_fd, const char *caller_identity, bool is_admin) {
 
     if (!found || !allowed) return false;
 
-    /* Best-effort courtesy ERROR after the shutdown — if the fd was recycled
-     * by the time send() runs, or the socket is already shut down, the send
-     * fails silently, which is harmless.  MSG_NOSIGNAL prevents SIGPIPE on
-     * a socket that has already been shut down for writing.  This is
-     * intentionally outside the lock because a partial/failed send here has
-     * no correctness consequence. On TLS connections raw send() bypasses the
-     * SSL layer anyway; shutdown(SHUT_RDWR) above is the real disconnect
-     * mechanism. */
-    const char *err = "ERROR :Disconnected by admin\r\n";
-    ssize_t unused = send(target_fd, err, strlen(err), MSG_NOSIGNAL);
-    (void)unused;
-
+    /* shutdown(SHUT_RDWR) inside the lock (above) is the sole disconnect
+     * mechanism — sufficient and race-free.  No courtesy send() after the
+     * lock: send() on a SHUT_RDWR socket always fails with EPIPE (dead code
+     * for the intended victim), and in the narrow window between unlock and
+     * send() the fd could be recycled to a new innocent connection by the OS,
+     * causing send() to succeed against the wrong client. */
     return true;
 }

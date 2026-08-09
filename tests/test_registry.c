@@ -113,14 +113,10 @@ TEST(kill_admin_any_target) {
 
     /* After the kill the fd is still in the registry (the victim thread
      * removes it on its own teardown path) — but the socket itself has
-     * been shut down.  registry_kill first sends an ERROR courtesy line
-     * (30 bytes), then calls shutdown(SHUT_RDWR).  Drain the ERROR line
-     * then verify that a subsequent recv() returns 0 (EOF), confirming
-     * shutdown() was called. */
+     * been shut down.  registry_kill calls shutdown(SHUT_RDWR) while
+     * holding g_lock (no send() after the lock).  Verify that recv()
+     * returns 0 (EOF), confirming shutdown() was called. */
     char buf[64];
-    /* First recv: may contain the ERROR line. */
-    (void)recv(sv[1], buf, sizeof(buf), 0);
-    /* Second recv: must be EOF (shutdown has been called). */
     ssize_t n = recv(sv[1], buf, sizeof(buf), 0);
     CHECK(n == 0);
 

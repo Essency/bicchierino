@@ -75,11 +75,13 @@ void registry_snapshot(struct conn_snapshot *snap, const char *filter_identity);
 
 /* Disconnect the connection identified by target_fd.
  *
- * Sends "ERROR :Disconnected by admin" (best-effort; the target may be on
- * a TLS fd where a raw write() won't go through the SSL layer — the real
- * mechanism is shutdown(SHUT_RDWR), which unblocks the target thread's
- * recv()/poll() as a normal connection-lost condition), then calls
- * shutdown(target_fd, SHUT_RDWR).
+ * Calls shutdown(target_fd, SHUT_RDWR) while holding g_lock.  The lock
+ * prevents the victim thread from closing and recycling the fd before
+ * shutdown() completes, eliminating any fd-reuse race.  No write() or
+ * send() is issued after the lock is released: send() on a SHUT_RDWR
+ * socket always fails with EPIPE (useless for the intended victim), and
+ * outside the lock the fd could already have been recycled by the OS to a
+ * new innocent connection.
  *
  * Authorisation: if is_admin is true, any target_fd in the registry is
  * allowed; otherwise the target's identity must match caller_identity (a
