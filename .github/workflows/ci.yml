@@ -246,6 +246,20 @@ jobs:
             -v "$(pwd)/rfc1459_check.py:/check.py:ro" \
             python:3.12-slim python3 /check.py
 
+      # IRCv3 draft/chathistory compliance check: CAP negotiation, ISUPPORT
+      # CHATHISTORY=N, BATCH framing, msgid=/time= tags on replayed messages,
+      # BEFORE/AFTER/LATEST/AROUND/BETWEEN subcommands, TARGETS (empty success),
+      # and error-response shape for invalid params.  Runs from inside bicc-net
+      # on the same sealed stack — no extra containers started.
+      - name: IRCv3 draft/chathistory compliance check
+        run: |
+          cd test
+          bicc_net="$($COMPOSE ps --format '{{.Project}}' | head -1)_bicc-net"
+          docker run --rm \
+            --network "$bicc_net" \
+            -v "$(pwd)/chathistory_check.py:/check.py:ro" \
+            python:3.12-slim python3 /check.py
+
       - name: Stack logs
         if: failure()
         run: cd test && $COMPOSE logs --tail=300
