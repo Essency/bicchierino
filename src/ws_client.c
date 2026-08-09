@@ -93,7 +93,7 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
     memset(out, 0, sizeof(*out));
 
     char host[256];
-    if (!https_tls_connect(grappa_url, &out->ctx, &out->ssl, &out->fd, host, sizeof(host)))
+    if (!grappa_transport_connect(grappa_url, &out->ctx, &out->ssl, &out->fd, host, sizeof(host)))
         return false;
 
     unsigned char key_bytes[16];
@@ -142,7 +142,7 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
                                 "\r\n",
                                 host, ws_key, token_b64);
         ok = req_len > 0 && (size_t)req_len < sizeof(request) &&
-             SSL_write(out->ssl, request, req_len) > 0;
+             conn_write(out->ssl, out->fd, request, (size_t)req_len) > 0;
     }
 
     free(ws_key);
@@ -163,8 +163,8 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
                 ok = false;
                 break;
             }
-            int n = SSL_read(out->ssl, response + response_len,
-                              (int)(sizeof(response) - 1 - response_len));
+            int n = conn_read(out->ssl, out->fd, response + response_len,
+                              sizeof(response) - 1 - response_len);
             if (n <= 0) {
                 ok = false;
                 break;
@@ -229,13 +229,13 @@ static bool send_masked_frame(struct ws_client *wsc, unsigned char opcode, const
     memcpy(header + header_len, mask_key, sizeof(mask_key));
     header_len += sizeof(mask_key);
 
-    if (SSL_write(wsc->ssl, header, (int)header_len) <= 0) return false;
+    if (conn_write(wsc->ssl, wsc->fd, header, header_len) <= 0) return false;
 
     unsigned char *masked = malloc(len);
     if (!masked) return false;
     const unsigned char *src = payload;
     for (size_t i = 0; i < len; i++) masked[i] = src[i] ^ mask_key[i % sizeof(mask_key)];
-    bool ok = len == 0 || SSL_write(wsc->ssl, masked, (int)len) > 0;
+    bool ok = len == 0 || conn_write(wsc->ssl, wsc->fd, masked, len) > 0;
     free(masked);
     return ok;
 }
@@ -260,7 +260,7 @@ ws_result ws_client_recv(struct ws_client *wsc, char **payload, size_t *len) {
     if (r != WS_NEED_MORE) return r;
 
     unsigned char chunk[4096];
-    int n = SSL_read(wsc->ssl, chunk, sizeof(chunk));
+    int n = conn_read(wsc->ssl, wsc->fd, chunk, sizeof(chunk));
     if (n <= 0) return n == 0 ? WS_CLOSED : WS_ERROR;
     if (!ws_reader_feed(&wsc->reader, chunk, (size_t)n)) return WS_ERROR;
 

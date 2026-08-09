@@ -261,10 +261,40 @@ must not pretend they are:
 
 Same library (direct OpenSSL, no bufferevent — see "Event loop" above),
 two different `SSL_CTX` setups, two different handshake directions. Both
-sides matter independently: loopback-only downstream deployments can skip
-the server-role cert (plaintext on `127.0.0.1`, same reasoning shottino's
-`--ircd` already uses for `SHOTTINO_IRCD_PASS`), but the client role
-towards grappa is not optional — grappa is presumably always behind TLS.
+sides matter independently, and on both the deciding question is the same
+one: does the secret leave the machine?
+
+- Loopback-only downstream deployments can skip the server-role cert
+  (plaintext on `127.0.0.1`, same reasoning shottino's `--ircd` already
+  uses for `SHOTTINO_IRCD_PASS`).
+- The client role towards grappa is likewise TLS unless grappa is on
+  `127.0.0.0/8` — the co-hosted case, where bicchierino and grappa are
+  the same machine and the "network" the bearer token would cross is a
+  kernel loopback buffer. `grappa-url http://…` expresses that, and
+  config.c refuses it for any other host: see "Plaintext is a loopback
+  privilege" below.
+
+Anywhere else, both legs are TLS and there is nothing to decide.
+
+### Plaintext is a loopback privilege, on both legs
+
+The two plaintext gates are deliberately the same rule stated twice,
+because there are two directions a credential can leave this process by:
+
+| Direction | Secret at risk | Gate |
+|---|---|---|
+| downstream client → bicchierino | the client's `PASS`, a real grappa password | `bind <ip> <port> plain` refused off `127.0.0.0/8` |
+| bicchierino → grappa | grappa's own bearer token | `grappa-url http://…` refused off `127.0.0.0/8` |
+
+Both are startup failures, not warnings; both name the secret in the
+error; both are overridden by the same `--insecure`, which exists for the
+operator who has a private link and knows what they are giving up. A
+deployment that allowed one and refused the other would not be safer, it
+would just be inconsistent about which of its two secrets it cared about.
+
+`localhost` is not accepted by either gate: it is a resolver claim, not a
+fact the parser can verify. A literal `127.0.0.1` costs four characters
+and removes the question.
 
 ### Horizontal scaling is free, because there's no state to coordinate
 

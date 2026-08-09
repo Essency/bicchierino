@@ -27,7 +27,7 @@ struct ws_client {
     struct ws_reader reader;
 };
 
-/* Performs the full handshake: TLS connect (https_tls_connect, same
+/* Performs the full handshake: transport connect (grappa_transport_connect, same
  * verification posture as every REST call), HTTP Upgrade request with
  * the bearer riding Sec-WebSocket-Protocol as
  * `base64url.bearer.phx.<token>` (WIRE.md §2 — NOT the query string,

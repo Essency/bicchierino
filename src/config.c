@@ -20,6 +20,93 @@ static bool is_loopback(const char *ip) {
     return false;
 }
 
+/* Extracts the host of `url`, whose scheme prefix has already been
+ * matched and is `prefix_len` bytes long, into `out`.
+ *
+ * Deliberately a second, minimal parse rather than reusing http.c's
+ * parse_grappa_url: config.c is the one translation unit with no OpenSSL
+ * dependency — tests/test_config links it on its own, see the Makefile —
+ * and this check has to run at startup, before anything opens a socket.
+ * The two parsers only need to agree on the shape that matters here: the
+ * host ends at the first ':' or '/'. */
+static bool url_host(const char *url, size_t prefix_len, char *out, size_t out_sz) {
+    const char *rest = url + prefix_len;
+
+    /* RFC 3986 §3.2.2 bracketed IPv6 literal: [addr]:port/path — mirrors
+     * http.c's parse_grappa_url bracket handling (this function only needs
+     * the host, not the port, since the caller's sole use is is_loopback()).
+     * Without this, a bracketed IPv6 host (e.g. "http://[::1]") would have
+     * its host wrongly extracted as a single "[" character by the plain
+     * strcspn below — is_loopback("[") is false, so a genuinely-loopback
+     * URL would be refused as not-loopback. */
+    if (*rest == '[') {
+        const char *close = strchr(rest + 1, ']');
+        if (!close) return false;
+        size_t n = (size_t)(close - (rest + 1));
+        if (n == 0 || n >= out_sz) return false;
+        memcpy(out, rest + 1, n);
+        out[n] = '\0';
+        return true;
+    }
+
+    size_t n = strcspn(rest, ":/");
+    if (n == 0 || n >= out_sz) return false;
+    memcpy(out, rest, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* `https://` always; `http://` only towards a loopback literal, unless
+ * --insecure says otherwise.
+ *
+ * This is the mirror image of parse_bind_line's rule below, and it is
+ * the same secret in both directions: there, a plaintext non-loopback
+ * bind would put the downstream client's PASS (a real grappa password)
+ * on the network; here, a plaintext non-loopback grappa-url would put
+ * grappa's own bearer token there. Accepting one and refusing the other
+ * would be incoherent.
+ *
+ * The loopback case is worth supporting because it is the normal
+ * self-hosted shape: bicchierino and grappa on the same machine, where
+ * demanding TLS means either routing local traffic out through a public
+ * name or standing up a certificate for 127.0.0.1 — ceremony that buys
+ * nothing a loopback socket does not already give.
+ *
+ * is_loopback() is reused as-is, which also means "localhost" is refused
+ * here: it is a resolver claim, not a fact this function can verify, and
+ * this gate decides whether a bearer token may leave the process in the
+ * clear. A literal address costs the operator four characters.
+ *
+ * url_host() below IS bracket-aware for a literal IPv6 host
+ * ("http://[::1]"), matching http.c's parse_grappa_url — is_loopback()
+ * already recognises bare "::1", so the two now agree end to end. */
+static bool validate_grappa_url(const char *url, struct config *cfg) {
+    static const char https_prefix[] = "https://";
+    static const char http_prefix[] = "http://";
+
+    if (strncmp(url, https_prefix, sizeof(https_prefix) - 1) == 0) return true;
+
+    if (strncmp(url, http_prefix, sizeof(http_prefix) - 1) != 0) {
+        fprintf(stderr, "config: grappa-url %s must start with https:// or http://\n", url);
+        return false;
+    }
+
+    char host[256];
+    if (!url_host(url, sizeof(http_prefix) - 1, host, sizeof(host))) {
+        fprintf(stderr, "config: grappa-url %s has no host\n", url);
+        return false;
+    }
+    if (!is_loopback(host) && !cfg->insecure) {
+        fprintf(stderr,
+                "config: grappa-url %s is plaintext and not loopback — refusing to start "
+                "(grappa's bearer token would cross the network in the clear). "
+                "Pass --insecure to override.\n",
+                url);
+        return false;
+    }
+    return true;
+}
+
 static void strip_comment_and_newline(char *line) {
     char *hash = strchr(line, '#');
     if (hash) *hash = '\0';
@@ -152,6 +239,7 @@ bool config_load_from_args(int argc, char **argv, struct config *out) {
         fprintf(stderr, "config: grappa-url is required\n");
         return false;
     }
+    if (!validate_grappa_url(out->grappa_url, out)) return false;
     if (out->bind_count == 0) {
         fprintf(stderr, "config: at least one bind directive is required\n");
         return false;
