@@ -20,6 +20,7 @@
 #include "http.h"
 #include "json.h"
 #include "jsonw.h"
+#include "registry.h"
 #include "version.h"
 
 #define IRC_LINE_MAX 512
@@ -1292,6 +1293,15 @@ static void handle_grappa_network(int fd, struct http_client *hc, struct bridge 
             "bicchierino: network selected: subject=%s network=%s(%ld) joined_channels=%zu\n",
             sess->subject_name, sess->network_slug, sess->network_id, sess->channel_count);
 
+    /* Case B: identity is now fully known — update the registry entry
+     * that was created at accept() time. */
+    {
+        char identity[CONN_IDENTITY_MAX];
+        snprintf(identity, sizeof(identity), "%s@%s",
+                 sess->subject_name, sess->network_slug);
+        registry_set_identity(fd, identity);
+    }
+
     *br_connected = bridge_connect(cfg->grappa_url, sess->token, sess->subject_name, br);
     if (*br_connected) {
         join_grappa_topics(fd, sess->network_nick, br, sess);
@@ -2487,6 +2497,153 @@ static void handle_channel_modes_query(int fd, struct bridge *br, bool br_connec
         fprintf(stderr, "bicchierino: MODE %s (query): push failed\n", channel);
 }
 
+/* ── /grappa clients / myclients / kill ─────────────────────────────────
+ *
+ * Commands that operate on bicchierino's own connection registry (see
+ * registry.h and CLAUDE.md §Mutex exceptions for the architectural context).
+ *
+ *   /grappa clients           — admin-gated; all identities' connections
+ *   /grappa myclients         — ungated; caller's own identity only
+ *   /grappa kill <fd>         — admin can kill any; non-admin only their own
+ *
+ * Admin gate: a throwaway GET /admin/me with the caller's existing session
+ * token.  grappa's :admin_authn pipeline returns 200 for admins and 403 for
+ * anyone else — bicchierino does not need to track admin status locally;
+ * the gate is always live and always authoritative.
+ *
+ * Output prefix: ":grappa!grappa@grappa" — the same synthetic source used
+ * across the /grappa command family (issue #56). */
+
+/* Format elapsed seconds as a human-readable "Xm", "Xh", or "Xs" string
+ * matching the issue's example rendering ("connected 14m", "connected 1h").
+ * The buffer must be at least 24 bytes (long max is 19 digits + suffix + NUL
+ * — the 16-byte size used in the calling site's variable declaration on
+ * earlier versions of this code provoked a -Wformat-truncation from gcc's
+ * fortify checker because it can't prove the long is bounded; 24 is
+ * generous past any realistic uptime value). */
+static void format_elapsed(time_t secs, char *out, size_t out_sz) {
+    if (secs < 60)
+        snprintf(out, out_sz, "%lds", (long)secs);
+    else if (secs < 3600)
+        snprintf(out, out_sz, "%ldm", (long)(secs / 60));
+    else
+        snprintf(out, out_sz, "%ldh", (long)(secs / 3600));
+}
+
+/* Returns true when GET /admin/me against the caller's existing session
+ * token comes back 200.  Any other result (403, unreachable, ...) is
+ * treated as "not admin" — the gate is intentionally fail-closed. */
+static bool check_is_admin(struct http_client *hc, const struct config *cfg,
+                            const struct grappa_session *sess) {
+    struct http_response resp;
+    if (!http_client_request(hc, cfg->grappa_url, "GET", "/admin/me",
+                             sess->token, NULL, &resp))
+        return false;
+    bool ok = (resp.status == 200);
+    http_response_free(&resp);
+    return ok;
+}
+
+/* Send one NOTICE line per occupied registry slot.  snap must already be
+ * filtered to the desired view before calling this. */
+static void send_registry_snapshot(int fd, const char *nick,
+                                   const struct conn_snapshot *snap) {
+    time_t now = time(NULL);
+    if (snap->count == 0) {
+        send_line(fd, ":grappa!grappa@grappa NOTICE %s :No connections found.", nick);
+        return;
+    }
+    for (size_t i = 0; i < snap->count; i++) {
+        const struct conn_entry *e = &snap->entries[i];
+        char elapsed[24]; /* 24: see format_elapsed's own comment */
+        time_t age = now > e->connected_at ? now - e->connected_at : 0;
+        format_elapsed(age, elapsed, sizeof(elapsed));
+        const char *ident = e->identity[0] ? e->identity : "(pending)";
+        send_line(fd,
+                  ":grappa!grappa@grappa NOTICE %s :[%d] %s — %s — connected %s",
+                  nick, e->fd, ident, e->peer_addr, elapsed);
+    }
+}
+
+/* Handles GRAPPA subcommands that operate on the local connection registry.
+ * Called from handle_irc_line when network is resolved AND the subcommand
+ * is "clients", "myclients", or "kill".  Returns true if the subcommand
+ * was handled (so the caller does not fall through to handle_raw). */
+static bool handle_grappa_registry_command(int fd, struct http_client *hc,
+                                            const struct config *cfg,
+                                            const struct registration *reg,
+                                            const struct grappa_session *sess,
+                                            const struct irc_message *msg) {
+    /* msg->params[0] is the subcommand — already checked by the caller. */
+    const char *sub  = msg->params[0];
+    const char *nick = sess->network_nick[0] ? sess->network_nick : reg->nick;
+
+    if (strcasecmp(sub, "clients") == 0) {
+        /* Admin-gated: use a throwaway GET /admin/me to check privilege. */
+        if (!check_is_admin(hc, cfg, sess)) {
+            send_line(fd,
+                      ":grappa!grappa@grappa NOTICE %s :you are not a grappa admin",
+                      nick);
+            return true;
+        }
+        struct conn_snapshot snap;
+        registry_snapshot(&snap, NULL); /* all identities */
+        send_registry_snapshot(fd, nick, &snap);
+        return true;
+    }
+
+    if (strcasecmp(sub, "myclients") == 0) {
+        /* Ungated: scoped to the caller's own identity, no admin check. */
+        char identity[CONN_IDENTITY_MAX];
+        snprintf(identity, sizeof(identity), "%s@%s",
+                 sess->subject_name, sess->network_slug);
+        struct conn_snapshot snap;
+        registry_snapshot(&snap, identity);
+        send_registry_snapshot(fd, nick, &snap);
+        return true;
+    }
+
+    if (strcasecmp(sub, "kill") == 0) {
+        if (msg->param_count < 2 || !msg->params[1][0]) {
+            send_line(fd,
+                      ":grappa!grappa@grappa NOTICE %s :Usage: /grappa kill <connection-id>",
+                      nick);
+            return true;
+        }
+        /* The connection ID displayed in /grappa clients output is the fd
+         * number — parse it back to an int. */
+        char *endp;
+        long target_fd_l = strtol(msg->params[1], &endp, 10);
+        if (*endp != '\0' || target_fd_l <= 0) {
+            send_line(fd,
+                      ":grappa!grappa@grappa NOTICE %s :Invalid connection id '%s'",
+                      nick, msg->params[1]);
+            return true;
+        }
+        int target_fd = (int)target_fd_l;
+
+        bool is_admin = check_is_admin(hc, cfg, sess);
+        char caller_identity[CONN_IDENTITY_MAX];
+        snprintf(caller_identity, sizeof(caller_identity), "%s@%s",
+                 sess->subject_name, sess->network_slug);
+
+        if (!registry_kill(target_fd, caller_identity, is_admin)) {
+            /* registry_kill returns false for "not found" OR "not allowed". */
+            send_line(fd,
+                      ":grappa!grappa@grappa NOTICE %s "
+                      ":Connection %d not found or not yours",
+                      nick, target_fd);
+        } else {
+            send_line(fd,
+                      ":grappa!grappa@grappa NOTICE %s :Connection %d disconnected",
+                      nick, target_fd);
+        }
+        return true;
+    }
+
+    return false; /* not a registry subcommand */
+}
+
 /* One already-parsed Phase 2 client line. Returns true if the client
  * asked to end the connection (QUIT) — the poll() loop below treats
  * that exactly like EOF/a read error, both fold into the same
@@ -2510,11 +2667,33 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     if (strcmp(msg->command, "QUIT") == 0) return true;
 
     if (!sess->network_resolved) {
-        if (strcmp(msg->command, "GRAPPA") == 0 && msg->param_count >= 2 &&
-            strcasecmp(msg->params[0], "NETWORK") == 0) {
-            handle_grappa_network(fd, hc, br, br_connected, reg->nick, cfg, msg, sess);
+        if (strcmp(msg->command, "GRAPPA") == 0 && msg->param_count >= 1) {
+            if (msg->param_count >= 2 && strcasecmp(msg->params[0], "NETWORK") == 0) {
+                handle_grappa_network(fd, hc, br, br_connected, reg->nick, cfg, msg, sess);
+            } else if (handle_grappa_registry_command(fd, hc, cfg, reg, sess, msg)) {
+                /* clients/myclients/kill are available even before network
+                 * selection — they operate on bicchierino-local state, not
+                 * on grappa, so no network is needed.  But sess->network_slug
+                 * is empty at this point, so only myclients (pending entries)
+                 * and kill are useful in practice. */
+                /* handled */
+            } else {
+                send_network_reminder(fd, reg->nick, sess);
+            }
         } else {
             send_network_reminder(fd, reg->nick, sess);
+        }
+        return false;
+    }
+
+    /* GRAPPA subcommands that operate on the local registry (clients,
+     * myclients, kill) — intercepted here before the RAW fall-through so
+     * they are never forwarded upstream. */
+    if (strcmp(msg->command, "GRAPPA") == 0 && msg->param_count >= 1) {
+        if (!handle_grappa_registry_command(fd, hc, cfg, reg, sess, msg)) {
+            /* Not a registry subcommand — fall through to RAW so unknown
+             * /grappa verbs still reach grappa if it understands them. */
+            handle_raw(br, *br_connected, sess, msg);
         }
         return false;
     }
@@ -4383,6 +4562,11 @@ void *connection_run(void *arg) {
      * plain bind — `client_tls_close` is a no-op in that case. */
     SSL_CTX *client_ssl_ctx = NULL;
     if (args->listener->tls && !client_tls_accept(fd, args->listener, &client_ssl_ctx)) {
+        /* Remove from registry before closing — registry_add() was called
+         * in main.c before this thread was spawned, so the entry already
+         * exists.  Skipping this call leaves a permanently dangling entry
+         * because this path never reaches the cleanup: label below. */
+        registry_remove(fd);
         client_tls_close(client_ssl_ctx);
         close(fd);
         atomic_fetch_sub(args->live_connections, 1);
@@ -4431,6 +4615,13 @@ void *connection_run(void *arg) {
         /* Best-effort ERROR — the client may still be connected (just
          * idle or slow), in which case this explains the disconnect. */
         send_line(fd, "ERROR :Registration timeout");
+        /* Remove from registry before closing — registry_add() was called
+         * in main.c before this thread was spawned, so the entry exists.
+         * This path bypasses the cleanup: label, so without this call the
+         * entry dangles indefinitely.  Any port-scanner or health-check
+         * that connects and never sends IRC registration commands will
+         * reliably trigger this path in production. */
+        registry_remove(fd);
         client_tls_close(client_ssl_ctx);
         close(fd);
         atomic_fetch_sub(args->live_connections, 1);
@@ -4506,6 +4697,17 @@ void *connection_run(void *arg) {
          * snapshot. Identical value at this exact point. */
         send_welcome(fd, sess.network_nick, sess.subject_name);
         present_channels(fd, sess.network_nick, &sess);
+
+        /* Registry identity is now known — "account@network".  Set it
+         * here (after send_welcome so the connection is visible to
+         * /grappa clients only once it's fully registered) and again in
+         * handle_grappa_network for the Case B path. */
+        {
+            char identity[CONN_IDENTITY_MAX];
+            snprintf(identity, sizeof(identity), "%s@%s",
+                     sess.subject_name, sess.network_slug);
+            registry_set_identity(fd, identity);
+        }
         if (!network_connected)
             send_line(fd,
                       ":%s NOTICE %s :Could not establish the IRC connection for %s (grappa "
@@ -4789,6 +4991,10 @@ void *connection_run(void *arg) {
     }
 
 cleanup:
+    /* Remove from the connection registry before closing the fd — the fd
+     * must not be recycled by a subsequent accept() while still registered,
+     * which would silently overwrite the new connection's slot. */
+    registry_remove(fd);
     if (br_connected) bridge_close(&br);
     http_client_close(&hc);
     client_tls_close(client_ssl_ctx);

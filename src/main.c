@@ -21,14 +21,11 @@
 
 #include "config.h"
 #include "connection.h"
+#include "registry.h"
 #include "version.h"
 
-/* Hard cap on simultaneous downstream IRC connections.  A personal
- * bouncer facade has no legitimate use case for hundreds of concurrent
- * IRC clients; this number is generous relative to any realistic
- * deployment while still bounding the resource cost an unauthenticated
- * peer can impose before it even sends a NICK line. */
-#define MAX_CONNECTIONS 64
+/* MAX_CONNECTIONS is defined in registry.h — the registry array uses the
+ * same hard cap, so there is exactly one definition shared by both. */
 
 /* Process-wide count of live connection threads.  Incremented here
  * (under the accept loop, single-threaded) before pthread_create, and
@@ -127,6 +124,8 @@ int main(int argc, char **argv) {
     struct config cfg;
     if (!config_load_from_args(argc, argv, &cfg)) return 1;
 
+    registry_init();
+
     /* `bind ... tls` listeners still `accept()` a plain TCP socket
      * here — the actual `SSL_accept` handshake happens inside
      * `connection_run` (connection.c), gated on `args->listener->tls`,
@@ -171,10 +170,29 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < listener_count; i++) {
             if (!(pfds[i].revents & POLLIN)) continue;
 
-            int client_fd = accept(listeners[i].fd, NULL, NULL);
+            /* Capture the peer address at accept() — family-agnostic via
+             * sockaddr_storage (handles both IPv4 and IPv6, dovetailing
+             * with the multi-family listener support in open_listener).
+             * Rendered into a plain text string immediately so the registry
+             * can store it without keeping a sockaddr alive. */
+            struct sockaddr_storage peer_ss;
+            socklen_t peer_len = sizeof(peer_ss);
+            int client_fd = accept(listeners[i].fd, (struct sockaddr *)&peer_ss, &peer_len);
             if (client_fd < 0) {
                 perror("accept");
                 continue;
+            }
+
+            char peer_addr[CONN_PEER_ADDR_MAX];
+            peer_addr[0] = '\0';
+            if (peer_ss.ss_family == AF_INET) {
+                inet_ntop(AF_INET,
+                          &((struct sockaddr_in *)&peer_ss)->sin_addr,
+                          peer_addr, sizeof(peer_addr));
+            } else if (peer_ss.ss_family == AF_INET6) {
+                inet_ntop(AF_INET6,
+                          &((struct sockaddr_in6 *)&peer_ss)->sin6_addr,
+                          peer_addr, sizeof(peer_addr));
             }
 
             /* Check and claim a connection slot atomically.
@@ -196,8 +214,13 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            /* Register the connection before spawning the thread — if
+             * pthread_create fails we call registry_remove immediately. */
+            registry_add(client_fd, peer_addr);
+
             struct connection_args *args = malloc(sizeof(*args));
             if (!args) {
+                registry_remove(client_fd);
                 atomic_fetch_sub(&g_live_connections, 1);
                 close(client_fd);
                 continue;
@@ -210,6 +233,7 @@ int main(int argc, char **argv) {
             pthread_t tid;
             if (pthread_create(&tid, NULL, connection_run, args) != 0) {
                 perror("pthread_create");
+                registry_remove(client_fd);
                 atomic_fetch_sub(&g_live_connections, 1);
                 close(client_fd);
                 free(args);
