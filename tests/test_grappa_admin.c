@@ -245,6 +245,122 @@ TEST(render_session_list_multiple_rows) {
     CHECK(strstr(buf, "mailbox=5") != NULL);
 }
 
+/* ── vhost grant/revoke input validation (#62) ───────────────────────── */
+
+/* Helper: build a minimal scaffolding for handle_grappa_admin calls that
+ * exercise input-validation paths (no HTTP call ever reaches the network). */
+static void build_admin_scaffolding(struct http_client *hc, struct config *cfg,
+                                     struct grappa_session *sess) {
+    http_client_init(hc);
+    memset(cfg, 0, sizeof(*cfg));
+    snprintf(cfg->grappa_url, sizeof(cfg->grappa_url), "https://grappa.test");
+    memset(sess, 0, sizeof(*sess));
+    sess->network_resolved = true;
+}
+
+/* "vhost grant" with fewer than 4 params must print a usage message rather
+ * than silently forwarding to the (now multi-step) HTTP logic. This guards
+ * against the dispatcher ever skipping the arity check. */
+TEST(vhost_grant_missing_args_shows_usage) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "vhost");
+    strcpy(msg.params[1], "grant");
+    msg.param_count = 2;  /* address and user are missing */
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, "usage") != NULL);
+    CHECK(strstr(buf, "grant") != NULL);
+}
+
+/* "vhost revoke" with a non-integer id must print a usage message and
+ * must NOT reach the HTTP layer. Before #62, this path called the wrong
+ * endpoint anyway; now it still must reject garbage ids early. */
+TEST(vhost_revoke_invalid_id_shows_usage) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "vhost");
+    strcpy(msg.params[1], "revoke");
+    strcpy(msg.params[2], "notanumber");
+    msg.param_count = 3;
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, "usage") != NULL);
+    CHECK(strstr(buf, "revoke") != NULL);
+}
+
+/* "vhost revoke" with zero id must also be rejected — zero is not a valid
+ * grant id and parse_positive_long already rejects it. */
+TEST(vhost_revoke_zero_id_shows_usage) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "vhost");
+    strcpy(msg.params[1], "revoke");
+    strcpy(msg.params[2], "0");
+    msg.param_count = 3;
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, "usage") != NULL);
+}
+
+/* An unknown vhost action must produce an error, not silence. */
+TEST(vhost_unknown_action_shows_error) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    strcpy(msg.command, "GRAPPA");
+    strcpy(msg.params[0], "vhost");
+    strcpy(msg.params[1], "delete");  /* 'delete' is not a valid action */
+    msg.param_count = 2;
+
+    struct http_client hc;
+    struct config cfg;
+    struct grappa_session sess;
+    build_admin_scaffolding(&hc, &cfg, &sess);
+
+    char buf[512];
+    int tx = open_client();
+    if (tx < 0) return;
+    handle_grappa_admin(tx, &hc, &cfg, "testnick", &sess, &msg);
+    drain(tx, buf, sizeof(buf));
+
+    /* Must say something — not silence */
+    CHECK(strlen(buf) > 0);
+    CHECK(strstr(buf, ":grappa!grappa@grappa NOTICE testnick :") != NULL);
+}
+
 /* ── grappa_admin_help ───────────────────────────────────────────────── */
 
 /* The help output must mention at least "whoami" (the first listed
@@ -343,6 +459,10 @@ int main(void) {
     RUN(render_session_list_null_label_becomes_orphan_pid);
     RUN(render_session_list_empty_produces_notice);
     RUN(render_session_list_multiple_rows);
+    RUN(vhost_grant_missing_args_shows_usage);
+    RUN(vhost_revoke_invalid_id_shows_usage);
+    RUN(vhost_revoke_zero_id_shows_usage);
+    RUN(vhost_unknown_action_shows_error);
     RUN(help_output_mentions_whoami);
     RUN(unknown_subcommand_suggests_help);
     RUN(empty_subcommand_shows_help);
