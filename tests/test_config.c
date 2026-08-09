@@ -102,9 +102,15 @@ TEST(a_plain_bind_off_loopback_is_refused) {
     CHECK(strstr(err, "refusing to start") != NULL);
     CHECK(strstr(err, "--insecure") != NULL);
 
-    /* Not just 0.0.0.0 — any non-127./::1 address. */
+    /* Not just 0.0.0.0 — any non-loopback address, v4 or v6. */
     CHECK(!load("grappa-url https://g.example\n"
                 "bind 192.168.1.10 6667 plain\n",
+                &cfg, NULL, err, sizeof(err)));
+    CHECK(strstr(err, "refusing to start") != NULL);
+
+    /* IPv6 wildcard (::) is not loopback — same gate. */
+    CHECK(!load("grappa-url https://g.example\n"
+                "bind :: 6667 plain\n",
                 &cfg, NULL, err, sizeof(err)));
     CHECK(strstr(err, "refusing to start") != NULL);
 }
@@ -125,27 +131,22 @@ TEST(insecure_opens_the_gate_and_only_that_gate) {
     CHECK(strstr(err, "plain") != NULL);
 }
 
-/* is_loopback() is a deliberate string check, not a prefix parse: the
- * whole 127/8 range counts. "localhost" deliberately does NOT — it depends
- * on resolver config, which the parser cannot see.
- * ::1 is rejected before the loopback gate, at the IPv4-only check. */
-TEST(loopback_means_127_slash_8) {
+/* is_loopback() is a deliberate string check, not a real prefix parse: the
+ * whole 127/8 range and ::1 count. "localhost" deliberately does NOT — it
+ * depends on resolver config, which the parser cannot see. */
+TEST(loopback_means_127_slash_8_and_ipv6_loopback) {
     struct config cfg;
+    /* IPv4 loopback — whole 127/8 range. */
     CHECK(load("grappa-url https://g.example\nbind 127.0.0.1 6667 plain\n", &cfg, NULL, NULL, 0));
     CHECK(load("grappa-url https://g.example\nbind 127.10.20.30 6667 plain\n", &cfg, NULL, NULL,
                0));
 
+    /* IPv6 loopback — ::1 is accepted as loopback, plain without --insecure. */
+    CHECK(load("grappa-url https://g.example\nbind ::1 6667 plain\n", &cfg, NULL, NULL, 0));
+    CHECK_STR(cfg.binds[0].ip, "::1");
+
     char err[512];
-    /* ::1 is rejected early — the listener is IPv4-only. */
-    CHECK(!load("grappa-url https://g.example\nbind ::1 6667 plain\n", &cfg, NULL, err,
-                sizeof(err)));
-    CHECK(strstr(err, "IPv6 not wired up yet") != NULL);
-
-    /* Other IPv6 addresses are likewise rejected. */
-    CHECK(!load("grappa-url https://g.example\nbind :: 6667 plain\n", &cfg, NULL, err,
-                sizeof(err)));
-    CHECK(strstr(err, "IPv6 not wired up yet") != NULL);
-
+    /* "localhost" is NOT loopback for our purposes. */
     CHECK(!load("grappa-url https://g.example\nbind localhost 6667 plain\n", &cfg, NULL, err,
                 sizeof(err)));
     CHECK(strstr(err, "refusing to start") != NULL);
@@ -308,7 +309,7 @@ int main(void) {
     RUN(binds_are_repeatable_and_keep_their_order);
     RUN(a_plain_bind_off_loopback_is_refused);
     RUN(insecure_opens_the_gate_and_only_that_gate);
-    RUN(loopback_means_127_slash_8);
+    RUN(loopback_means_127_slash_8_and_ipv6_loopback);
     RUN(both_required_directives_are_required);
     RUN(an_unknown_directive_fails_loudly);
     RUN(malformed_binds_are_rejected);
