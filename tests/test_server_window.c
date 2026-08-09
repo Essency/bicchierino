@@ -84,6 +84,36 @@ static void render_row(const char *kind, const char *sender, const char *text, c
     drain(tx, out, out_sz);
 }
 
+/* Same as render_row but passes a meta object carrying sender_kind — simulates
+ * grappa >= v0.15.0 which threads this authoritative discriminator through all
+ * NOTICE persist paths (vjt/grappa-irc#1070). */
+static void render_row_with_sender_kind(const char *kind, const char *sender,
+                                        const char *sender_kind_val, const char *text,
+                                        char *out, size_t out_sz) {
+    struct grappa_session sess;
+    memset(&sess, 0, sizeof(sess));
+    snprintf(sess.network_nick, sizeof(sess.network_nick), "%s", "me");
+
+    int tx = open_client();
+    if (tx < 0) {
+        out[0] = '\0';
+        return;
+    }
+    json_doc *body = body_doc(text);
+
+    char meta_json[256];
+    int n = snprintf(meta_json, sizeof(meta_json), "{\"sender_kind\":\"%s\"}", sender_kind_val);
+    char err[128];
+    json_doc *meta_d = json_parse(meta_json, (size_t)n, err, sizeof(err));
+    if (!meta_d) FAIL("render_row_with_sender_kind: meta parse failed");
+
+    handle_grappa_server_window_row(tx, &sess, kind, sender, json_root(body),
+                                    json_root(meta_d), 0);
+    json_free(body);
+    json_free(meta_d);
+    drain(tx, out, out_sz);
+}
+
 /* A user's private notice: the client must see a user prefix, or it files
  * the line as server chrome and drops the nick-derived tags with it. */
 TEST(a_user_sender_gets_a_user_prefix) {
@@ -128,6 +158,48 @@ TEST(a_server_event_keeps_a_bare_prefix) {
     CHECK_STR(buf, ":somehost NOTICE me :GLOBOPS text\r\n");
 }
 
+/* grappa v0.15.0 added meta.sender_kind ("user"/"server") as an authoritative
+ * discriminator (vjt/grappa-irc#1070). When present it overrides the dot
+ * heuristic — a user nick with a dot, or a server hostname without one (e.g.
+ * a single-label IRC test hostname), must still be handled correctly. */
+TEST(sender_kind_user_overrides_dot_heuristic) {
+    char buf[1024];
+
+    /* A nick containing a dot would fool the dot heuristic into treating it as
+     * a server; sender_kind="user" must win and produce a user prefix. */
+    render_row_with_sender_kind("notice", "nick.with.dot", "user", "hi", buf, sizeof(buf));
+    CHECK_STR(buf, ":nick.with.dot!bicchierino@bicchierino NOTICE me :hi\r\n");
+}
+
+TEST(sender_kind_server_overrides_dot_heuristic) {
+    char buf[1024];
+
+    /* A single-label hostname (no dot) would fool the dot heuristic into
+     * treating it as a user nick; sender_kind="server" must win and keep the
+     * prefix bare. */
+    render_row_with_sender_kind("notice", "localhost", "server", "MOTD line", buf, sizeof(buf));
+    CHECK_STR(buf, ":localhost NOTICE me :MOTD line\r\n");
+}
+
+TEST(sender_kind_user_works_for_normal_nick) {
+    char buf[1024];
+
+    /* Normal case: sender_kind="user" on an ordinary nick (no dot) must
+     * produce the same user prefix as the heuristic path. */
+    render_row_with_sender_kind("notice", "alice", "user", "hello", buf, sizeof(buf));
+    CHECK_STR(buf, ":alice!bicchierino@bicchierino NOTICE me :hello\r\n");
+}
+
+TEST(sender_kind_server_works_for_dotted_hostname) {
+    char buf[1024];
+
+    /* Normal case: sender_kind="server" on a dotted hostname must keep the
+     * prefix bare, same as the heuristic path. */
+    render_row_with_sender_kind("notice", "leaf4.azzurra.chat", "server",
+                                "*** Global notice", buf, sizeof(buf));
+    CHECK_STR(buf, ":leaf4.azzurra.chat NOTICE me :*** Global notice\r\n");
+}
+
 /* The prefix-less sentinel. "*" is not a usable IRC prefix, so the bridge
  * speaks under its own name rather than emitting something a client has
  * to guess at. */
@@ -149,5 +221,9 @@ int main(void) {
     RUN(a_server_sender_keeps_a_bare_prefix);
     RUN(a_server_event_keeps_a_bare_prefix);
     RUN(the_anonymous_sender_becomes_the_bridge_itself);
+    RUN(sender_kind_user_overrides_dot_heuristic);
+    RUN(sender_kind_server_overrides_dot_heuristic);
+    RUN(sender_kind_user_works_for_normal_nick);
+    RUN(sender_kind_server_works_for_dotted_hostname);
     return test_report();
 }

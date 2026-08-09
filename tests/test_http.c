@@ -63,6 +63,61 @@ TEST(a_path_ends_the_host_and_is_discarded) {
     CHECK_STR(pu.port, "443");
 }
 
+/* RFC 3986 §3.2.2: a bracketed IPv6 literal is stripped of its brackets
+ * before being stored — getaddrinfo / tcp_connect take bare literals. */
+TEST(a_bracketed_ipv6_literal_parses_to_bare_host_and_default_port) {
+    struct parsed_url pu;
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://[2001:db8::1]", &pu));
+    CHECK_STR(pu.host, "2001:db8::1");
+    CHECK_STR(pu.port, "443");
+
+    /* The loopback address is the most common test case. */
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://[::1]", &pu));
+    CHECK_STR(pu.host, "::1");
+    CHECK_STR(pu.port, "443");
+}
+
+TEST(a_bracketed_ipv6_literal_with_explicit_port_is_taken) {
+    struct parsed_url pu;
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://[2001:db8::1]:4000", &pu));
+    CHECK_STR(pu.host, "2001:db8::1");
+    CHECK_STR(pu.port, "4000");
+
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://[::1]:443", &pu));
+    CHECK_STR(pu.host, "::1");
+    CHECK_STR(pu.port, "443");
+}
+
+TEST(a_bracketed_ipv6_literal_with_a_path_is_accepted) {
+    struct parsed_url pu;
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://[::1]/api/v1", &pu));
+    CHECK_STR(pu.host, "::1");
+    CHECK_STR(pu.port, "443");
+
+    memset(&pu, 0, sizeof(pu));
+    CHECK(parse_grappa_url("https://[2001:db8::1]:4000/api", &pu));
+    CHECK_STR(pu.host, "2001:db8::1");
+    CHECK_STR(pu.port, "4000");
+}
+
+TEST(a_malformed_bracketed_host_is_refused) {
+    struct parsed_url pu;
+    /* Opening bracket with no closing bracket. */
+    CHECK(!parse_grappa_url("https://[::1", &pu));
+    /* Empty brackets — no host. */
+    CHECK(!parse_grappa_url("https://[]", &pu));
+    CHECK(!parse_grappa_url("https://[]:4000", &pu));
+    /* Junk character immediately after the closing bracket. */
+    CHECK(!parse_grappa_url("https://[::1]junk", &pu));
+    /* Empty port after the colon that follows ']'. */
+    CHECK(!parse_grappa_url("https://[::1]:", &pu));
+}
+
 /* Fails closed on anything unexpected — the header says so, and the
  * dangerous alternative is connecting to whatever the tail happened to
  * hold.
@@ -676,6 +731,10 @@ int main(void) {
     RUN(a_plain_https_url_parses_to_host_and_default_port);
     RUN(an_explicit_port_is_taken);
     RUN(a_path_ends_the_host_and_is_discarded);
+    RUN(a_bracketed_ipv6_literal_parses_to_bare_host_and_default_port);
+    RUN(a_bracketed_ipv6_literal_with_explicit_port_is_taken);
+    RUN(a_bracketed_ipv6_literal_with_a_path_is_accepted);
+    RUN(a_malformed_bracketed_host_is_refused);
     RUN(anything_that_is_not_a_known_scheme_is_refused);
     RUN(a_plaintext_url_parses_and_defaults_to_port_80);
     RUN(an_empty_or_oversized_port_is_refused);

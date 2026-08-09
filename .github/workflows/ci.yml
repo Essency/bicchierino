@@ -145,6 +145,38 @@ jobs:
           kill $BICCHIERINO_PID
           wait $BICCHIERINO_PID 2>/dev/null || true
 
+      # IPv6 loopback smoke: bind ::1, connect with AF_INET6, send a line,
+      # confirm the process survives.  Uses a distinct port (17669) to avoid
+      # colliding with the IPv4 smoke above if the two ever overlap.
+      - name: Smoke test — IPv6 listener (::1) under ASan/UBSan
+        run: |
+          cat > smoke6.config <<'EOF'
+          grappa-url https://127.0.0.1:1
+          bind ::1 17669 plain
+          EOF
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            ./bicchierino --config smoke6.config &
+          BICCHIERINO_PID=$!
+          sleep 1
+
+          python3 - <<'EOF'
+          import socket, time
+          s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+          s.settimeout(2)
+          s.connect(("::1", 17669))
+          s.sendall(b"NICK ipv6test\r\nUSER a b c :d\r\n")
+          time.sleep(0.1)
+          s.close()
+          EOF
+
+          sleep 1
+          if ! kill -0 $BICCHIERINO_PID 2>/dev/null; then
+            echo "bicchierino crashed on IPv6 connection"
+            exit 1
+          fi
+          kill $BICCHIERINO_PID
+          wait $BICCHIERINO_PID 2>/dev/null || true
+
       # The cap and the registration deadline from #20. Neither is
       # unit-testable in any useful way — the cap arithmetic is inline in
       # main.c's accept loop, and what actually breaks is the invariant
@@ -244,6 +276,20 @@ jobs:
           docker run --rm \
             --network "$bicc_net" \
             -v "$(pwd)/rfc1459_check.py:/check.py:ro" \
+            python:3.12-slim python3 /check.py
+
+      # IRCv3 draft/chathistory compliance check: CAP negotiation, ISUPPORT
+      # CHATHISTORY=N, BATCH framing, msgid=/time= tags on replayed messages,
+      # BEFORE/AFTER/LATEST/AROUND/BETWEEN subcommands, TARGETS (empty success),
+      # and error-response shape for invalid params.  Runs from inside bicc-net
+      # on the same sealed stack — no extra containers started.
+      - name: IRCv3 draft/chathistory compliance check
+        run: |
+          cd test
+          bicc_net="$($COMPOSE ps --format '{{.Project}}' | head -1)_bicc-net"
+          docker run --rm \
+            --network "$bicc_net" \
+            -v "$(pwd)/chathistory_check.py:/check.py:ro" \
             python:3.12-slim python3 /check.py
 
       - name: Stack logs

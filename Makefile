@@ -33,7 +33,7 @@ BINDIR ?= $(PREFIX)/bin
 LDLIBS := -lssl -lcrypto -lpthread
 
 BIN := bicchierino
-OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_client.o src/ws.o src/json.o src/jsonw.o
+OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_client.o src/ws.o src/json.o src/jsonw.o src/registry.o
 
 # Each suite links ONLY the module under test plus what that module
 # actually needs — not $(OBJS). A test binary that drags in the whole
@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin
 
 .PHONY: all clean install version check
 
@@ -101,14 +101,23 @@ tests/test_bridge: tests/test_bridge.c tests/test.h tests/ws_stub.c tests/ws_stu
 # Needs the modules connection.c calls plus the same libraries the binary
 # links; nothing is stubbed, because the property under test is what the
 # real formatter puts on a real fd.
-tests/test_render: tests/test_render.c tests/test.h src/connection.c
-	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_render.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c -lssl -lcrypto -lpthread
+tests/test_registry: tests/test_registry.c tests/test.h src/registry.c src/registry.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_registry.c src/registry.c -lpthread
+
+tests/test_render: tests/test_render.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_render.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 # Compiles connection.c in to reach handle_grappa_server_window_row,
 # which is static — the same approach test_http uses for the parsers.
 # Links what connection.c calls, plus the libraries the binary links.
-tests/test_server_window: tests/test_server_window.c tests/test.h src/connection.c
-	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_window.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c -lssl -lcrypto -lpthread
+tests/test_server_window: tests/test_server_window.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_window.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach the static admin handlers: grappa_admin_notice,
+# render_live_list, parse_positive_long, handle_grappa_admin. Same pattern as
+# test_render and test_server_window.
+tests/test_grappa_admin: tests/test_grappa_admin.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_grappa_admin.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)

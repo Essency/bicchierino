@@ -8,16 +8,15 @@
 #define CONFIG_MAX_LINE 1024
 #define DEFAULT_CONFIG_PATH "./bicchierino.config"
 
-/* 127.0.0.0/8 only — a string check, not a real prefix parse.
+/* 127.0.0.0/8 and ::1 only — a string check, not a real prefix parse.
  * Deliberately narrow: this gates whether a `plain` (non-TLS) bind is
  * allowed to start at all, so a false negative (calling something
  * loopback that isn't) would be the dangerous direction. "localhost" is
  * not accepted here on purpose — it depends on resolver configuration,
- * which is not a fact this function can see.  IPv6 loopback (::1) is not
- * handled here because IPv6 bind addresses are rejected earlier by
- * parse_bind_line, before this function is ever called. */
+ * which is not a fact this function can see. */
 static bool is_loopback(const char *ip) {
     if (strncmp(ip, "127.", 4) == 0) return true;
+    if (strcmp(ip, "::1") == 0) return true;
     return false;
 }
 
@@ -32,6 +31,24 @@ static bool is_loopback(const char *ip) {
  * host ends at the first ':' or '/'. */
 static bool url_host(const char *url, size_t prefix_len, char *out, size_t out_sz) {
     const char *rest = url + prefix_len;
+
+    /* RFC 3986 §3.2.2 bracketed IPv6 literal: [addr]:port/path — mirrors
+     * http.c's parse_grappa_url bracket handling (this function only needs
+     * the host, not the port, since the caller's sole use is is_loopback()).
+     * Without this, a bracketed IPv6 host (e.g. "http://[::1]") would have
+     * its host wrongly extracted as a single "[" character by the plain
+     * strcspn below — is_loopback("[") is false, so a genuinely-loopback
+     * URL would be refused as not-loopback. */
+    if (*rest == '[') {
+        const char *close = strchr(rest + 1, ']');
+        if (!close) return false;
+        size_t n = (size_t)(close - (rest + 1));
+        if (n == 0 || n >= out_sz) return false;
+        memcpy(out, rest + 1, n);
+        out[n] = '\0';
+        return true;
+    }
+
     size_t n = strcspn(rest, ":/");
     if (n == 0 || n >= out_sz) return false;
     memcpy(out, rest, n);
@@ -58,11 +75,11 @@ static bool url_host(const char *url, size_t prefix_len, char *out, size_t out_s
  * is_loopback() is reused as-is, which also means "localhost" is refused
  * here: it is a resolver claim, not a fact this function can verify, and
  * this gate decides whether a bearer token may leave the process in the
- * clear. A literal address costs the operator four characters. There is
- * no IPv6 branch either, and not by oversight — http.c's own URL parser
- * splits the host at the first ':', so a literal IPv6 address cannot
- * survive it in any case; recognising ::1 here would only accept a URL
- * that the connect path then fails on. That limit is pre-existing. */
+ * clear. A literal address costs the operator four characters.
+ *
+ * url_host() below IS bracket-aware for a literal IPv6 host
+ * ("http://[::1]"), matching http.c's parse_grappa_url — is_loopback()
+ * already recognises bare "::1", so the two now agree end to end. */
 static bool validate_grappa_url(const char *url, struct config *cfg) {
     static const char https_prefix[] = "https://";
     static const char http_prefix[] = "http://";
@@ -120,17 +137,6 @@ static bool parse_bind_line(char *rest, size_t lineno, struct config *cfg) {
     int mode_end = 0;
     if (sscanf(rest, "%63s %d %15s%n", b->ip, &b->port, mode, &mode_end) < 3) {
         fprintf(stderr, "config line %zu: bind needs <ip> <port> plain|tls\n", lineno);
-        return false;
-    }
-
-    /* The listener in main.c is IPv4-only.  Catch IPv6 addresses here, at
-     * config-parse time, so the error surfaces before any sockets are
-     * touched rather than mid-startup after other listeners may already be
-     * open. A colon in the address is a reliable IPv6 marker for any
-     * address a user would plausibly write (::1, ::, 2001:db8::1, …). */
-    if (strchr(b->ip, ':') != NULL) {
-        fprintf(stderr, "config line %zu: bind address '%s': IPv6 not wired up yet\n",
-                lineno, b->ip);
         return false;
     }
 
