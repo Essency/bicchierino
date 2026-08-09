@@ -4562,6 +4562,11 @@ void *connection_run(void *arg) {
      * plain bind — `client_tls_close` is a no-op in that case. */
     SSL_CTX *client_ssl_ctx = NULL;
     if (args->listener->tls && !client_tls_accept(fd, args->listener, &client_ssl_ctx)) {
+        /* Remove from registry before closing — registry_add() was called
+         * in main.c before this thread was spawned, so the entry already
+         * exists.  Skipping this call leaves a permanently dangling entry
+         * because this path never reaches the cleanup: label below. */
+        registry_remove(fd);
         client_tls_close(client_ssl_ctx);
         close(fd);
         atomic_fetch_sub(args->live_connections, 1);
@@ -4610,6 +4615,13 @@ void *connection_run(void *arg) {
         /* Best-effort ERROR — the client may still be connected (just
          * idle or slow), in which case this explains the disconnect. */
         send_line(fd, "ERROR :Registration timeout");
+        /* Remove from registry before closing — registry_add() was called
+         * in main.c before this thread was spawned, so the entry exists.
+         * This path bypasses the cleanup: label, so without this call the
+         * entry dangles indefinitely.  Any port-scanner or health-check
+         * that connects and never sends IRC registration commands will
+         * reliably trigger this path in production. */
+        registry_remove(fd);
         client_tls_close(client_ssl_ctx);
         close(fd);
         atomic_fetch_sub(args->live_connections, 1);

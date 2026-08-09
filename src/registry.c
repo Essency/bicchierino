@@ -68,8 +68,8 @@ void registry_snapshot(struct conn_snapshot *snap, const char *filter_identity) 
 }
 
 bool registry_kill(int target_fd, const char *caller_identity, bool is_admin) {
-    bool found    = false;
-    bool allowed  = false;
+    bool found   = false;
+    bool allowed = false;
 
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -77,6 +77,17 @@ bool registry_kill(int target_fd, const char *caller_identity, bool is_admin) {
             found   = true;
             allowed = is_admin ||
                       strcmp(g_entries[i].identity, caller_identity) == 0;
+            /* Call shutdown() WHILE STILL HOLDING g_lock — registry_remove()
+             * in the victim thread also acquires g_lock, so the fd cannot be
+             * closed and recycled by a new accept() before we finish here.
+             * Without this, there is a TOCTOU window between releasing the
+             * lock and calling shutdown() where the victim thread could run
+             * registry_remove → close(fd) and the OS could hand that same fd
+             * number to a brand-new connection, causing shutdown() to
+             * disconnect an innocent client instead. shutdown() is a
+             * non-blocking syscall and is safe to call while holding a mutex. */
+            if (allowed)
+                shutdown(target_fd, SHUT_RDWR);
             break;
         }
     }
@@ -84,14 +95,17 @@ bool registry_kill(int target_fd, const char *caller_identity, bool is_admin) {
 
     if (!found || !allowed) return false;
 
-    /* Best-effort courtesy ERROR before the shutdown — may not reach the
-     * client on TLS connections (raw write() bypasses the SSL layer), but
-     * the shutdown(SHUT_RDWR) below is the real disconnect mechanism and
-     * works regardless. */
+    /* Best-effort courtesy ERROR after the shutdown — if the fd was recycled
+     * by the time send() runs, or the socket is already shut down, the send
+     * fails silently, which is harmless.  MSG_NOSIGNAL prevents SIGPIPE on
+     * a socket that has already been shut down for writing.  This is
+     * intentionally outside the lock because a partial/failed send here has
+     * no correctness consequence. On TLS connections raw send() bypasses the
+     * SSL layer anyway; shutdown(SHUT_RDWR) above is the real disconnect
+     * mechanism. */
     const char *err = "ERROR :Disconnected by admin\r\n";
-    ssize_t unused = write(target_fd, err, strlen(err));
+    ssize_t unused = send(target_fd, err, strlen(err), MSG_NOSIGNAL);
     (void)unused;
 
-    shutdown(target_fd, SHUT_RDWR);
     return true;
 }
