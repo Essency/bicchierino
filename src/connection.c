@@ -3266,7 +3266,10 @@ static bool chathistory_fetch(struct http_client *hc, const struct config *cfg,
     url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
     char encoded_target[300];
     url_encode(target, encoded_target, sizeof(encoded_target));
-    char path[512];
+    /* 1024 matches send_privmsg_rest's own path buffer — the base path alone
+     * (encoded_slug up to 192 + encoded_target up to 300 + fixed prefix/suffix)
+     * can reach ~520 bytes before query params; 512 was too tight. */
+    char path[1024];
     if (cursor_kind)
         snprintf(path, sizeof(path), "/networks/%s/channels/%s/messages?%s=%ld&limit=%ld",
                  encoded_slug, encoded_target, cursor_kind, cursor_value, limit);
@@ -3342,7 +3345,7 @@ static void handle_chathistory(int fd, struct http_client *hc, const struct conf
     }
 
     bool is_between = strcasecmp(sub, "BETWEEN") == 0;
-    size_t min_params = is_between ? 5 : 4;
+    int min_params = is_between ? 5 : 4;
     if (msg->param_count < min_params) {
         send_chathistory_fail(fd, "NEED_MORE_PARAMS", sub, "Missing parameters");
         return;
