@@ -2240,13 +2240,31 @@ static void handle_whois(struct bridge *br, bool br_connected, struct grappa_ses
 static void handle_who(struct bridge *br, bool br_connected, struct grappa_session *sess,
                         const struct irc_message *msg) {
     if (!br_connected || msg->param_count < 1) return;
-    const char *target = msg->params[0];
-    char esc_target[300];
+
+    /* Join params[0..n-1] with spaces — bahamut's extended-WHO syntax
+     * (/who +h *.azzurra.chat) arrives as TWO separate params
+     * (params[0]="+h", params[1]="*.azzurra.chat") because irc_parse_line
+     * splits on spaces. grappa's own "who" handler treats the value as one
+     * space-separated string (grappa_channel.ex: ":who_target — spaces
+     * allowed... the value may be a mask or a multi-token flag string").
+     * A plain /who #channel (single param) passes through unchanged because
+     * the loop never runs. */
+    char target[IRC_LINE_MAX];
+    size_t pos = (size_t)snprintf(target, sizeof(target), "%s", msg->params[0]);
+    for (int i = 1; i < msg->param_count; i++) {
+        int written = snprintf(target + pos, sizeof(target) - pos, " %s", msg->params[i]);
+        if (written > 0 && (size_t)written < sizeof(target) - pos)
+            pos += (size_t)written;
+        else
+            break; /* truncated — stop rather than advance pos past the buffer */
+    }
+
+    char esc_target[IRC_LINE_MAX * 2];
     if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
         fprintf(stderr, "bicchierino: WHO %s: target too long to escape\n", target);
         return;
     }
-    char payload[700];
+    char payload[IRC_LINE_MAX * 2 + 64];
     snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\"}", sess->network_id,
              esc_target);
     if (!push_on_user_topic(br, sess, "who", payload))
