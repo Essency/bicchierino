@@ -3052,9 +3052,11 @@ static void grappa_admin_vhost_grant(int fd, const char *nick, struct http_clien
 
 /* /grappa vhost revoke <grant_id> — DELETE /admin/vhosts/grants/:grant_id.
  *
- * Defense in depth: verifies the id appears in a vhost's grants array via
- * GET /admin/vhosts before issuing the delete. Without this check, a mistyped
- * grant id could collide with a vhost id and silently delete an entire vhost
+ * Defense in depth: verifies the id appears in the flat root-level grants
+ * array from GET /admin/vhosts before issuing the delete. The grants are
+ * returned as a flat top-level array (siblings to "vhosts"), NOT nested
+ * inside each vhost object. Without this check, a mistyped grant id could
+ * collide with a vhost id and silently delete an entire vhost
  * (DELETE /admin/vhosts/:id cascades every grant on it). (#62) */
 static void grappa_admin_vhost_revoke(int fd, const char *nick, struct http_client *hc,
                                        const struct config *cfg, const struct grappa_session *sess,
@@ -3070,21 +3072,14 @@ static void grappa_admin_vhost_revoke(int fd, const char *nick, struct http_clie
 
     bool found = false;
     const json_value *root = json_root(doc);
-    const json_value *vhosts = json_get(root, "vhosts");
-    if (!vhosts) vhosts = root;
-    size_t vhost_count = json_len(vhosts);
-    for (size_t i = 0; i < vhost_count && !found; i++) {
-        const json_value *v = json_at(vhosts, i);
-        const json_value *grants = json_get(v, "grants");
-        if (!grants) continue;
-        size_t grant_count = json_len(grants);
-        for (size_t j = 0; j < grant_count; j++) {
-            const json_value *g = json_at(grants, j);
+    const json_value *grants = json_get(root, "grants");
+    if (grants) {
+        size_t n = json_len(grants);
+        for (size_t i = 0; i < n && !found; i++) {
+            const json_value *g = json_at(grants, i);
             long gid = 0;
-            if (json_long_req(g, "id", &gid) && gid == grant_id) {
+            if (json_long_req(g, "id", &gid) && gid == grant_id)
                 found = true;
-                break;
-            }
         }
     }
     json_free(doc);

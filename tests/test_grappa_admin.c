@@ -245,6 +245,60 @@ TEST(render_session_list_multiple_rows) {
     CHECK(strstr(buf, "mailbox=5") != NULL);
 }
 
+/* ── vhost revoke — flat grants array shape (#62) ───────────────────── */
+
+/* GET /admin/vhosts returns grants as a FLAT top-level array, NOT nested
+ * inside each vhost object.  Verify that:
+ *   (a) json_get(root, "grants") yields the grants array, and
+ *   (b) json_get(<vhost-object>, "grants") returns NULL (no sub-array).
+ * A regression to the nested lookup would cause (a) to be skipped and
+ * (b) to be the actual path — silently making revoke always refuse. */
+TEST(vhost_revoke_flat_grants_array_accessible_from_root) {
+    /* Minimal faithful replica of the real GET /admin/vhosts response shape,
+     * as rendered by VhostsController.index/2 + Grappa.Vhosts.AdminWire. */
+    const char *json =
+        "{"
+        "\"vhosts\":["
+        "{\"id\":1,\"address\":\"user.example.net\",\"in_pool\":true,"
+        "\"generally_available\":true,\"inserted_at\":\"2024-01-01T00:00:00Z\","
+        "\"updated_at\":\"2024-01-01T00:00:00Z\"}"
+        "],"
+        "\"grants\":["
+        "{\"id\":7,\"vhost_id\":1,\"subject_type\":\"user\","
+        "\"subject_id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"}"
+        "],"
+        "\"host_candidates\":[]"
+        "}";
+    char err[64];
+    json_doc *doc = json_parse(json, strlen(json), err, sizeof(err));
+    CHECK(doc != NULL);
+    if (!doc) return;
+
+    const json_value *root = json_root(doc);
+
+    /* (a) Flat root-level grants array must be found and contain one entry. */
+    const json_value *grants = json_get(root, "grants");
+    CHECK(grants != NULL);
+    CHECK(json_len(grants) == 1);
+
+    /* Verify the grant's id field is readable and equals 7. */
+    const json_value *g = json_at(grants, 0);
+    long gid = 0;
+    CHECK(json_long_req(g, "id", &gid));
+    CHECK(gid == 7);
+
+    /* (b) Each vhost object must NOT have a "grants" sub-key — the old
+     * broken code did json_get(vhost_obj, "grants") and always got NULL,
+     * causing it to skip the inner loop for every vhost and never find any
+     * valid grant id. */
+    const json_value *vhosts = json_get(root, "vhosts");
+    CHECK(vhosts != NULL);
+    const json_value *v = json_at(vhosts, 0);
+    CHECK(json_get(v, "grants") == NULL);
+
+    json_free(doc);
+}
+
 /* ── vhost grant/revoke input validation (#62) ───────────────────────── */
 
 /* Helper: build a minimal scaffolding for handle_grappa_admin calls that
@@ -459,6 +513,7 @@ int main(void) {
     RUN(render_session_list_null_label_becomes_orphan_pid);
     RUN(render_session_list_empty_produces_notice);
     RUN(render_session_list_multiple_rows);
+    RUN(vhost_revoke_flat_grants_array_accessible_from_root);
     RUN(vhost_grant_missing_args_shows_usage);
     RUN(vhost_revoke_invalid_id_shows_usage);
     RUN(vhost_revoke_zero_id_shows_usage);
