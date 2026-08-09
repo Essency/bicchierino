@@ -45,6 +45,38 @@ static bool parse_grappa_url(const char *url, struct parsed_url *out) {
     const char *rest = url + prefix_len;
     if (*rest == '\0') return false;
 
+    if (*rest == '[') {
+        /* RFC 3986 §3.2.2 bracketed IPv6 literal: [addr]:port/path
+         * Find the closing ']'; everything between the brackets is the
+         * host.  getaddrinfo / tcp_connect take a bare literal (e.g.
+         * "::1"), not a bracket-wrapped one, so we strip them here. */
+        const char *close = strchr(rest + 1, ']');
+        if (!close) return false;
+        size_t host_len = (size_t)(close - (rest + 1));
+        if (host_len == 0 || host_len >= sizeof(out->host)) return false;
+        memcpy(out->host, rest + 1, host_len);
+        out->host[host_len] = '\0';
+
+        const char *after = close + 1; /* character right after ']' */
+        if (*after == ':') {
+            /* explicit port follows the closing bracket */
+            const char *port_start = after + 1;
+            const char *slash = strchr(port_start, '/');
+            const char *port_end = slash ? slash : port_start + strlen(port_start);
+            size_t port_len = (size_t)(port_end - port_start);
+            if (port_len == 0 || port_len >= sizeof(out->port)) return false;
+            memcpy(out->port, port_start, port_len);
+            out->port[port_len] = '\0';
+        } else if (*after == '/' || *after == '\0') {
+            /* no explicit port — fall through to default */
+            snprintf(out->port, sizeof(out->port), "443");
+        } else {
+            /* unexpected character after ']' — fail closed */
+            return false;
+        }
+        return true;
+    }
+
     const char *colon = strchr(rest, ':');
     const char *slash = strchr(rest, '/');
     const char *host_end = slash && (!colon || slash < colon) ? slash : colon;
