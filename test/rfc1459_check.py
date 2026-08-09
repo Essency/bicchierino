@@ -382,7 +382,10 @@ def check_privmsg(bicc: IRCConn, peer: IRCConn, own_nick: str) -> None:
         parts_dm = line_dm.split()
         if len(parts_dm) >= 3 and parts_dm[1] == "PRIVMSG":
             target = parts_dm[2]
-            ok(f"PRIVMSG DM: verb=PRIVMSG, target={target!r} (re-keyed to peer)")
+            if target.lower() != "rfc-peer":
+                fail(f"PRIVMSG DM: target={target!r}, expected 'rfc-peer' (WIRE.md §5 re-key)")
+            else:
+                ok(f"PRIVMSG DM: verb=PRIVMSG, target={target!r} (re-keyed to peer)")
         else:
             fail(f"PRIVMSG DM: unexpected format {line_dm!r}")
 
