@@ -31,12 +31,20 @@ if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 
     # On upgrade ($1=configure, $2=old-version set): restart the service so
-    # the new binary is picked up.  deb-systemd-invoke try-restart is a
-    # no-op when the unit is not active, so this is safe on a fresh install
-    # where the service was never started — it preserves the existing
-    # "don't autostart into a crash loop with placeholder config" behaviour.
+    # the new binary is picked up.  systemctl try-restart is a no-op when
+    # the unit is not active, so this is safe on a fresh install where the
+    # service was never started — it preserves the existing "don't autostart
+    # into a crash loop with placeholder config" behaviour.
+    #
+    # We call systemctl directly (not via deb-systemd-invoke/invoke-rc.d)
+    # because invoke-rc.d detects the dpkg maintenance context via
+    # $DPKG_RUNNING_VERSION and blocks the 'start' half of a try-restart by
+    # policy — the stop fires, the start does not, and the service is left
+    # down until someone notices.  systemctl talks to systemd via D-Bus and
+    # is unaffected by that policy gate; we are already inside the
+    # [ -d /run/systemd/system ] guard so systemd is confirmed running.
     if [ "$1" = "configure" ] && [ -n "$2" ]; then
-        deb-systemd-invoke try-restart bicchierino.service >/dev/null 2>&1 || true
+        systemctl try-restart bicchierino.service >/dev/null 2>&1 || true
     fi
 fi
 
