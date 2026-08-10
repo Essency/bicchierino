@@ -1,4 +1,4 @@
-/* test_whois.c — handle_grappa_whois_bundle_event: P-0a bahamut fields. (#72)
+/* test_whois.c — handle_grappa_whois_bundle_event: P-0a bahamut fields. (#72, #78)
  *
  * Bug: handle_grappa_whois_bundle_event read the eleven P-0a typed fields
  * grappa's whois_bundle carries (`actually_host`, `actually_ip`, `umodes`,
@@ -284,34 +284,55 @@ TEST(whois_full_bahamut_bundle_all_p0a_fields) {
     CHECK(strstr(buf, "is an IRC Server Administrator") != NULL);
 }
 
-/* P-0a fields must appear AFTER 313 and BEFORE 317 (fixed-order
- * post-313 placement per the WIRE.md spec). */
-TEST(whois_p0a_fields_ordered_after_313_before_317) {
+/* Full emission order matches bahamut's own WHOIS sequence (#78, confirmed
+ * against s_user.c): 311 → 378 → 379 → 319 → 312 → 307 → 671 → 313 → 320
+ * → 317 → 318.  The three numerics that were previously out of place (319
+ * after 317, 312 second, 313 third) are now in the correct positions. */
+TEST(whois_numerics_match_bahamut_order) {
     char buf[8192];
     render_whois("{\"target\":\"T\",\"user\":\"u\",\"host\":\"h\","
                  "\"realname\":\"r\","
-                 "\"is_operator\":true,"
-                 "\"is_registered\":true,"
+                 "\"actually_host\":\"real.host\",\"actually_ip\":\"1.2.3.4\","
                  "\"umodes\":\"+i\","
+                 "\"channels\":[\"#test\"],"
+                 "\"server\":\"irc.example.net\","
+                 "\"is_registered\":true,"
+                 "\"using_ssl\":true,"
+                 "\"is_operator\":true,"
+                 "\"is_agent\":true,"
                  "\"idle_seconds\":30,\"signon\":1}",
                  buf, sizeof(buf));
 
-    /* Find positions of the key numerics to assert ordering. */
-    const char *p313 = strstr(buf, " 313 ");
-    const char *p307 = strstr(buf, " 307 ");
+    const char *p311 = strstr(buf, " 311 ");
+    const char *p378 = strstr(buf, " 378 ");
     const char *p379 = strstr(buf, " 379 ");
+    const char *p319 = strstr(buf, " 319 ");
+    const char *p312 = strstr(buf, " 312 ");
+    const char *p307 = strstr(buf, " 307 ");
+    /* 671 for using_ssl (bahamut) — first occurrence; no `secure` in payload
+     * so no second 671 to confuse the pointer. */
+    const char *p671 = strstr(buf, " 671 ");
+    const char *p313 = strstr(buf, " 313 ");
+    const char *p320 = strstr(buf, " 320 ");
     const char *p317 = strstr(buf, " 317 ");
+    const char *p318 = strstr(buf, " 318 ");
 
-    CHECK(p313 != NULL);
-    CHECK(p307 != NULL);
-    CHECK(p379 != NULL);
-    CHECK(p317 != NULL);
+    CHECK(p311 != NULL); CHECK(p378 != NULL); CHECK(p379 != NULL);
+    CHECK(p319 != NULL); CHECK(p312 != NULL); CHECK(p307 != NULL);
+    CHECK(p671 != NULL); CHECK(p313 != NULL); CHECK(p320 != NULL);
+    CHECK(p317 != NULL); CHECK(p318 != NULL);
 
-    /* 307 and 379 must come after 313 and before 317. */
-    CHECK(p313 < p307);
-    CHECK(p313 < p379);
-    CHECK(p307 < p317);
-    CHECK(p379 < p317);
+    /* bahamut order: 311 < 378 < 379 < 319 < 312 < 307 < 671 < 313 < 320 < 317 < 318 */
+    CHECK(p311 < p378);
+    CHECK(p378 < p379);
+    CHECK(p379 < p319);
+    CHECK(p319 < p312);
+    CHECK(p312 < p307);
+    CHECK(p307 < p671);
+    CHECK(p671 < p313);
+    CHECK(p313 < p320);
+    CHECK(p320 < p317);
+    CHECK(p317 < p318);
 }
 
 /* is_registered == false (default): no 307 must be emitted. */
@@ -353,7 +374,7 @@ int main(void) {
     RUN(whois_is_agent_emits_320);
     RUN(whois_is_java_emits_320);
     RUN(whois_full_bahamut_bundle_all_p0a_fields);
-    RUN(whois_p0a_fields_ordered_after_313_before_317);
+    RUN(whois_numerics_match_bahamut_order);
     RUN(whois_is_registered_false_does_not_emit_307);
     RUN(whois_no_such_nick_still_emits_401_and_318);
     return test_report();

@@ -5396,9 +5396,11 @@ static void handle_grappa_who_reply_event(int fd, const char *nick,
  * (`is_admin`, `is_services_admin`, `is_helper`, `is_chanop`, `is_agent`,
  * `is_java`) each rendered as a 320 RPL_WHOISSPECIAL line with the same
  * human-readable string the ircd itself would send. Because the typed
- * payload loses the original interleaving order, all P-0a fields are
- * emitted in a fixed order after 313 (the closest approximation a bridge
- * can produce without replaying the raw numeric stream).
+ * payload loses the original interleaving order, all fields are emitted
+ * in bahamut's own order (issue #78, confirmed against s_user.c):
+ *   311, 378, 379, 319, 312, 307, 671, 313, 320, 317, 318
+ * IRCv3/solanum-only fields (330, 301, 671/secure, 276, extra_lines)
+ * have no fixed bahamut position and are clustered before 318.
  *
  * `using_ssl` (bahamut 275) and `secure` (solanum 671) are distinct typed
  * fields from distinct ircd families; both map to 671 here. In practice
@@ -5426,9 +5428,41 @@ static void handle_grappa_whois_bundle_event(int fd, const char *nick,
         send_line(fd, ":%s 318 %s %s :End of /WHOIS list", IRCD_SERVER, nick, target);
         return;
     }
+    /* 311 RPL_WHOISUSER */
     send_line(fd, ":%s 311 %s %s %s %s * :%s", IRCD_SERVER, nick, target, user, host ? host : "*",
               realname ? realname : "");
 
+    /* 378 RPL_WHOISACTUALLY (P-0a) — bahamut emits right after 311. */
+    const char *actually_host = NULL, *actually_ip = NULL;
+    json_str_opt(payload, "actually_host", &actually_host);
+    json_str_opt(payload, "actually_ip", &actually_ip);
+    if (actually_host || actually_ip)
+        send_line(fd, ":%s 378 %s %s :is connecting from %s [%s]", IRCD_SERVER, nick, target,
+                  actually_host ? actually_host : "*", actually_ip ? actually_ip : "");
+
+    /* 379 RPL_WHOISMODES (P-0a) — bahamut emits after 378. */
+    const char *umodes = NULL;
+    json_str_opt(payload, "umodes", &umodes);
+    if (umodes)
+        send_line(fd, ":%s 379 %s %s :is using modes %s", IRCD_SERVER, nick, target, umodes);
+
+    /* 319 RPL_WHOISCHANNELS — bahamut emits before 312. */
+    const json_value *channels = json_get(payload, "channels");
+    if (channels && json_type_of(channels) == JSON_ARRAY && json_len(channels) > 0) {
+        char line[480] = "";
+        size_t line_len = 0;
+        size_t count = json_len(channels);
+        for (size_t i = 0; i < count; i++) {
+            const char *chan = json_string(json_at(channels, i));
+            if (!chan) continue;
+            int written = snprintf(line + line_len, sizeof(line) - line_len, "%s%s",
+                                    line_len ? " " : "", chan);
+            if (written > 0 && (size_t)written < sizeof(line) - line_len) line_len += (size_t)written;
+        }
+        send_line(fd, ":%s 319 %s %s :%s", IRCD_SERVER, nick, target, line);
+    }
+
+    /* 312 RPL_WHOISSERVER — bahamut emits after the channel list. */
     const char *server = NULL, *server_info = NULL;
     json_str_opt(payload, "server", &server);
     json_str_opt(payload, "server_info", &server_info);
@@ -5436,6 +5470,19 @@ static void handle_grappa_whois_bundle_event(int fd, const char *nick,
         send_line(fd, ":%s 312 %s %s %s :%s", IRCD_SERVER, nick, target, server,
                   server_info ? server_info : "");
 
+    /* 307 RPL_WHOISREGNICK (P-0a) — bahamut emits after 312. */
+    bool is_registered = false;
+    json_bool_dflt(payload, "is_registered", false, &is_registered);
+    if (is_registered)
+        send_line(fd, ":%s 307 %s %s :has identified for this nick", IRCD_SERVER, nick, target);
+
+    /* 671 (bahamut 275 RPL_USINGSSL, P-0a) — bahamut emits after 307, before 313. */
+    bool using_ssl = false;
+    json_bool_dflt(payload, "using_ssl", false, &using_ssl);
+    if (using_ssl)
+        send_line(fd, ":%s 671 %s %s :is using a secure connection (SSL)", IRCD_SERVER, nick, target);
+
+    /* 313 RPL_WHOISOPERATOR — bahamut emits after 307/671. */
     bool is_operator = false;
     json_bool_dflt(payload, "is_operator", false, &is_operator);
     if (is_operator) {
@@ -5445,29 +5492,7 @@ static void handle_grappa_whois_bundle_event(int fd, const char *nick,
                   oper_text ? oper_text : "is an IRC operator");
     }
 
-    /* P-0a bahamut fields — emitted in a fixed order after 313 (#72). */
-    const char *actually_host = NULL, *actually_ip = NULL;
-    json_str_opt(payload, "actually_host", &actually_host);
-    json_str_opt(payload, "actually_ip", &actually_ip);
-    if (actually_host || actually_ip)
-        send_line(fd, ":%s 378 %s %s :is connecting from %s [%s]", IRCD_SERVER, nick, target,
-                  actually_host ? actually_host : "*", actually_ip ? actually_ip : "");
-
-    const char *umodes = NULL;
-    json_str_opt(payload, "umodes", &umodes);
-    if (umodes)
-        send_line(fd, ":%s 379 %s %s :is using modes %s", IRCD_SERVER, nick, target, umodes);
-
-    bool is_registered = false;
-    json_bool_dflt(payload, "is_registered", false, &is_registered);
-    if (is_registered)
-        send_line(fd, ":%s 307 %s %s :has identified for this nick", IRCD_SERVER, nick, target);
-
-    bool using_ssl = false;
-    json_bool_dflt(payload, "using_ssl", false, &using_ssl);
-    if (using_ssl)
-        send_line(fd, ":%s 671 %s %s :is using a secure connection (SSL)", IRCD_SERVER, nick, target);
-
+    /* P-0a 320 flags — bahamut emits after 313. */
     bool is_admin = false;
     json_bool_dflt(payload, "is_admin", false, &is_admin);
     if (is_admin)
@@ -5498,6 +5523,7 @@ static void handle_grappa_whois_bundle_event(int fd, const char *nick,
     if (is_java)
         send_line(fd, ":%s 320 %s %s :is a Java User", IRCD_SERVER, nick, target);
 
+    /* 317 RPL_WHOISIDLE */
     long idle_seconds = 0;
     bool has_idle = false;
     json_long_opt(payload, "idle_seconds", &idle_seconds, &has_idle);
@@ -5513,21 +5539,7 @@ static void handle_grappa_whois_bundle_event(int fd, const char *nick,
                       idle_seconds);
     }
 
-    const json_value *channels = json_get(payload, "channels");
-    if (channels && json_type_of(channels) == JSON_ARRAY && json_len(channels) > 0) {
-        char line[480] = "";
-        size_t line_len = 0;
-        size_t count = json_len(channels);
-        for (size_t i = 0; i < count; i++) {
-            const char *chan = json_string(json_at(channels, i));
-            if (!chan) continue;
-            int written = snprintf(line + line_len, sizeof(line) - line_len, "%s%s",
-                                    line_len ? " " : "", chan);
-            if (written > 0 && (size_t)written < sizeof(line) - line_len) line_len += (size_t)written;
-        }
-        send_line(fd, ":%s 319 %s %s :%s", IRCD_SERVER, nick, target, line);
-    }
-
+    /* IRCv3/solanum-only fields — no fixed bahamut position, clustered before 318. */
     const char *account = NULL;
     json_str_opt(payload, "account", &account);
     if (account) send_line(fd, ":%s 330 %s %s %s :is logged in as", IRCD_SERVER, nick, target, account);
