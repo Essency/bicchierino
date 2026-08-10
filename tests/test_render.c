@@ -169,6 +169,105 @@ TEST(a_nul_truncates_the_argument_and_cannot_inject) {
     check_single_line("nul", buf, len);
 }
 
+/* ── pending_self_channel set — issue #73 ────────────────────────────
+ *
+ * `remember_pending_self_channel` / `consume_pending_self_channel` are
+ * the join/part analogue of `remember_pending_self_id` /
+ * `consume_pending_self_id`. These tests assert:
+ *
+ *   1. A channel this connection issued (in the pending set) is consumed
+ *      on the first matching event → own echo, suppress it.
+ *   2. A channel NOT in the pending set (sibling client's event) is NOT
+ *      consumed → forward it to the IRC client.
+ *   3. After consuming once the entry is gone — a second identical event
+ *      is NOT consumed (sibling join that happened to be the same channel
+ *      after the echo was already matched).
+ *   4. Join and part sets are independent — a channel in the join set is
+ *      not matched by a part consume and vice versa.
+ *   5. Matching is case-insensitive (folded keys): a channel recorded
+ *      as "#ABC" is consumed by "#abc".
+ */
+
+/* Thin wrappers so the tests don't need to manage the raw [CAP][SZ] types
+ * by hand — just a mini session with two pending sets. */
+struct pending_ch_fixture {
+    char join_set[PENDING_SELF_CH_CAP][PENDING_SELF_CH_SZ];
+    size_t join_count;
+    char part_set[PENDING_SELF_CH_CAP][PENDING_SELF_CH_SZ];
+    size_t part_count;
+};
+
+static void pf_remember_join(struct pending_ch_fixture *f, const char *ch) {
+    char folded[PENDING_SELF_CH_SZ];
+    ascii_fold_lower(ch, folded, sizeof(folded));
+    remember_pending_self_channel(f->join_set, &f->join_count, folded);
+}
+static void pf_remember_part(struct pending_ch_fixture *f, const char *ch) {
+    char folded[PENDING_SELF_CH_SZ];
+    ascii_fold_lower(ch, folded, sizeof(folded));
+    remember_pending_self_channel(f->part_set, &f->part_count, folded);
+}
+static bool pf_consume_join(struct pending_ch_fixture *f, const char *ch) {
+    char folded[PENDING_SELF_CH_SZ];
+    ascii_fold_lower(ch, folded, sizeof(folded));
+    return consume_pending_self_channel(f->join_set, &f->join_count, folded);
+}
+static bool pf_consume_part(struct pending_ch_fixture *f, const char *ch) {
+    char folded[PENDING_SELF_CH_SZ];
+    ascii_fold_lower(ch, folded, sizeof(folded));
+    return consume_pending_self_channel(f->part_set, &f->part_count, folded);
+}
+
+/* Own echo: recorded channel IS in the pending set → consumed (suppress). */
+TEST(pending_join_own_echo_is_consumed) {
+    struct pending_ch_fixture f = {0};
+    pf_remember_join(&f, "#bicchierino");
+    CHECK(pf_consume_join(&f, "#bicchierino") == true);
+    CHECK(f.join_count == 0);
+}
+
+/* Sibling event: channel NOT in the set → NOT consumed (forward). */
+TEST(pending_join_sibling_event_not_consumed) {
+    struct pending_ch_fixture f = {0};
+    pf_remember_join(&f, "#mine");
+    /* A different channel — sibling joined somewhere else. */
+    CHECK(pf_consume_join(&f, "#theirs") == false);
+    /* The pending entry for #mine must still be there. */
+    CHECK(f.join_count == 1);
+}
+
+/* Consumed only once: a second identical event is NOT in the set any more. */
+TEST(pending_join_consumed_only_once) {
+    struct pending_ch_fixture f = {0};
+    pf_remember_join(&f, "#once");
+    CHECK(pf_consume_join(&f, "#once") == true);  /* own echo — suppress */
+    CHECK(pf_consume_join(&f, "#once") == false); /* sibling join after echo — forward */
+}
+
+/* Join and part sets are independent. */
+TEST(pending_join_and_part_sets_are_independent) {
+    struct pending_ch_fixture f = {0};
+    pf_remember_join(&f, "#chan");
+    /* A part consume must NOT match what is in the join set. */
+    CHECK(pf_consume_part(&f, "#chan") == false);
+    CHECK(f.join_count == 1); /* join entry still present */
+
+    pf_remember_part(&f, "#chan");
+    CHECK(pf_consume_part(&f, "#chan") == true);
+    CHECK(f.part_count == 0);
+    /* And the join entry is still untouched. */
+    CHECK(pf_consume_join(&f, "#chan") == true);
+}
+
+/* Matching is case-insensitive (folded keys). */
+TEST(pending_join_matching_is_case_insensitive) {
+    struct pending_ch_fixture f = {0};
+    pf_remember_join(&f, "#MyChannel");
+    /* Event arrives with differently-cased channel name. */
+    CHECK(pf_consume_join(&f, "#mychannel") == true);
+    CHECK(f.join_count == 0);
+}
+
 int main(void) {
     RUN(a_clean_line_is_unchanged);
     RUN(a_crlf_in_a_field_does_not_start_a_second_line);
@@ -178,5 +277,10 @@ int main(void) {
     RUN(injection_inside_an_oversized_field);
     RUN(injection_in_a_non_trailing_field);
     RUN(a_nul_truncates_the_argument_and_cannot_inject);
+    RUN(pending_join_own_echo_is_consumed);
+    RUN(pending_join_sibling_event_not_consumed);
+    RUN(pending_join_consumed_only_once);
+    RUN(pending_join_and_part_sets_are_independent);
+    RUN(pending_join_matching_is_case_insensitive);
     return test_report();
 }
