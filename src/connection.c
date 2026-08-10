@@ -31,6 +31,13 @@
 #define MAX_DM_PEERS 64  /* one per person ever DMed on this network — same
                            * "hostile-response backstop, not a real ceiling"
                            * posture as MAX_CHANNELS */
+/* Capacity and per-entry size for `pending_self_join_channels` /
+ * `pending_self_part_channels` on `struct grappa_session`. Sized the same
+ * way as `pending_self_msg_ids` (16): a comma-separated JOIN/PART can name
+ * several channels at once, but even a pathological client issuing many
+ * before the WS echoes land is well within 8 outstanding entries. */
+#define PENDING_SELF_CH_CAP 8
+#define PENDING_SELF_CH_SZ  128
 #define CHATHISTORY_RING_SIZE 256 /* every (id, server_time) pair this
                                     * connection has seen live, oldest
                                     * evicted on overflow — same
@@ -518,6 +525,18 @@ struct grappa_session {
      * fixed-size buffer in this file). */
     long pending_self_msg_ids[16];
     size_t pending_self_msg_count;
+
+    /* Same multi-client correlation fix as `pending_self_msg_ids`, but for
+     * join/part: records every channel THIS connection issued a JOIN or PART
+     * for (stored folded), so the matching WS echo can be identified as
+     * "my own, already rendered locally" and suppressed. A sibling client's
+     * join/part on the same channel would NOT be in this set and therefore
+     * passes through normally. See issue #73, and the comment above
+     * `pending_self_msg_ids` for the full multi-client motivation. */
+    char pending_self_join_channels[PENDING_SELF_CH_CAP][PENDING_SELF_CH_SZ];
+    size_t pending_self_join_count;
+    char pending_self_part_channels[PENDING_SELF_CH_CAP][PENDING_SELF_CH_SZ];
+    size_t pending_self_part_count;
 
     /* Real gap found live (testing a DM to a real user with a second
      * client listening, right after the multi-client fixes above):
@@ -1530,6 +1549,38 @@ static bool consume_pending_self_id(struct grappa_session *sess, long id) {
     return false;
 }
 
+/* Same shift-and-insert / scan-and-remove pattern as
+ * `remember_pending_self_id` / `consume_pending_self_id`, but operating on
+ * a set of FOLDED channel name strings rather than integer ids.  Used by
+ * `handle_join`/`handle_part` to record outbound JOIN/PART targets, and by
+ * `bridge_event_dispatch` to distinguish "my own echo, already rendered" from
+ * "a sibling client's event that I have not seen yet". */
+static void remember_pending_self_channel(char (*set)[PENDING_SELF_CH_SZ], size_t *count,
+                                           const char *folded_ch) {
+    if (*count == PENDING_SELF_CH_CAP) {
+        memmove(set[0], set[1], (PENDING_SELF_CH_CAP - 1) * PENDING_SELF_CH_SZ);
+        (*count)--;
+    }
+    snprintf(set[*count], PENDING_SELF_CH_SZ, "%s", folded_ch);
+    (*count)++;
+}
+
+/* Returns true and removes the entry if `folded_ch` is found (this is my
+ * own echo, already rendered — suppress); false leaves the set untouched
+ * (not mine, or already consumed — render it). */
+static bool consume_pending_self_channel(char (*set)[PENDING_SELF_CH_SZ], size_t *count,
+                                          const char *folded_ch) {
+    for (size_t i = 0; i < *count; i++) {
+        if (strcmp(set[i], folded_ch) != 0) continue;
+        size_t remaining = *count - i - 1;
+        if (remaining)
+            memmove(set[i], set[i + 1], remaining * PENDING_SELF_CH_SZ);
+        (*count)--;
+        return true;
+    }
+    return false;
+}
+
 /* See `chathistory_ring_ids`'s own doc on `struct grappa_session`. A
  * true circular buffer (unlike `remember_pending_self_id`'s shift-based
  * 16-entry set above): 256 entries is past the point where a per-insert
@@ -1765,6 +1816,14 @@ static void handle_join(int fd, struct http_client *hc, struct bridge *br, bool 
 
         if (!send_join_rest(hc, cfg, sess, channel, key[0] ? key : NULL)) continue;
 
+        /* Record the channel so bridge_event_dispatch can distinguish our
+         * own optimistic echo (already rendered below) from a sibling
+         * client's independent join on the same channel — issue #73. */
+        char folded_join_ch[PENDING_SELF_CH_SZ];
+        ascii_fold_lower(channel, folded_join_ch, sizeof(folded_join_ch));
+        remember_pending_self_channel(sess->pending_self_join_channels,
+                                       &sess->pending_self_join_count, folded_join_ch);
+
         if (find_channel_index(sess, channel) == sess->channel_count &&
             sess->channel_count < MAX_CHANNELS) {
             size_t idx = sess->channel_count++;
@@ -1808,6 +1867,14 @@ static void handle_part(int fd, struct http_client *hc, struct bridge *br, bool 
     char channel[128];
     while (next_csv_token(&channels_cursor, channel, sizeof(channel))) {
         if (!send_part_rest(hc, cfg, sess, channel)) continue;
+
+        /* Record the channel so bridge_event_dispatch can distinguish our
+         * own optimistic echo (already rendered below) from a sibling
+         * client's independent part on the same channel — issue #73. */
+        char folded_part_ch[PENDING_SELF_CH_SZ];
+        ascii_fold_lower(channel, folded_part_ch, sizeof(folded_part_ch));
+        remember_pending_self_channel(sess->pending_self_part_channels,
+                                       &sess->pending_self_part_count, folded_part_ch);
 
         size_t idx = find_channel_index(sess, channel);
         if (idx != sess->channel_count) {
@@ -4185,7 +4252,7 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
      * would leave the user with zero confirmation their kick worked,
      * exactly the bug this scoping fixes.
      *
-     * `is_self` alone is NOT sufficient for privmsg/notice/action —
+     * `is_self` alone is NOT sufficient for ANY of the suppressed kinds —
      * see the `pending_self_msg_ids` doc on `struct grappa_session`:
      * two simultaneous bicchierino connections sharing one grappa
      * identity both compute `is_self == true` for EITHER connection's
@@ -4193,7 +4260,8 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
      * message loss, not just self-echo suppression, found live testing
      * exactly that scenario. The privmsg/notice/action branch below
      * additionally correlates by the message's own `id` before
-     * suppressing. */
+     * suppressing; the join/part branches use `pending_self_join/part_channels`
+     * the same way (issue #73). */
     bool is_self = folded_own_nick[0] && strcmp(folded_sender, folded_own_nick) == 0;
 
     char prefix[196];
@@ -4297,13 +4365,27 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
     }
 
     if (strcmp(kind, "join") == 0) {
-        if (is_self) return;
+        /* Suppress our own optimistic echo only when the channel is in
+         * `pending_self_join_channels` — i.e. THIS connection just issued
+         * the JOIN and `handle_join` already sent the local echo. A bare
+         * `is_self` check would also suppress a SIBLING client's
+         * independent join (cicchetto, another bicchierino on the same
+         * account), leaving that client's view of the channel out of sync
+         * with the session — issue #73. Same pattern as `pending_self_msg_ids`
+         * for privmsg/notice/action. */
+        if (is_self && consume_pending_self_channel(sess->pending_self_join_channels,
+                                                    &sess->pending_self_join_count,
+                                                    folded_channel)) return;
         send_tagged_line(fd, sess, server_time_ms, ":%s JOIN :%s", prefix, channel);
         return;
     }
 
     if (strcmp(kind, "part") == 0) {
-        if (is_self) return;
+        /* Same as the join case above — suppress only when correlated with
+         * THIS connection's own PART, not a sibling's. Issue #73. */
+        if (is_self && consume_pending_self_channel(sess->pending_self_part_channels,
+                                                    &sess->pending_self_part_count,
+                                                    folded_channel)) return;
         const char *reason = NULL;
         json_str_opt(message, "body", &reason);
         if (reason)
