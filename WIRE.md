@@ -321,17 +321,14 @@ JSON discriminant (`Session.Wire`, `wire.ex`):
 - `"whois_bundle"` — every field nullable, populated as 311/312/313/
   317/319 arrive and broadcast whole on 318. `user == nil` (nothing
   else populated either) is grappa's own "no such nick" shape → 401
-  before the always-sent 318. bahamut (azzurra) never fires the
-  solanum-only fields (`account`/`secure`/`secure_cipher`/`certfp`) or
-  the P-0a boolean flags (`is_admin`/`is_chanop`/...) — read but not
-  separately rendered, since they carry no dedicated RFC numeric to
-  round-trip through on their own; `extra_lines` (`{numeric, text}`
-  pairs, 320 + any unhandled WHOIS-leg numeric) already covers verbatim
-  relay of whatever a solanum-family network fires that isn't
-  special-cased. **Confirmed live against real data**: `WHOIS RealUser` on
-  azzurra correctly rendered `RealUser` as a genuine Server Administrator
-  (313, real `oper_text`) with a real, sigil-prefixed channel list
-  (319).
+  before the always-sent 318. P-0a bahamut fields (#72) rendered after
+  313 in a fixed order: `actually_host`/`actually_ip` → 378,
+  `umodes` → 379, `is_registered` → 307, `using_ssl` → 671, and six
+  boolean flags (`is_admin`, `is_services_admin`, `is_helper`,
+  `is_chanop`, `is_agent`, `is_java`) each → 320 with the ircd's own
+  trailing text. Solanum-only fields (`account`/`secure`/`certfp`) and
+  `extra_lines` (`{numeric, text}` pairs, 320 + any unhandled
+  WHOIS-leg numeric) relayed verbatim.
 - `"banlist_bundle"` — `{network, channel, entries: [{mask, setter,
   set_ts}]}`. `set_ts` is the raw upstream unix-epoch STRING (grappa
   never formats it — no-localized-strings-server-side rule) — rendered

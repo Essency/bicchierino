@@ -5305,15 +5305,30 @@ static void handle_grappa_who_reply_event(int fd, const char *nick,
  * (`Session.Wire.whois_bundle_payload/0`, `wire.ex:444-506`) — every
  * field nullable, populated as 311/312/313/317/319 (plus the solanum-only
  * 330/301/671/276 + free-form `extra_lines`) arrive upstream, broadcast
- * whole on 318. Azzurra (bahamut) never fires the solanum-only fields
- * (`account`, `secure*`, `certfp`) or the P-0a boolean flags
- * (`is_admin`/`is_chanop`/...) — those have no dedicated RFC numeric to
- * round-trip through on their own, so they're read from the bundle but
- * not separately rendered here; `extra_lines` (320 + any unhandled
- * WHOIS-leg numeric) already covers verbatim relay of anything a NEWER
- * network fires that this function doesn't special-case. `user == NULL`
- * with nothing else populated is grappa's own "no such nick" shape
- * (`wire.ex:438-440`) — rendered as 401 before the always-sent 318. */
+ * whole on 318.
+ *
+ * P-0a fields (issue #72): eleven bahamut-specific WHOIS-leg fields that
+ * grappa parses out of the numeric stream and delivers as typed bundle
+ * members — `actually_host`/`actually_ip` (378→378), `umodes` (326→379),
+ * `is_registered` (307→307), `using_ssl` (275→671), and six booleans
+ * (`is_admin`, `is_services_admin`, `is_helper`, `is_chanop`, `is_agent`,
+ * `is_java`) each rendered as a 320 RPL_WHOISSPECIAL line with the same
+ * human-readable string the ircd itself would send. Because the typed
+ * payload loses the original interleaving order, all P-0a fields are
+ * emitted in a fixed order after 313 (the closest approximation a bridge
+ * can produce without replaying the raw numeric stream).
+ *
+ * `using_ssl` (bahamut 275) and `secure` (solanum 671) are distinct typed
+ * fields from distinct ircd families; both map to 671 here. In practice
+ * a given network fires exactly one of the two.
+ *
+ * `extra_lines` ({numeric, text} pairs, 320 + any unhandled WHOIS-leg
+ * numeric) covers verbatim relay of anything a newer network fires that
+ * this function doesn't special-case.
+ *
+ * `user == NULL` with nothing else populated is grappa's own "no such
+ * nick" shape (`wire.ex:438-440`) — rendered as 401 before the
+ * always-sent 318. */
 static void handle_grappa_whois_bundle_event(int fd, const char *nick,
                                               const json_value *payload) {
     const char *target = NULL;
@@ -5347,6 +5362,59 @@ static void handle_grappa_whois_bundle_event(int fd, const char *nick,
         send_line(fd, ":%s 313 %s %s :%s", IRCD_SERVER, nick, target,
                   oper_text ? oper_text : "is an IRC operator");
     }
+
+    /* P-0a bahamut fields — emitted in a fixed order after 313 (#72). */
+    const char *actually_host = NULL, *actually_ip = NULL;
+    json_str_opt(payload, "actually_host", &actually_host);
+    json_str_opt(payload, "actually_ip", &actually_ip);
+    if (actually_host || actually_ip)
+        send_line(fd, ":%s 378 %s %s :is connecting from %s [%s]", IRCD_SERVER, nick, target,
+                  actually_host ? actually_host : "*", actually_ip ? actually_ip : "");
+
+    const char *umodes = NULL;
+    json_str_opt(payload, "umodes", &umodes);
+    if (umodes)
+        send_line(fd, ":%s 379 %s %s :is using modes %s", IRCD_SERVER, nick, target, umodes);
+
+    bool is_registered = false;
+    json_bool_dflt(payload, "is_registered", false, &is_registered);
+    if (is_registered)
+        send_line(fd, ":%s 307 %s %s :has identified for this nick", IRCD_SERVER, nick, target);
+
+    bool using_ssl = false;
+    json_bool_dflt(payload, "using_ssl", false, &using_ssl);
+    if (using_ssl)
+        send_line(fd, ":%s 671 %s %s :is using a secure connection (SSL)", IRCD_SERVER, nick, target);
+
+    bool is_admin = false;
+    json_bool_dflt(payload, "is_admin", false, &is_admin);
+    if (is_admin)
+        send_line(fd, ":%s 320 %s %s :is an IRC Server Administrator", IRCD_SERVER, nick, target);
+
+    bool is_services_admin = false;
+    json_bool_dflt(payload, "is_services_admin", false, &is_services_admin);
+    if (is_services_admin)
+        send_line(fd, ":%s 320 %s %s :is a Services Administrator", IRCD_SERVER, nick, target);
+
+    bool is_helper = false;
+    json_bool_dflt(payload, "is_helper", false, &is_helper);
+    if (is_helper)
+        send_line(fd, ":%s 320 %s %s :is a Help Operator", IRCD_SERVER, nick, target);
+
+    bool is_chanop = false;
+    json_bool_dflt(payload, "is_chanop", false, &is_chanop);
+    if (is_chanop)
+        send_line(fd, ":%s 320 %s %s :is a channel operator", IRCD_SERVER, nick, target);
+
+    bool is_agent = false;
+    json_bool_dflt(payload, "is_agent", false, &is_agent);
+    if (is_agent)
+        send_line(fd, ":%s 320 %s %s :is a Services Agent", IRCD_SERVER, nick, target);
+
+    bool is_java = false;
+    json_bool_dflt(payload, "is_java", false, &is_java);
+    if (is_java)
+        send_line(fd, ":%s 320 %s %s :is a Java User", IRCD_SERVER, nick, target);
 
     long idle_seconds = 0;
     bool has_idle = false;
