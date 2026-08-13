@@ -64,7 +64,10 @@ static void render_005(const char *payload_json, char *out, size_t out_sz) {
     }
     struct grappa_session sess;
     memset(&sess, 0, sizeof(sess));
-    /* isupport_005_sent defaults to false — the function will send. */
+    /* welcome_sent = true: simulate the Case B path (post-welcome) so the
+     * handler sends immediately rather than caching.  isupport_005_sent
+     * stays false so the dedup guard does not fire. */
+    sess.welcome_sent = true;
 
     int tx = open_client();
     if (tx < 0) {
@@ -115,7 +118,7 @@ TEST(statusmsg_matches_prefix_sigils_for_two_level_prefix) {
     const char *sm = strstr(buf, "STATUSMSG=");
     CHECK(sm != NULL);
     /* The STATUSMSG token ends at the next space; % must not be in it. */
-    const char *sm_end = strchr(sm, ' ');
+    const char *sm_end = sm ? strchr(sm, ' ') : NULL;
     if (sm_end) {
         size_t sm_len = (size_t)(sm_end - sm);
         char sm_tok[64];
@@ -141,6 +144,8 @@ TEST(isupport_005_is_sent_only_once_per_session) {
 
     struct grappa_session sess;
     memset(&sess, 0, sizeof(sess));
+    /* welcome_sent = true: exercise the Case B (post-welcome) send path. */
+    sess.welcome_sent = true;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { FAIL("socketpair"); json_free(d); return; }

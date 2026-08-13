@@ -153,7 +153,7 @@ TEST(send_welcome_with_cache_emits_full_005) {
     /* The 005 line must include PREFIX and CHANMODES. */
     CHECK(strstr(out, "PREFIX=(ohv)@%+") != NULL);
     CHECK(strstr(out, "CHANMODES=bz,,l,imnpst") != NULL);
-    CHECK(strstr(out, "STATUSMSG=@+") != NULL);
+    CHECK(strstr(out, "STATUSMSG=@%+") != NULL);
 
     /* And welcome_sent + isupport_005_sent must now both be true. */
     CHECK(sess.welcome_sent);

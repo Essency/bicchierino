@@ -1253,10 +1253,10 @@ static void send_welcome(int fd, const char *nick, struct grappa_session *sess) 
          * reaches the client after the correct prefix set is already in place. */
         send_line(fd,
                   ":%s 005 %s CHANTYPES=# PREFIX=(%s)%s CHANMODES=%s CASEMAPPING=ascii "
-                  "STATUSMSG=@+ CHATHISTORY=%d :are supported by this server",
+                  "STATUSMSG=%s CHATHISTORY=%d :are supported by this server",
                   IRCD_SERVER, nick,
                   sess->cached_prefix_letters, sess->cached_prefix_sigils,
-                  sess->cached_chanmodes, CHATHISTORY_MAX_LIMIT);
+                  sess->cached_chanmodes, sess->cached_prefix_sigils, CHATHISTORY_MAX_LIMIT);
         sess->isupport_005_sent = true;
     } else {
         send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii CHATHISTORY=%d :are supported by this server",
