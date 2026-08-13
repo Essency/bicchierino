@@ -5191,10 +5191,20 @@ static void handle_grappa_isupport_changed_event(int fd, const char *nick,
     letters[ll] = '\0';
     sigils[sl] = '\0';
 
+    /* STATUSMSG is derived from the same `sigils[]` already built for
+     * PREFIX rather than a second hardcoded literal.  This keeps both
+     * tokens in sync whenever the real isupport_changed event carries a
+     * PREFIX that differs from the bahamut default (op/halfop/voice).
+     *
+     * Caveat (verified for azzurra/bahamut, not a universal IRC guarantee):
+     * this assumes every PREFIX status level is also a valid STATUSMSG
+     * target.  bahamut's own 005 confirms this (STATUSMSG=@%+ matches
+     * PREFIX=(ohv)@%+ exactly).  A future ircd that restricts STATUSMSG
+     * to a subset of PREFIX would need an explicit wire field here. */
     send_line(fd,
               ":%s 005 %s CHANTYPES=# PREFIX=(%s)%s CHANMODES=%s CASEMAPPING=ascii "
-              "STATUSMSG=@+ :are supported by this server",
-              IRCD_SERVER, nick, letters, sigils, chanmodes);
+              "STATUSMSG=%s :are supported by this server",
+              IRCD_SERVER, nick, letters, sigils, chanmodes, sigils);
     sess->isupport_005_sent = true;
 }
 
