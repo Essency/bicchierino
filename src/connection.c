@@ -494,6 +494,24 @@ struct grappa_session {
      * just quieter. */
     bool isupport_005_sent;
 
+    /* Bootstrap ordering fix (#82): grappa v1.1.0 pushes `isupport_changed`
+     * in the user-topic snapshot (`session_snapshot/2`), which arrives while
+     * `join_user_topic` blocks on its `bridge_join` reply — before
+     * `send_welcome` is called. To include the live PREFIX/CHANMODES in the
+     * client's initial 005 (rather than sending a partial 005 now and a
+     * corrected one moments later, which is too late for WeeChat's nicklist-
+     * group construction at JOIN time), the event handler caches these values
+     * when `welcome_sent` is false and lets `send_welcome` emit them directly.
+     * After `send_welcome` sets `welcome_sent`, any later `isupport_changed`
+     * that arrives (once per channel-topic join, as before) is either sent
+     * immediately (if this is Case B, where `send_welcome` already fired
+     * before the bridge came up) or skipped via `isupport_005_sent`. */
+    bool welcome_sent;           /* true after send_welcome has been called */
+    char cached_prefix_letters[32]; /* e.g. "ohv" — from the pre-welcome
+                                     * isupport_changed, read by send_welcome */
+    char cached_prefix_sigils[32];  /* e.g. "@%+" — parallel to above */
+    char cached_chanmodes[128];     /* e.g. "bz,,l,imnpst" */
+
     /* Real bug found live, testing two simultaneous bicchierino
      * connections for the SAME grappa account: the old is_self check
      * (folded sender == own nick) can't tell "this is MY OWN optimistic
@@ -1199,41 +1217,56 @@ static bool ensure_network_connected(struct http_client *hc, const struct config
 /* Registration numerics — 001-005 + MOTD (375/372/376), same shape as
  * shottino's own ircd_register.
  *
- * The 005 sent HERE is deliberately minimal, not the bahamut-shaped
- * guess an earlier version of this function sent (`PREFIX=(ohv)@%+
- * CHANMODES=beI,k,l,...`, copied from `ISupport.default/0`). Caught
- * live: that guess was WRONG for the real network (azzurra's actual
- * CHANMODES type-A class is `bz`, not `beI` — confirmed the moment the
- * first real `isupport_changed` arrived) — and CHANMODES/PREFIX are
- * only ever right for a bahamut-shaped network to begin with, not a
- * promise for every network an account might have bound. Asserting a
- * value bicchierino has not actually verified for THIS network is a
- * confidently WRONG numeric — worse than a missing one, since a client
- * will act on it. So: only `CHANTYPES=#` here (bicchierino's own
- * decision, not network-sourced — grappa's ISupport struct doesn't even
- * track it) and `CASEMAPPING=ascii` (grappa's own pre-005
- * `Session.Server` fallback, `ISupport.default/0` — NOT corrected by
- * `isupport_changed` later since that event never carries casemapping
- * at all, confirmed directly against `ISupport.t/0`'s wire projection,
- * so this is the best-available truth for the WHOLE session, not a
- * temporary guess). PREFIX/CHANMODES/STATUSMSG are omitted entirely
- * until `handle_grappa_isupport_changed_event` sends the real,
- * network-confirmed 005 — arriving within moments of the first
- * channel-shaped topic join, WIRE.md §3/§6. */
-static void send_welcome(int fd, const char *nick, const char *subject_name) {
+ * The 005 emitted here includes PREFIX/CHANMODES/STATUSMSG when
+ * `sess->cached_prefix_letters` is non-empty — i.e. when the bootstrap
+ * called `join_user_topic` before this function, letting grappa v1.1.0's
+ * user-topic `isupport_changed` push populate those fields first (#82).
+ * If the bridge never came up, or this is Case B (no default network),
+ * the cached fields are empty and the 005 falls back to CHANTYPES/
+ * CASEMAPPING only — same as before, correct: asserting a value not yet
+ * confirmed for this network would be a confidently WRONG numeric. The
+ * earlier version's hard-coded guess (`PREFIX=(ohv)@%+` from
+ * `ISupport.default/0`) was caught live to be wrong for azzurra
+ * (CHANMODES type-A is `bz`, not `beI`).
+ *
+ * CASEMAPPING=ascii — grappa's own pre-005 `Session.Server` fallback
+ * (`ISupport.default/0`). NOT corrected by `isupport_changed` (that
+ * event never carries casemapping — confirmed against `ISupport.t/0`'s
+ * wire projection), so this is the best-available truth for the whole
+ * session, cached or not.
+ *
+ * Sets `sess->welcome_sent` and `sess->isupport_005_sent` (the latter
+ * only when PREFIX was included) so `handle_grappa_isupport_changed_event`
+ * knows whether to send 005 immediately on later topic joins (Case B,
+ * where this fired before the bridge) or skip it (already included). */
+static void send_welcome(int fd, const char *nick, struct grappa_session *sess) {
     send_line(fd, ":%s 001 %s :Welcome to grappa via bicchierino, %s", IRCD_SERVER, nick,
-              subject_name);
+              sess->subject_name);
     send_line(fd, ":%s 002 %s :Your host is %s, running bicchierino %s", IRCD_SERVER, nick,
               IRCD_SERVER, BICCHIERINO_VERSION);
     send_line(fd, ":%s 003 %s :This server has no particular birthday", IRCD_SERVER, nick);
     send_line(fd, ":%s 004 %s %s bicchierino-%s o o", IRCD_SERVER, nick, IRCD_SERVER,
               BICCHIERINO_VERSION);
-    send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii CHATHISTORY=%d :are supported by this server",
-              IRCD_SERVER, nick, CHATHISTORY_MAX_LIMIT);
+    if (sess->cached_prefix_letters[0]) {
+        /* Live PREFIX/CHANMODES already cached from user-topic isupport_changed
+         * (#82): emit the full 005 now so every subsequent JOIN (present_channels)
+         * reaches the client after the correct prefix set is already in place. */
+        send_line(fd,
+                  ":%s 005 %s CHANTYPES=# PREFIX=(%s)%s CHANMODES=%s CASEMAPPING=ascii "
+                  "STATUSMSG=%s CHATHISTORY=%d :are supported by this server",
+                  IRCD_SERVER, nick,
+                  sess->cached_prefix_letters, sess->cached_prefix_sigils,
+                  sess->cached_chanmodes, sess->cached_prefix_sigils, CHATHISTORY_MAX_LIMIT);
+        sess->isupport_005_sent = true;
+    } else {
+        send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii CHATHISTORY=%d :are supported by this server",
+                  IRCD_SERVER, nick, CHATHISTORY_MAX_LIMIT);
+    }
     send_line(fd, ":%s 375 %s :- %s message of the day -", IRCD_SERVER, nick, IRCD_SERVER);
     send_line(fd, ":%s 372 %s :- bicchierino is bridging this connection to grappa.", IRCD_SERVER,
               nick);
     send_line(fd, ":%s 376 %s :End of /MOTD command.", IRCD_SERVER, nick);
+    sess->welcome_sent = true;
 }
 
 /* Presents channels already known-joined on grappa as JOIN lines, same
@@ -1354,6 +1387,14 @@ static void send_network_reminder(int fd, const char *nick, const struct grappa_
  * hidden->visible TRANSITION, and a client that never reports visible
  * never makes one).
  *
+ * The bootstrap splits this into two phases (#82): join_user_topic joins
+ * only the user topic (triggering the user-topic isupport_changed snapshot
+ * that grappa v1.1.0 now pushes there), then send_welcome can use the
+ * cached PREFIX/CHANMODES in its 005, and join_channel_topics joins
+ * everything else after present_channels. Case B (network-select path)
+ * still calls join_grappa_topics, which combines both phases, since
+ * send_welcome has already fired before bridge_connect in that path.
+ *
  * Best-effort throughout, matching the existing precedent from the
  * user-topic-only smoke test this replaces: a failure here is logged,
  * never sent to the IRC client as an ERROR — the client already got
@@ -1384,8 +1425,13 @@ static void bridge_event_dispatch(void *ctx_raw, const char *payload, size_t pay
     handle_grappa_event(ctx->fd, ctx->nick, ctx->br, ctx->sess, payload, payload_len);
 }
 
-static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
-                                struct grappa_session *sess) {
+/* Phase 1 of the two-phase topic join (#82): join the user topic only.
+ * In the Case A bootstrap this runs BEFORE send_welcome, so that grappa
+ * v1.1.0's user-topic isupport_changed snapshot is processed synchronously
+ * by bridge_join's wait loop and the cached PREFIX/CHANMODES are available
+ * for send_welcome's own 005. */
+static void join_user_topic(int fd, const char *nick, struct bridge *br,
+                             struct grappa_session *sess) {
     struct bridge_event_ctx ctx = {fd, nick, br, sess};
 
     char user_topic[160];
@@ -1396,6 +1442,16 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
     } else {
         fprintf(stderr, "bicchierino: join %s failed\n", user_topic);
     }
+}
+
+/* Phase 2 of the two-phase topic join (#82): join the server window,
+ * per-channel topics, the DM-listener topic, and push visibility.
+ * In the Case A bootstrap this runs AFTER send_welcome and present_channels,
+ * so no live channel-topic frame can arrive before the client has seen
+ * JOIN for its channels. */
+static void join_channel_topics(int fd, const char *nick, struct bridge *br,
+                                 struct grappa_session *sess) {
+    struct bridge_event_ctx ctx = {fd, nick, br, sess};
 
     /* The `$server` window is NOT derived from the channel list and never
      * appears in it: `GET /networks/:slug/channels` merges the credential
@@ -1450,6 +1506,8 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
     }
 
     if (sess->user_join_ref) {
+        char user_topic[160];
+        snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess->subject_name);
         if (bridge_push(br, user_topic, sess->user_join_ref, "visibility",
                          "{\"visible\":true}")) {
             fprintf(stderr, "bicchierino: visibility:true pushed\n");
@@ -1457,6 +1515,15 @@ static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
             fprintf(stderr, "bicchierino: visibility push failed\n");
         }
     }
+}
+
+/* Combines join_user_topic + join_channel_topics for the Case B network-
+ * select path (handle_grappa_network), where send_welcome has already
+ * fired before bridge_connect and the two-phase split is not needed. */
+static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
+                                struct grappa_session *sess) {
+    join_user_topic(fd, nick, br, sess);
+    join_channel_topics(fd, nick, br, sess);
 }
 
 /* WIRE.md §2.5's corrected text: sending a message is REST, not a WS
@@ -5109,27 +5176,31 @@ static void handle_grappa_members_seeded_event(int fd, const char *nick,
 
 /* WIRE.md §3/§6: `isupport_changed` payload is `{kind, network_id,
  * chanmodes_a..d: [letters...], prefix: {letter => sigil}}`
- * (`Session.Wire.isupport_changed/2`, `wire.ex:113-131`) — the LIVE
- * values behind the pre-005 fallback `send_welcome` sends at
- * registration (`ISupport.default/0`, only right for a bahamut-shaped
- * network). Re-sends a corrected 005 whenever this arrives — pushed on
- * EVERY channel-shaped topic join (confirmed live: once per channel,
- * again for the DM-listener topic), so a session with several channels
- * re-announces 005 more than once; harmless, real clients (irssi/
- * weechat) handle a repeated 005 fine, and there is no cheap way from
- * this event alone to tell "genuinely changed" from "same value, next
- * topic's snapshot" — CHANTYPES/CASEMAPPING/STATUSMSG stay
- * bicchierino's own fallback values verbatim: confirmed directly
- * against `ISupport.t/0` that only `chanmodes`/`prefix` reach this wire
- * event at all — `casemapping`/`statusmsg` are tracked server-side but
- * never exposed here, so there is nothing live to prefer over the
- * fallback for those three tokens.
+ * (`Session.Wire.isupport_changed/2`, `wire.ex:113-131`).
  *
- * Sent only ONCE per connection (`sess->isupport_005_sent`) — see its
- * own doc on `struct grappa_session`: with the DM-peer-topic fix a
- * normal session now joins many more channel-shaped topics, each
- * pushing this same event, and re-announcing an identical 005 that
- * many times over is pure noise a real client gains nothing from. */
+ * As of grappa v1.1.0 this event is also pushed in the user-topic
+ * snapshot (`session_snapshot/2`) — before any channel topic is joined.
+ * This means the bootstrap can now receive the live PREFIX/CHANMODES
+ * before `send_welcome` is called. Two-path behaviour:
+ *
+ * - `!sess->welcome_sent` (bootstrap's pre-welcome user-topic join, #82):
+ *   parse and cache `letters`/`sigils`/`chanmodes` into the session, but
+ *   do NOT send 005 yet — `send_welcome` will pick them up and include
+ *   them in its own 005 burst, so the client receives the correct PREFIX
+ *   before it ever sees a JOIN line for any channel.
+ *
+ * - `sess->welcome_sent` (Case B, where send_welcome fired before the
+ *   bridge came up; or any late-arriving event after welcome):
+ *   send the corrected 005 immediately if not already done
+ *   (`isupport_005_sent`), same as before. Pushed on every channel-shaped
+ *   topic join (once per channel, again for the DM-listener topic); sent
+ *   only once via `isupport_005_sent` since the values don't change
+ *   mid-session (one network, one ISUPPORT block per connection).
+ *
+ * CHANTYPES/CASEMAPPING/STATUSMSG stay bicchierino's own fallback values:
+ * confirmed against `ISupport.t/0` that only `chanmodes`/`prefix` reach
+ * this wire event — `casemapping`/`statusmsg` are tracked server-side but
+ * never exposed here. */
 static void handle_grappa_isupport_changed_event(int fd, const char *nick,
                                                    struct grappa_session *sess,
                                                    const json_value *payload) {
@@ -5190,6 +5261,14 @@ static void handle_grappa_isupport_changed_event(int fd, const char *nick,
     }
     letters[ll] = '\0';
     sigils[sl] = '\0';
+
+    if (!sess->welcome_sent) {
+        /* Pre-welcome (#82): cache for send_welcome to emit in its own 005. */
+        snprintf(sess->cached_prefix_letters, sizeof(sess->cached_prefix_letters), "%s", letters);
+        snprintf(sess->cached_prefix_sigils,  sizeof(sess->cached_prefix_sigils),  "%s", sigils);
+        snprintf(sess->cached_chanmodes,       sizeof(sess->cached_chanmodes),       "%s", chanmodes);
+        return;
+    }
 
     /* STATUSMSG is derived from the same `sigils[]` already built for
      * PREFIX rather than a second hardcoded literal.  This keeps both
@@ -6056,11 +6135,29 @@ void *connection_run(void *arg) {
     if (sess.network_resolved) {
         bool network_connected = ensure_network_connected(&hc, cfg, &sess);
         if (!fetch_joined_channels(fd, &hc, cfg, &sess)) goto cleanup;
-        /* `sess.network_nick` (set by `pick_network` just above), not
+
+        /* Bootstrap reorder (#82 — PREFIX before JOIN): connect the bridge
+         * and join the user topic BEFORE sending the welcome burst, so that
+         * grappa v1.1.0's user-topic isupport_changed snapshot is processed
+         * by bridge_join's synchronous wait loop and the live PREFIX/CHANMODES
+         * are cached in sess before send_welcome runs. This lets send_welcome
+         * include the correct PREFIX in its own 005 line — the one the IRC
+         * client sees before the first JOIN it ever receives for any channel.
+         *
+         * If the bridge fails to connect, send_welcome still runs with an
+         * empty cache (correct: no verified PREFIX available), and the live
+         * event bridge notice is sent after the welcome burst, same as before.
+         *
+         * `sess.network_nick` (set by `pick_network` just above), not
          * `reg.nick`, from here on — the one is live-tracked across a
          * later self nick_change, the other is a one-time registration
          * snapshot. Identical value at this exact point. */
-        send_welcome(fd, sess.network_nick, sess.subject_name);
+        br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
+        if (br_connected) {
+            join_user_topic(fd, sess.network_nick, &br, &sess);
+        }
+
+        send_welcome(fd, sess.network_nick, &sess);
         present_channels(fd, sess.network_nick, &sess);
 
         /* Registry identity is now known — "account@network".  Set it
@@ -6083,16 +6180,15 @@ void *connection_run(void *arg) {
                 "bicchierino: bootstrap OK: subject=%s network=%s(%ld) joined_channels=%zu\n",
                 sess.subject_name, sess.network_slug, sess.network_id, sess.channel_count);
 
-        /* The join sequence below proves every topic's reply is "ok" and
-         * pushes visibility, but doesn't itself consume the after-join
-         * snapshot pushes (query_windows_list, topic_changed, ...) that
-         * arrive as separate frames right after — those stay buffered
-         * in the OS socket until Phase 2's poll()-on-two-fds loop reads
-         * them. Isolated the same way the handshake was: a join failing
-         * here means the join sequence is broken, never the handshake. */
-        br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
+        /* Join the channel topics after present_channels (#82): no live
+         * channel-topic frame can arrive before the client has seen JOIN
+         * for its channels. The user topic was already joined above.
+         * The join sequence proves every topic's reply is "ok" and
+         * pushes visibility; snapshot pushes (query_windows_list,
+         * topic_changed, ...) stay buffered in the OS socket until
+         * Phase 2's poll()-on-two-fds loop reads them. */
         if (br_connected) {
-            join_grappa_topics(fd, sess.network_nick, &br, &sess);
+            join_channel_topics(fd, sess.network_nick, &br, &sess);
         } else {
             fprintf(stderr, "bicchierino: websocket handshake FAILED\n");
             send_line(fd,
@@ -6105,7 +6201,7 @@ void *connection_run(void *arg) {
         /* Case B: registration completes anyway — there IS a real,
          * recoverable next step (`GRAPPA NETWORK <slug>`), unlike the
          * zero-networks dead end fetch_networks() already closed on. */
-        send_welcome(fd, reg.nick, sess.subject_name);
+        send_welcome(fd, reg.nick, &sess);
         send_network_reminder(fd, reg.nick, &sess);
         char available[512];
         format_available_networks(&sess, available, sizeof(available));
