@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport_bootstrap
 
 .PHONY: all clean install version check
 
@@ -130,6 +130,14 @@ tests/test_who: tests/test_who.c tests/test.h tests/ws_stub.c tests/ws_stub.h sr
 # Tests the P-0a bahamut fields added in issue #72. Same deps as test_render.
 tests/test_whois: tests/test_whois.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_whois.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_isupport_changed_event and
+# send_welcome (both static). Tests the PREFIX bootstrap ordering fix (#82):
+# isupport_changed caches instead of sending when welcome_sent is false, and
+# send_welcome emits the live 005 with PREFIX when the cache is populated.
+# Same deps as test_render.
+tests/test_isupport_bootstrap: tests/test_isupport_bootstrap.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_isupport_bootstrap.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)
