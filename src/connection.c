@@ -1253,7 +1253,8 @@ static void send_welcome(int fd, const char *nick, struct grappa_session *sess) 
               sess->subject_name);
     send_line(fd, ":%s 002 %s :Your host is %s, running bicchierino %s", IRCD_SERVER, nick,
               IRCD_SERVER, BICCHIERINO_VERSION);
-    send_line(fd, ":%s 003 %s :This server has no particular birthday", IRCD_SERVER, nick);
+    send_line(fd, ":%s 003 %s :This server was created %s", IRCD_SERVER, nick,
+              BICCHIERINO_BUILD_DATE);
     send_line(fd, ":%s 004 %s %s bicchierino-%s o o", IRCD_SERVER, nick, IRCD_SERVER,
               BICCHIERINO_VERSION);
     if (sess->cached_prefix_letters[0]) {
