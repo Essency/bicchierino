@@ -494,18 +494,27 @@ struct grappa_session {
      * just quieter. */
     bool isupport_005_sent;
 
-    /* Bootstrap ordering fix (#82): grappa v1.1.0 pushes `isupport_changed`
-     * in the user-topic snapshot (`session_snapshot/2`), which arrives while
-     * `join_user_topic` blocks on its `bridge_join` reply — before
-     * `send_welcome` is called. To include the live PREFIX/CHANMODES in the
-     * client's initial 005 (rather than sending a partial 005 now and a
-     * corrected one moments later, which is too late for WeeChat's nicklist-
-     * group construction at JOIN time), the event handler caches these values
-     * when `welcome_sent` is false and lets `send_welcome` emit them directly.
+    /* Bootstrap ordering (#82/#90): the live PREFIX/CHANMODES must reach the
+     * client in the FIRST 005, before any JOIN line, so that IRC clients
+     * (WeeChat, etc.) build their nicklist groups from the correct prefix set.
+     *
+     * `isupport_changed` is pushed by `push_isupport_if_live/3` (grappa
+     * v0.14.0, confirmed against the vendored `test/grappa`), which is called
+     * exclusively from `push_channel_snapshot/4` — the `{:after_join,
+     * {:channel, ...}}` handler. The user-topic snapshot (`push_user_snapshot`
+     * → `push_session_snapshot`) does NOT push isupport (#90 root cause: #82
+     * joined the user topic hoping this would work, but it never did).
+     *
+     * The channel-topic snapshot itself arrives in a SEPARATE message after
+     * the `phx_reply` bridge_join already consumed: grappa schedules it via
+     * `Process.send_after(self(), {:after_join, ...}, 0)` — an in-process
+     * mailbox reschedule, bounded by the BEAM scheduler, not by network
+     * latency. `await_channel_snapshot()` poll()-waits up to ~200ms for it.
+     *
+     * The event handler caches these values when `welcome_sent` is false;
+     * `send_welcome` reads the cache and emits the full 005 with PREFIX.
      * After `send_welcome` sets `welcome_sent`, any later `isupport_changed`
-     * that arrives (once per channel-topic join, as before) is either sent
-     * immediately (if this is Case B, where `send_welcome` already fired
-     * before the bridge came up) or skipped via `isupport_005_sent`. */
+     * is either sent immediately (Case B) or skipped via `isupport_005_sent`. */
     bool welcome_sent;           /* true after send_welcome has been called */
     char cached_prefix_letters[32]; /* e.g. "ohv" — from the pre-welcome
                                      * isupport_changed, read by send_welcome */
@@ -1219,8 +1228,8 @@ static bool ensure_network_connected(struct http_client *hc, const struct config
  *
  * The 005 emitted here includes PREFIX/CHANMODES/STATUSMSG when
  * `sess->cached_prefix_letters` is non-empty — i.e. when the bootstrap
- * called `join_user_topic` before this function, letting grappa v1.1.0's
- * user-topic `isupport_changed` push populate those fields first (#82).
+ * joined a channel-shaped topic (`$server`) before calling this function
+ * and `await_channel_snapshot` caught the `isupport_changed` push (#82/#90).
  * If the bridge never came up, or this is Case B (no default network),
  * the cached fields are empty and the 005 falls back to CHANTYPES/
  * CASEMAPPING only — same as before, correct: asserting a value not yet
@@ -1425,11 +1434,11 @@ static void bridge_event_dispatch(void *ctx_raw, const char *payload, size_t pay
     handle_grappa_event(ctx->fd, ctx->nick, ctx->br, ctx->sess, payload, payload_len);
 }
 
-/* Phase 1 of the two-phase topic join (#82): join the user topic only.
- * In the Case A bootstrap this runs BEFORE send_welcome, so that grappa
- * v1.1.0's user-topic isupport_changed snapshot is processed synchronously
- * by bridge_join's wait loop and the cached PREFIX/CHANMODES are available
- * for send_welcome's own 005. */
+/* Phase 1 of the three-phase topic join (#82/#90): join the user topic.
+ * The user-topic snapshot seeds per-session state (umodes, session identity,
+ * invited windows — see grappa's push_user_snapshot/push_session_snapshot).
+ * It does NOT push isupport_changed (#90 root cause); that comes from the
+ * channel-shaped topic joined in Phase 2 (join_server_topic). */
 static void join_user_topic(int fd, const char *nick, struct bridge *br,
                              struct grappa_session *sess) {
     struct bridge_event_ctx ctx = {fd, nick, br, sess};
@@ -1444,27 +1453,22 @@ static void join_user_topic(int fd, const char *nick, struct bridge *br,
     }
 }
 
-/* Phase 2 of the two-phase topic join (#82): join the server window,
- * per-channel topics, the DM-listener topic, and push visibility.
- * In the Case A bootstrap this runs AFTER send_welcome and present_channels,
- * so no live channel-topic frame can arrive before the client has seen
- * JOIN for its channels. */
-static void join_channel_topics(int fd, const char *nick, struct bridge *br,
-                                 struct grappa_session *sess) {
+/* Phase 2 of the three-phase topic join (#82/#90): join the synthetic
+ * `$server` window topic.  This is a channel-shaped topic, so grappa's
+ * `push_channel_snapshot/4` handles its {:after_join, ...} and calls
+ * `push_isupport_if_live/3` — the ONLY path that pushes `isupport_changed`.
+ * Must complete before send_welcome in Case A so the snapshot has a chance
+ * to populate the isupport cache; `await_channel_snapshot` polls for it.
+ *
+ * `$server` is synthetic and always exists: grappa broadcasts server notices,
+ * MOTD lines, and catch-all rows on its per-channel topic (`Session.Persistor`
+ * `Topic.channel(subject, slug, attrs.channel)`), just like a real channel.
+ * Its join_ref is local (unlike the user topic's, which heartbeat/visibility
+ * pushes need). */
+static void join_server_topic(int fd, const char *nick, struct bridge *br,
+                               struct grappa_session *sess) {
     struct bridge_event_ctx ctx = {fd, nick, br, sess};
 
-    /* The `$server` window is NOT derived from the channel list and never
-     * appears in it: `GET /networks/:slug/channels` merges the credential
-     * autojoin list with `Session.list_channels/2` (grappa's
-     * `channels_controller.ex`), both of which are real channels only.
-     * `$server` is synthetic and always exists, so it is joined
-     * unconditionally — grappa broadcasts its rows on the per-channel
-     * topic like any other window (`Session.Persistor`'s
-     * `Topic.channel(subject, slug, attrs.channel)`), which means without
-     * this join every server notice, MOTD line and catch-all row is
-     * dropped one layer below the renderer. Nothing is ever pushed on this
-     * topic, so its join_ref is local — unlike the user topic's, which the
-     * heartbeat/visibility pushes need. */
     char server_topic[512];
     snprintf(server_topic, sizeof(server_topic), "grappa:user:%s/network:%s/channel:%s",
              sess->subject_name, sess->network_slug, GRAPPA_SERVER_WINDOW);
@@ -1474,6 +1478,91 @@ static void join_channel_topics(int fd, const char *nick, struct bridge *br,
     } else {
         fprintf(stderr, "bicchierino: join %s failed\n", server_topic);
     }
+}
+
+/* After joining the `$server` topic, poll-wait up to ~200ms for the
+ * follow-up `isupport_changed` snapshot that grappa sends via
+ * `Process.send_after(self(), {:after_join, ...}, 0)` — a same-BEAM-process
+ * mailbox reschedule that arrives AFTER the phx_reply bridge_join already
+ * consumed. The delay is bounded by the BEAM scheduler (in-process, not
+ * network-shaped), so 200ms is generous in practice.
+ *
+ * On success: `sess->cached_prefix_letters` is populated; send_welcome
+ * emits the full 005 with PREFIX/CHANMODES.
+ * On timeout or error: cache stays empty; send_welcome falls back to the
+ * CHANTYPES/CASEMAPPING-only 005, same as today — never confidently wrong.
+ *
+ * If the cache was already populated by a frame that arrived during
+ * bridge_join's own wait loop (via on_event), returns immediately without
+ * polling (the common case in a well-loaded deployment where grappa's
+ * scheduler fires :after_join quickly). */
+static void await_channel_snapshot(int fd, const char *nick, struct bridge *br,
+                                   struct grappa_session *sess) {
+    if (sess->cached_prefix_letters[0]) return; /* already cached */
+    if (br->wsc.fd < 0) return;                 /* no real socket (test stub) */
+
+    struct pollfd pfd = {br->wsc.fd, POLLIN, 0};
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (!sess->cached_prefix_letters[0]) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int remaining_ms =
+            200 - (int)((now.tv_sec - start.tv_sec) * 1000 +
+                         (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (remaining_ms <= 0) break;
+
+        int pr = poll(&pfd, 1, remaining_ms);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) break; /* timeout (0) or unrecoverable error (<0) */
+        if (!(pfd.revents & POLLIN)) break;
+
+        /* Same first-recv / buffered-drain pattern as the steady-state loop
+         * (connection.c §Phase2): one ws_client_recv (allowed to touch the
+         * network — poll() just promised data) then bridge_recv_buffered for
+         * every further frame already in the ws_reader buffer, to avoid a
+         * second blocking SSL_read poll() never promised would return. */
+        bool first_read = true;
+        for (;;) {
+            char *payload = NULL;
+            size_t payload_len = 0;
+            ws_result r = first_read
+                              ? ws_client_recv(&br->wsc, &payload, &payload_len)
+                              : bridge_recv_buffered(br, &payload, &payload_len);
+            first_read = false;
+            if (r == WS_NEED_MORE) {
+                free(payload);
+                break;
+            }
+            if (r == WS_TEXT) {
+                handle_grappa_event(fd, nick, br, sess, payload, payload_len);
+                free(payload);
+                continue;
+            }
+            /* WS_PING, WS_CLOSED, WS_ERROR — not expected here; drop and stop. */
+            free(payload);
+            break;
+        }
+    }
+
+    if (sess->cached_prefix_letters[0]) {
+        fprintf(stderr, "bicchierino: isupport snapshot received (pre-welcome)\n");
+    } else {
+        fprintf(stderr,
+                "bicchierino: isupport snapshot timeout — send_welcome will use fallback 005\n");
+    }
+}
+
+/* Phase 3 of the three-phase topic join (#82/#90): join per-channel topics,
+ * the DM-listener topic, and push visibility.
+ * In the Case A bootstrap this runs AFTER send_welcome and present_channels,
+ * so no live channel-topic frame can arrive before the client has seen
+ * JOIN for its channels.  `$server` is NOT joined here — it was joined in
+ * Phase 2 (join_server_topic), before send_welcome. */
+static void join_channel_topics(int fd, const char *nick, struct bridge *br,
+                                 struct grappa_session *sess) {
+    struct bridge_event_ctx ctx = {fd, nick, br, sess};
 
     for (size_t i = 0; i < sess->channel_count; i++) {
         char folded_channel[128];
@@ -1517,12 +1606,20 @@ static void join_channel_topics(int fd, const char *nick, struct bridge *br,
     }
 }
 
-/* Combines join_user_topic + join_channel_topics for the Case B network-
- * select path (handle_grappa_network), where send_welcome has already
- * fired before bridge_connect and the two-phase split is not needed. */
+/* Combines all three join phases for the Case B network-select path
+ * (handle_grappa_network), where send_welcome has already fired before
+ * bridge_connect.  No pre-welcome ordering constraint here, so the three
+ * phases run back-to-back:
+ *   1. user topic  — seeds per-session state
+ *   2. $server     — now needed for isupport (moved out of join_channel_topics
+ *                    by #90; was previously the first thing join_channel_topics
+ *                    did, which is equivalent for Case B where ordering doesn't
+ *                    matter the same way)
+ *   3. channel topics — real channels, DM listener, visibility push */
 static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
                                 struct grappa_session *sess) {
     join_user_topic(fd, nick, br, sess);
+    join_server_topic(fd, nick, br, sess);
     join_channel_topics(fd, nick, br, sess);
 }
 
@@ -6147,25 +6244,31 @@ void *connection_run(void *arg) {
         bool network_connected = ensure_network_connected(&hc, cfg, &sess);
         if (!fetch_joined_channels(fd, &hc, cfg, &sess)) goto cleanup;
 
-        /* Bootstrap reorder (#82 — PREFIX before JOIN): connect the bridge
-         * and join the user topic BEFORE sending the welcome burst, so that
-         * grappa v1.1.0's user-topic isupport_changed snapshot is processed
-         * by bridge_join's synchronous wait loop and the live PREFIX/CHANMODES
-         * are cached in sess before send_welcome runs. This lets send_welcome
-         * include the correct PREFIX in its own 005 line — the one the IRC
-         * client sees before the first JOIN it ever receives for any channel.
+        /* Bootstrap reorder (#82/#90 — PREFIX before JOIN):
          *
-         * If the bridge fails to connect, send_welcome still runs with an
-         * empty cache (correct: no verified PREFIX available), and the live
-         * event bridge notice is sent after the welcome burst, same as before.
+         * Phase 1: join the user topic.  Seeds per-session state (umodes,
+         *   session identity, invited windows).  Does NOT push isupport_changed
+         *   (#90 root cause: the user-topic snapshot in grappa v0.14.0 never
+         *   calls push_isupport_if_live, only push_channel_snapshot does).
+         *
+         * Phase 2: join the `$server` channel-shaped topic, then poll-wait
+         *   (≤200ms) for the :after_join snapshot that carries isupport_changed.
+         *   This populates sess.cached_prefix_letters/sigils/chanmodes so that
+         *   send_welcome can emit the full 005 with PREFIX before any JOIN line.
+         *
+         * If the bridge fails to connect, all three phases are skipped and
+         * send_welcome falls back to the CHANTYPES/CASEMAPPING-only 005 —
+         * same as before, correct: no verified PREFIX is available.
          *
          * `sess.network_nick` (set by `pick_network` just above), not
-         * `reg.nick`, from here on — the one is live-tracked across a
-         * later self nick_change, the other is a one-time registration
-         * snapshot. Identical value at this exact point. */
+         * `reg.nick`, from here on — the one is live-tracked across a later
+         * self nick_change, the other is a one-time registration snapshot.
+         * Identical value at this exact point. */
         br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
         if (br_connected) {
             join_user_topic(fd, sess.network_nick, &br, &sess);
+            join_server_topic(fd, sess.network_nick, &br, &sess);
+            await_channel_snapshot(fd, sess.network_nick, &br, &sess);
         }
 
         send_welcome(fd, sess.network_nick, &sess);
@@ -6191,13 +6294,12 @@ void *connection_run(void *arg) {
                 "bicchierino: bootstrap OK: subject=%s network=%s(%ld) joined_channels=%zu\n",
                 sess.subject_name, sess.network_slug, sess.network_id, sess.channel_count);
 
-        /* Join the channel topics after present_channels (#82): no live
-         * channel-topic frame can arrive before the client has seen JOIN
-         * for its channels. The user topic was already joined above.
-         * The join sequence proves every topic's reply is "ok" and
-         * pushes visibility; snapshot pushes (query_windows_list,
-         * topic_changed, ...) stay buffered in the OS socket until
-         * Phase 2's poll()-on-two-fds loop reads them. */
+        /* Phase 3: join per-channel topics after present_channels (#82/#90).
+         * No live channel-topic frame can arrive before the client has seen
+         * JOIN for its channels.  The user topic ($server) was already joined
+         * above (Phases 1 and 2).  Snapshot pushes (query_windows_list,
+         * topic_changed, ...) stay buffered in the OS socket until the
+         * Phase 2 poll()-on-two-fds steady-state loop reads them. */
         if (br_connected) {
             join_channel_topics(fd, sess.network_nick, &br, &sess);
         } else {

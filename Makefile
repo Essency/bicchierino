@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap
 
 .PHONY: all clean install version check
 
@@ -143,6 +143,15 @@ tests/test_isupport: tests/test_isupport.c tests/test.h src/connection.c src/reg
 # Same deps as test_render.
 tests/test_isupport_bootstrap: tests/test_isupport_bootstrap.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_isupport_bootstrap.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach join_server_topic, await_channel_snapshot,
+# join_user_topic, and send_welcome (all static). Tests the $server-topic
+# bootstrap fix (#90): joining a channel-shaped topic before send_welcome
+# lets the isupport_changed push populate the cache, so the first 005 sent to
+# the IRC client includes PREFIX/CHANMODES. ws_stub replaces ws_client.c at
+# link time (same pattern as test_who). Same deps as test_who.
+tests/test_server_topic_bootstrap: tests/test_server_topic_bootstrap.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_topic_bootstrap.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)
