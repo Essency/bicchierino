@@ -268,6 +268,109 @@ TEST(pending_join_matching_is_case_insensitive) {
     CHECK(f.join_count == 0);
 }
 
+/* ── render_names_353_366 sigil-precedence fix — issue #86 ────────────
+ *
+ * Grappa's per-member `modes[]` is insertion-ordered (prepend-only), NOT
+ * precedence-ordered.  A member voiced first and later opped ends up with
+ * modes = ["+", "@"]: reading modes[0] yields "+" instead of "@".
+ *
+ * The fix scans the full array and picks the HIGHEST-ranked sigil present
+ * (@>%>+), matching grappa's own member_sort_tier/1 which checks presence,
+ * not position.  These tests pin both the bug scenario and the single-
+ * element baseline.
+ *
+ * `render_names_353_366` is static but reachable here because this file
+ * already includes ../src/connection.c directly.  We feed it a parsed JSON
+ * members array and check the 353 line written to the socketpair.
+ */
+
+/* Helper: parse a JSON members array, call render_names_353_366, drain the
+ * output into `buf` (capacity `cap`).  Returns the number of bytes written.
+ * `json` must be a valid JSON array of member objects. */
+static size_t names_render(const char *json_str, char *buf, size_t cap) {
+    char err[128] = "";
+    json_doc *doc = json_parse(json_str, strlen(json_str), err, sizeof(err));
+    if (!doc) {
+        fprintf(stderr, "  [names_render] json_parse failed: %s\n", err);
+        return 0;
+    }
+    int tx = open_client();
+    if (tx < 0) { json_free(doc); return 0; }
+    render_names_353_366(tx, "me", "#test", json_root(doc));
+    size_t n = drain(tx, buf, cap);
+    json_free(doc);
+    return n;
+}
+
+/* Single-element baseline: the old code's path must still work. */
+TEST(names_single_op_sigil_is_at) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"@\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "@TestUser") != NULL);
+}
+
+/* Bug case: voice granted first, op granted later → modes=["+","@"].
+ * modes[0]="+" — the old code returned "+" here; the fix returns "@". */
+TEST(names_voice_then_op_shows_op_sigil) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"+\",\"@\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "@TestUser") != NULL);
+    /* Must NOT render "+TestUser" — the bug symptom. */
+    CHECK(strstr(buf, "+TestUser") == NULL);
+}
+
+/* Op granted first, voice later → modes=["+","@"] same wire shape as above
+ * (grappa prepends, order reflects grant sequence, not rank). */
+TEST(names_op_then_regranted_voice_still_shows_op_sigil) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"@\",\"+\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "@TestUser") != NULL);
+    CHECK(strstr(buf, "+TestUser") == NULL);
+}
+
+/* All three statuses in the worst-case insertion order (voice first,
+ * halfop second, op last) → modes=["+","%","@"]. */
+TEST(names_ohv_insertion_order_shows_op_sigil) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"+\",\"%\",\"@\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "@TestUser") != NULL);
+    CHECK(strstr(buf, "+TestUser") == NULL);
+    CHECK(strstr(buf, "%TestUser") == NULL);
+}
+
+/* Halfop-only: no op present, must show "%". */
+TEST(names_halfop_only_shows_halfop_sigil) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"%\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "%TestUser") != NULL);
+    CHECK(strstr(buf, "@TestUser") == NULL);
+}
+
+/* Voice then halfop → modes=["+","%"]: must show "%" not "+". */
+TEST(names_voice_then_halfop_shows_halfop_sigil) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"+\",\"%\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "%TestUser") != NULL);
+    CHECK(strstr(buf, "+TestUser") == NULL);
+}
+
+/* Voice-only: must show "+". */
+TEST(names_voice_only_shows_voice_sigil) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[\"+\"]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "+TestUser") != NULL);
+}
+
+/* No status at all: must render the bare nick with no sigil. */
+TEST(names_no_modes_renders_bare_nick) {
+    char buf[2048];
+    names_render("[{\"nick\":\"TestUser\",\"modes\":[]}]", buf, sizeof(buf));
+    CHECK(strstr(buf, "TestUser") != NULL);
+    CHECK(strstr(buf, "@TestUser") == NULL);
+    CHECK(strstr(buf, "%TestUser") == NULL);
+    CHECK(strstr(buf, "+TestUser") == NULL);
+}
+
 int main(void) {
     RUN(a_clean_line_is_unchanged);
     RUN(a_crlf_in_a_field_does_not_start_a_second_line);
@@ -282,5 +385,13 @@ int main(void) {
     RUN(pending_join_consumed_only_once);
     RUN(pending_join_and_part_sets_are_independent);
     RUN(pending_join_matching_is_case_insensitive);
+    RUN(names_single_op_sigil_is_at);
+    RUN(names_voice_then_op_shows_op_sigil);
+    RUN(names_op_then_regranted_voice_still_shows_op_sigil);
+    RUN(names_ohv_insertion_order_shows_op_sigil);
+    RUN(names_halfop_only_shows_halfop_sigil);
+    RUN(names_voice_then_halfop_shows_halfop_sigil);
+    RUN(names_voice_only_shows_voice_sigil);
+    RUN(names_no_modes_renders_bare_nick);
     return test_report();
 }

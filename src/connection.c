@@ -5112,9 +5112,9 @@ static void render_names_353_366(int fd, const char *nick, const char *channel,
         const char *mnick = NULL;
         if (!json_str_req(m, "nick", &mnick)) continue;
 
-        /* `modes[0]` is ALREADY the raw prefix SIGIL character (`@`/`%`/
-         * `+`), not a mode letter (`o`/`h`/`v`) — confirmed reading
-         * grappa's own `split_mode_prefix/1`
+        /* Each element of `modes[]` is a raw prefix SIGIL character
+         * (`@`/`%`/`+`), not a mode letter (`o`/`h`/`v`) — confirmed
+         * reading grappa's own `split_mode_prefix/1`
          * (`event_router.ex:2908-2912`), which builds this exact array
          * straight from a 353 RPL_NAMREPLY token's leading byte
          * (`<<prefix, rest::binary>> when prefix in [?@, ?%, ?+] ->
@@ -5125,17 +5125,28 @@ static void render_names_353_366(int fd, const char *nick, const char *channel,
          * name) and so never matched anything, silently dropping every
          * sigil — found live: `TestUser`, a confirmed real op in
          * `#testchannel` (per WHOIS's own 319 channel list showing
-         * `@#testchannel`), rendered with no `@` in `/names` at all. At
-         * most one element (grappa/bahamut send a single leading
-         * sigil per NAMES token, never a multi-prefix `@+nick` form —
-         * matches this codebase not advertising `multi-prefix`
-         * either), so just read it directly; still validated against
-         * the known sigil set rather than trusted blindly. */
+         * `@#testchannel`), rendered with no `@` in `/names` at all.
+         *
+         * The array may contain more than one element: grappa's
+         * `toggle_mode` (event_router.ex) PREPENDS each new status to
+         * the front regardless of rank, so the list is insertion-ordered,
+         * NOT precedence-ordered. A member voiced first and later opped
+         * ends up with modes = ["+", "@"] — modes[0] is "+", reading it
+         * directly would yield the wrong (lowest) sigil. We must scan the
+         * whole array and pick the HIGHEST-ranked sigil present
+         * (@>%>+), matching grappa's own member_sort_tier/1 which also
+         * checks presence, never position. */
         char sigil = '\0';
         const json_value *modes = json_get(m, "modes");
-        if (modes && json_type_of(modes) == JSON_ARRAY && json_len(modes) > 0) {
-            const char *first = json_string(json_at(modes, 0));
-            if (first && (first[0] == '@' || first[0] == '%' || first[0] == '+')) sigil = first[0];
+        if (modes && json_type_of(modes) == JSON_ARRAY) {
+            size_t mlen = json_len(modes);
+            for (size_t mi = 0; mi < mlen && sigil != '@'; mi++) {
+                const char *ms = json_string(json_at(modes, mi));
+                if (!ms) continue;
+                if      (ms[0] == '@') sigil = '@';          /* highest rank — loop exits */
+                else if (ms[0] == '%' && sigil != '%') sigil = '%';  /* upgrade from + or \0 */
+                else if (ms[0] == '+' && sigil == '\0') sigil = '+';
+            }
         }
 
         char token[80];
