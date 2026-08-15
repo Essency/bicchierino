@@ -26,6 +26,8 @@ GIT_TAG := $(shell git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BICCHIERINO_VERSION := $(GIT_TAG)+$(GIT_HASH)
 CPPFLAGS += -DBICCHIERINO_VERSION='"$(BICCHIERINO_VERSION)"'
+BUILD_DATE := $(shell date -u +'%a %b %d %Y at %H:%M:%S UTC')
+CPPFLAGS += -DBICCHIERINO_BUILD_DATE='"$(BUILD_DATE)"'
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
