@@ -64,6 +64,19 @@
                                      * a client asked for. Advertised via
                                      * `CHATHISTORY=<N>` in `send_welcome`'s
                                      * 005 so clients know the page size. */
+/* CLAUDE.md §3.2: raw client<->grappa IRC traffic is NEVER logged in a
+ * release build — the code that would do it does not exist in that
+ * binary, gated behind this compile-time flag rather than a runtime one,
+ * so it can't be switched on by accident. Build with `-DBICCHIERINO_LOG_TRAFFIC`
+ * (see `make debug`) for a variant that does, for local debugging only. */
+#ifdef BICCHIERINO_LOG_TRAFFIC
+#define LOG_TRAFFIC_IN(line) fprintf(stderr, "bicchierino: <- %s\n", (line))
+#define LOG_TRAFFIC_OUT(buf, len) fprintf(stderr, "bicchierino: -> %.*s\n", (int)(len), (buf))
+#else
+#define LOG_TRAFFIC_IN(line) ((void)0)
+#define LOG_TRAFFIC_OUT(buf, len) ((void)0)
+#endif
+
 #define IRCD_SERVER "bicchierino"
 /* grappa's synthetic per-network window for everything that belongs to no
  * channel and no query: server notices, connect MOTD, unsolicited
@@ -233,6 +246,7 @@ static int next_line(int fd, struct linebuf *lb, char *line, size_t line_sz) {
             size_t consumed = (size_t)(nl - lb->data) + 1;
             memmove(lb->data, lb->data + consumed, lb->len - consumed);
             lb->len -= consumed;
+            LOG_TRAFFIC_IN(line);
             return NEXT_LINE_OK;
         }
 
@@ -339,6 +353,7 @@ static void send_line(int fd, const char *fmt, ...) {
         }
         n = out;
     }
+    LOG_TRAFFIC_OUT(buf, n);
     buf[n++] = '\r';
     buf[n++] = '\n';
     /* Best-effort: if the write fails the connection is already dead and
@@ -1978,6 +1993,22 @@ static void handle_join(int fd, struct http_client *hc, struct bridge *br, bool 
     while (next_csv_token(&channels_cursor, channel, sizeof(channel))) {
         char key[128] = {0};
         if (keys_cursor) next_csv_token(&keys_cursor, key, sizeof(key));
+
+        /* A client that already thinks it's in this channel (its own
+         * remembered list replayed on reconnect, racing bicchierino's own
+         * bootstrap auto-join of the same channel) sending JOIN again is
+         * not a real join — mirror bahamut's own behavior for this exact
+         * case (channel.c: `if (IsMember(sptr, chptr)) continue;`, no
+         * echo, no burst, silently ignored). Skip it here too: no REST
+         * call (redundant — grappa would just re-send JOIN upstream for
+         * nothing, `Session.send_join/4` has no already-joined guard of
+         * its own), no optimistic echo. Sending the echo without a
+         * NAMES burst behind it (this path never sends one) breaks a
+         * real client's own JOIN contract — it clears its nicklist
+         * expecting a fresh roster that never comes, until a manual
+         * /names repopulates it. Confirmed live 2026-08-17: exactly this
+         * sequence, reproduced with a real irssi reconnect. */
+        if (find_channel_index(sess, channel) != sess->channel_count) continue;
 
         if (!send_join_rest(hc, cfg, sess, channel, key[0] ? key : NULL)) continue;
 

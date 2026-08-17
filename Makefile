@@ -52,7 +52,7 @@ TEST_CFLAGS := $(CFLAGS) -g
 
 TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap
 
-.PHONY: all clean install version check
+.PHONY: all clean install version check debug
 
 all: $(BIN)
 
@@ -61,6 +61,21 @@ $(BIN): $(OBJS)
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+# CLAUDE.md §3.2: raw client<->grappa IRC traffic is never logged in a
+# release build — it's compiled out entirely, not a runtime-togglable
+# flag. `make debug` builds a SEPARATE binary (own object files, own
+# name) with that logging compiled in, for local debugging only — never
+# touches the objects/binary `make all` produces.
+DEBUG_OBJS := $(OBJS:.o=.debug.o)
+
+debug: bicchierino-debug
+
+bicchierino-debug: $(DEBUG_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
+
+%.debug.o: %.c
+	$(CC) $(CPPFLAGS) -DBICCHIERINO_LOG_TRAFFIC $(CFLAGS) -c -o $@ $<
 
 install: $(BIN)
 	install -D -m 755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
@@ -156,7 +171,7 @@ tests/test_server_topic_bootstrap: tests/test_server_topic_bootstrap.c tests/tes
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_topic_bootstrap.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 clean:
-	rm -f $(BIN) src/*.o $(TESTS)
+	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)
 
 version:
 	@echo $(BICCHIERINO_VERSION)
