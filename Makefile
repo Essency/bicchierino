@@ -26,6 +26,8 @@ GIT_TAG := $(shell git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BICCHIERINO_VERSION := $(GIT_TAG)+$(GIT_HASH)
 CPPFLAGS += -DBICCHIERINO_VERSION='"$(BICCHIERINO_VERSION)"'
+BUILD_DATE := $(shell date -u +'%a %b %d %Y at %H:%M:%S UTC')
+CPPFLAGS += -DBICCHIERINO_BUILD_DATE='"$(BUILD_DATE)"'
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
@@ -48,9 +50,9 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap
 
-.PHONY: all clean install version check
+.PHONY: all clean install version check debug
 
 all: $(BIN)
 
@@ -59,6 +61,21 @@ $(BIN): $(OBJS)
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+# CLAUDE.md §3.2: raw client<->grappa IRC traffic is never logged in a
+# release build — it's compiled out entirely, not a runtime-togglable
+# flag. `make debug` builds a SEPARATE binary (own object files, own
+# name) with that logging compiled in, for local debugging only — never
+# touches the objects/binary `make all` produces.
+DEBUG_OBJS := $(OBJS:.o=.debug.o)
+
+debug: bicchierino-debug
+
+bicchierino-debug: $(DEBUG_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
+
+%.debug.o: %.c
+	$(CC) $(CPPFLAGS) -DBICCHIERINO_LOG_TRAFFIC $(CFLAGS) -c -o $@ $<
 
 install: $(BIN)
 	install -D -m 755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
@@ -144,8 +161,17 @@ tests/test_isupport: tests/test_isupport.c tests/test.h src/connection.c src/reg
 tests/test_isupport_bootstrap: tests/test_isupport_bootstrap.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_isupport_bootstrap.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
+# Compiles connection.c in to reach join_server_topic, await_channel_snapshot,
+# join_user_topic, and send_welcome (all static). Tests the $server-topic
+# bootstrap fix (#90): joining a channel-shaped topic before send_welcome
+# lets the isupport_changed push populate the cache, so the first 005 sent to
+# the IRC client includes PREFIX/CHANMODES. ws_stub replaces ws_client.c at
+# link time (same pattern as test_who). Same deps as test_who.
+tests/test_server_topic_bootstrap: tests/test_server_topic_bootstrap.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_topic_bootstrap.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
 clean:
-	rm -f $(BIN) src/*.o $(TESTS)
+	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)
 
 version:
 	@echo $(BICCHIERINO_VERSION)
