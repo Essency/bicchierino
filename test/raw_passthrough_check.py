@@ -9,24 +9,29 @@ silently discarding any tokens beyond the 15th.
 
 Anatomy of the test line (why bahamut + services cooperate end-to-end):
 
-  OS TAGLINE ADD a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19
+  OS AKILL PERM *@192.0.2.1 a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19
 
   Command:  OS
-  bicchierino-side token count after command: 22 (TAGLINE + ADD + a0..a19)
-  IRC_MAX_PARAMS = 15 → old code stopped here, losing a13..a19.
+  Token count after "OS": 22 (AKILL + PERM + *@192.0.2.1 + a0..a19)
+  IRC_MAX_PARAMS = 15 → old code stopped at params[14] = "a11",
+  losing a12..a19 when reconstructing the line from parsed tokens.
 
   bahamut's m_os has parameters=1 in its message table.  When parse()
-  hits that limit, it breaks out of the param-collection loop WITHOUT
-  advancing past the current token — so parv[1] ends up pointing to the
-  entire unsplit remainder "TAGLINE ADD a0 a1 ... a19", not just the
-  first word "TAGLINE".  m_os then sends:
+  hits that limit, it breaks WITHOUT advancing past the current token —
+  so parv[1] points to the entire unsplit remainder
+  "AKILL PERM *@192.0.2.1 a0 a1 … a19", not just "AKILL".  m_os sends:
 
-    :<nick> PRIVMSG OperServ@services.azzurra.chat :TAGLINE ADD a0 ... a19
+    :<nick> PRIVMSG OperServ@services.azzurra.chat :AKILL PERM *@192.0.2.1 a0 … a19
 
-  services' m_privmsg → operserv() → handle_tagline parses that text
-  with strtok(NULL, "") (capturing everything after ADD) and emits:
+  services' m_privmsg → operserv() → handle_akill parses:
+    subcommand = "PERM"  (→ expireTime=0, permanent)
+    username   = "*"
+    host       = "192.0.2.1"
+    reason     = strtok(NULL, "") = "a0 a1 … a19" (all remaining text)
 
-    GLOBOPS :**bicc-grappa** added the following tagline: a0 a1 ... a19
+  handle_akill emits (via send_globops with s_Snooper = s_OperServ):
+
+    GLOBOPS :**bicc-grappa** added a permanent AKILL for ***@192.0.2.1** [Reason: a0 a1 … a19]
 
   bahamut receives the GLOBOPS and relays it to all local IRC opers as:
 
@@ -35,26 +40,31 @@ Anatomy of the test line (why bahamut + services cooperate end-to-end):
   The bicc-raw socket (= the bicc-grappa network identity) is an oper
   (after /OPER) and therefore receives this NOTICE.
 
-  Under the pre-fix code the tagline text would end at a12 (params[14]
-  in bicchierino's 0-indexed array, the 15th slot); with the fix, all 20
-  words arrive and "a19" is present.
+  Under the old code the reason would end at "a11" (params[14], the last
+  slot in the 15-element array); with the fix, all 20 tokens arrive and
+  "[Reason: a0 a1 … a19]" is present in the GLOBOPS, including "a19".
+
+Substitution note (original intent vs. implementation):
+  The original test plan called for OS TAGLINE ADD, but that command
+  requires services ULEVEL_SOP — above the basic ULEVEL_OPER that a
+  freshly-OPERed oper has.  AKILL (PERM/ADD) requires only ULEVEL_OPER
+  and its GLOBOPS notice includes the full reason text verbatim, making
+  it a perfect ULEVEL_OPER-accessible equivalent for this test.
+  192.0.2.0/24 is RFC 5737 TEST-NET-1: reserved for documentation, no
+  real host ever has this address, so the AKILL has no side effects.
 
 Auth setup:
   bicc-raw connects to bicchierino as the grappa account (PASS
   bahamut-test:test-password-not-secret), becoming bicc-grappa on the
-  network.  bicc-grappa is SERVICES_MASTER (compose.yaml overrides the
-  testnet default), so services gives it ULEVEL_MASTER — above the
-  ULEVEL_SOP required by OS TAGLINE.  But m_privmsg in services also
-  requires the IRC-oper umode (+o) before calling operserv(), so the
-  test OPERs first.
+  network.  bicc-grappa needs IRC-oper status (UMODE_o) because:
+    1. services' m_privmsg requires isOper before calling operserv().
+    2. bahamut's send_globops delivers only to IsAnOper() local users.
 
-  The sealed testnet always has an O:line for the oper name "testoper"
-  with password "testoperpass" (OPER_NICK/OPER_PASS testnet defaults,
-  not overridden by the bicchierino compose.yaml).
+  The sealed testnet always has an O:line for "testoper"/"testoperpass"
+  (OPER_NICK/OPER_PASS defaults, not overridden by bicchierino compose).
 
-  raw-peer connects directly to bahamut-test:6667, OPERs as "testoper"
-  as well, and serves as a second independent observation point for the
-  GLOBOPS — it arrives at both sockets.
+  raw-peer connects directly to bahamut-test:6667 and OPERs as a second
+  independent GLOBOPS observer.
 
 Run from inside bicc-net (docker run --network ...).
 """
@@ -74,17 +84,19 @@ BAHAMUT_PORT = 6667
 # ── Timeouts ─────────────────────────────────────────────────────────────────
 
 CONNECT_TIMEOUT  = 10
-RELAY_TIMEOUT    = 30   # grappa round-trip can be slow (WS + Phoenix Channels)
 POST_REG_SECS    = 8    # seconds to drain post-004 burst before OPER
 POST_OPER_WAIT   = 3.0  # seconds to wait for UMODE +o to propagate to services
 GLOBOPS_TIMEOUT  = 20.0 # wait this long for the GLOBOPS NOTICE
 
 # ── The raw line under test ───────────────────────────────────────────────────
-# 20 words after the verb (a0..a19) = 22 tokens total after "OS"
-# (TAGLINE + ADD + 20 words), well past IRC_MAX_PARAMS=15.
-TOKENS       = [f"a{i}" for i in range(20)]
-TAGLINE_TEXT = " ".join(TOKENS)          # "a0 a1 a2 … a19"
-RAW_LINE     = f"OS TAGLINE ADD {TAGLINE_TEXT}"
+# 20 reason tokens (a0..a19) = 22 tokens total after "OS"
+# (AKILL + PERM + *@192.0.2.1 + 20 tokens), well past IRC_MAX_PARAMS=15.
+#
+# Substitution: OS AKILL PERM instead of OS TAGLINE ADD (see module docstring).
+TOKENS      = [f"a{i}" for i in range(20)]
+REASON_TEXT = " ".join(TOKENS)           # "a0 a1 a2 … a19"
+AKILL_MASK  = "*@192.0.2.1"             # RFC 5737 TEST-NET-1 — safe, never real
+RAW_LINE    = f"OS AKILL PERM {AKILL_MASK} {REASON_TEXT}"
 
 # ── Wire-level patterns ───────────────────────────────────────────────────────
 
@@ -259,42 +271,46 @@ def strip_irc_formatting(text: str) -> str:
 
 # ── Test checks ───────────────────────────────────────────────────────────────
 
-def check_globops(globops_line: str) -> None:
+def check_akill_globops(globops_line: str) -> None:
     """
-    Assert that the GLOBOPS NOTICE contains the complete tagline text
-    (all 20 tokens, a0..a19), proving the raw line was forwarded verbatim
+    Assert that the GLOBOPS NOTICE from AKILL PERM contains the full reason
+    text (all 20 tokens, a0..a19), proving the raw line was forwarded verbatim
     and not truncated at IRC_MAX_PARAMS=15.
+
+    The GLOBOPS from services looks like (after stripping bold codes):
+      :leaf4.azzurra.chat NOTICE bicc-grappa :*** Global -- from
+      services.azzurra.chat: bicc-grappa added a permanent AKILL for
+      *@192.0.2.1 [Reason: a0 a1 … a19]
     """
     clean = strip_irc_formatting(globops_line)
 
-    # The 20th token (a19, index 19) is the one that would be absent under
-    # the old bicchierino bug — assert it first for a sharp diagnostic.
+    # "a19" is the first token that the old bicchierino would have dropped
+    # (it falls beyond params[14] in the 15-element array).
     if "a19" in clean:
-        ok("GLOBOPS contains 'a19' — token at position 19, beyond IRC_MAX_PARAMS=15 boundary")
+        ok("AKILL GLOBOPS contains 'a19' — token beyond IRC_MAX_PARAMS=15, verbatim passthrough confirmed")
     else:
         fail(
-            "GLOBOPS missing 'a19' (the 20th token) — "
+            "AKILL GLOBOPS missing 'a19' (token beyond IRC_MAX_PARAMS=15) — "
             "bicchierino may have truncated the raw line at 15 params\n"
             f"  raw:   {globops_line!r}\n"
             f"  clean: {clean!r}"
         )
 
-    # Assert the full contiguous tagline text is present in the right order.
-    if TAGLINE_TEXT in clean:
-        ok(f"GLOBOPS contains full tagline text '{TAGLINE_TEXT}' — all tokens a0..a19 present and in order")
+    # Also assert the full contiguous reason text is present in order.
+    if REASON_TEXT in clean:
+        ok(f"AKILL GLOBOPS contains full reason '{REASON_TEXT}' — all tokens a0..a19 present and in order")
     else:
         missing = [t for t in TOKENS if t not in clean.split()]
         if missing:
             fail(
-                f"GLOBOPS missing tokens: {missing!r}\n"
-                f"  expected substring: {TAGLINE_TEXT!r}\n"
+                f"AKILL GLOBOPS missing tokens: {missing!r}\n"
+                f"  expected substring: {REASON_TEXT!r}\n"
                 f"  clean: {clean!r}"
             )
         else:
-            # All tokens individually present but not contiguous — unexpected ordering.
             fail(
-                f"GLOBOPS has all tokens individually but not as contiguous substring "
-                f"{TAGLINE_TEXT!r}\n"
+                f"AKILL GLOBOPS has all tokens individually but not as contiguous substring "
+                f"{REASON_TEXT!r}\n"
                 f"  clean: {clean!r}"
             )
 
@@ -355,26 +371,20 @@ def main() -> None:
 
     # ── OPER ─────────────────────────────────────────────────────────────────
     #
-    # bicc-grappa (the network identity shared by this bicchierino session)
-    # must have IRC oper status (UMODE_o) for two reasons:
-    #  1. services' m_privmsg requires isOper before dispatching to operserv().
-    #  2. bahamut's send_globops only sends to opers — we need to receive it.
+    # bicc-grappa (the network identity of this bicchierino session) needs
+    # IRC oper status (UMODE_o) for two reasons:
+    #  1. services' m_privmsg requires isOper before calling operserv().
+    #  2. bahamut's send_globops only delivers to IsAnOper() local clients.
     #
     # raw-peer also OPERs to serve as an independent GLOBOPS observer.
     #
-    # O:line: "testoper" / "testoperpass" — always present in the testnet,
-    # set by OPER_NICK/OPER_PASS defaults (not overridden by bicchierino's
-    # compose.yaml).  "azzurra" / "azzt3st" is an alternative fixed O:line.
-    #
-    # bicchierino routes OPER via grappa's Session.send_oper/4 (WIRE.md §2.6
-    # "oper" push), so bahamut is the one that verifies credentials and
-    # emits 381 RPL_YOUREOPER.
+    # O:line: "testoper" / "testoperpass" — sealed testnet default, never
+    # overridden by the bicchierino compose.yaml.
     print("\n─ OPER (bicc-raw) ─", flush=True)
     bicc.send("OPER testoper testoperpass")
 
-    # 381 RPL_YOUREOPER confirms oper succeeded.  Not all ircd numerics are
-    # guaranteed to flow back through grappa → bicchierino → client, so
-    # treat 381 as optional confirmation rather than a hard requirement.
+    # 381 RPL_YOUREOPER confirms the OPER succeeded.  Grappa may not relay
+    # this numeric back to the bicchierino client, so treat it as optional.
     got_381 = bicc.recv_match(
         timeout=8.0,
         match_fn=lambda t: len(t.split()) >= 2 and t.split()[1] == "381",
@@ -405,51 +415,53 @@ def main() -> None:
 
     # ── Send the raw line through bicchierino ────────────────────────────────
     #
-    # This is the handle_raw path: "OS" has no dedicated handler in
-    # bicchierino, so handle_irc_line falls through to handle_raw, which
-    # (after the fix) forwards the original line bytes verbatim.
+    # "OS" has no dedicated handler in bicchierino, so handle_irc_line
+    # falls through to handle_raw.  After the PR #104 fix, handle_raw
+    # forwards the original raw bytes verbatim rather than reconstructing
+    # the line from the parsed (and truncated) params array.
     print(f"\n─ Sending raw line ({len(RAW_LINE.split())} tokens) ─", flush=True)
     print(f"  {RAW_LINE!r}", flush=True)
     bicc.send(RAW_LINE)
 
-    # ── Wait for the GLOBOPS NOTICE ──────────────────────────────────────────
+    # ── Wait for the GLOBOPS NOTICE on bicc-raw ──────────────────────────────
     #
-    # services emits GLOBOPS, bahamut routes it as:
-    #   :<server> NOTICE <oper-nick> :*** Global -- from services.azzurra.chat: …
+    # handle_akill in services (on AKILL PERM success) calls:
+    #   send_globops(s_Snooper, "… added a permanent AKILL for … [Reason: %s]", reason)
+    # where s_Snooper = s_OperServ (conf.h) and reason = "a0 a1 … a19".
     #
-    # bicc-raw receives this because bicc-grappa is an oper on bahamut-test.
-    # raw-peer receives it because it is also an oper on the same server.
+    # bahamut receives the GLOBOPS from services and delivers it to all
+    # local IRC opers as:
+    #   :<server> NOTICE <nick> :*** Global -- from services.azzurra.chat: …
     #
-    # The GLOBOPS body is:
-    #   **bicc-grappa** added the following tagline: a0 a1 … a19
-    # (where ** = IRC bold 0x02).  After stripping formatting codes,
-    # "a0 a1 … a19" must appear as an uninterrupted substring.
-    print(f"\n─ Waiting for GLOBOPS on bicc-raw (timeout={GLOBOPS_TIMEOUT}s) ─", flush=True)
+    # bicc-raw receives this because bicc-grappa has UMODE_o on bahamut-test.
+    # "[Reason:" is a unique marker present only in AKILL GLOBOPS messages.
+    print(f"\n─ Waiting for AKILL GLOBOPS on bicc-raw (timeout={GLOBOPS_TIMEOUT}s) ─", flush=True)
 
-    def is_tagline_notice(text: str) -> bool:
-        return "NOTICE" in text and "tagline" in text.lower()
+    def is_akill_globops(text: str) -> bool:
+        return "NOTICE" in text and "[Reason:" in text
 
-    globops_bicc = bicc.recv_match(GLOBOPS_TIMEOUT, is_tagline_notice)
+    globops_bicc = bicc.recv_match(GLOBOPS_TIMEOUT, is_akill_globops)
 
     if globops_bicc is None:
         fail(
-            f"No tagline GLOBOPS NOTICE received on bicc-raw within {GLOBOPS_TIMEOUT}s\n"
-            "  Possible causes: OPER failed, services not responding, "
-            "handle_raw not forwarding, or GLOBOPS not relayed by grappa."
+            f"No AKILL GLOBOPS NOTICE received on bicc-raw within {GLOBOPS_TIMEOUT}s\n"
+            "  Possible causes: OPER failed (services rejected OS — UMODE_o missing?),\n"
+            "  AKILL mask rejected (validate_host), handle_raw not forwarding verbatim,\n"
+            "  or GLOBOPS NOTICE not relayed by grappa to the bicchierino client."
         )
     else:
         print(f"  bicc-raw GLOBOPS: {globops_bicc!r}", flush=True)
         print("\n─ Asserting GLOBOPS content ─", flush=True)
-        check_globops(globops_bicc)
+        check_akill_globops(globops_bicc)
 
-    # ── Also check on raw-peer (direct bahamut observation) ──────────────────
-    print(f"\n─ Waiting for GLOBOPS on raw-peer (timeout=5s) ─", flush=True)
-    globops_peer = peer.recv_match(5.0, is_tagline_notice)
+    # ── Also check on raw-peer (direct bahamut observation, optional) ─────────
+    print(f"\n─ Waiting for AKILL GLOBOPS on raw-peer (timeout=5s) ─", flush=True)
+    globops_peer = peer.recv_match(5.0, is_akill_globops)
     if globops_peer is not None:
-        ok(f"raw-peer also received GLOBOPS: {globops_peer!r}")
+        ok(f"raw-peer also received AKILL GLOBOPS: {globops_peer!r}")
     else:
-        # Not a hard failure — peer GLOBOPS reception depends on oper timing.
-        print("  (GLOBOPS not observed on raw-peer within 5s — not fatal)", flush=True)
+        # Not a hard failure — peer reception depends on OPER timing.
+        print("  (AKILL GLOBOPS not observed on raw-peer within 5s — not fatal)", flush=True)
 
     bicc.close()
     peer.close()
