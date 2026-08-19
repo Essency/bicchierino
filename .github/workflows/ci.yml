@@ -302,6 +302,21 @@ jobs:
             -v "$(pwd)/chathistory_check.py:/check.py:ro" \
             python:3.12-slim python3 /check.py
 
+      # handle_raw verbatim-passthrough regression (#101): a raw IRC line with
+      # more than IRC_MAX_PARAMS (15) space-separated tokens must reach bahamut
+      # and services byte-for-byte as the client sent it.  Sends OS TAGLINE ADD
+      # with 20 tokens (a0..a19), then asserts the GLOBOPS NOTICE emitted by
+      # services contains the full text including a19 (the 20th token, which
+      # the old parse-then-reconstruct path would have silently discarded).
+      - name: handle_raw verbatim-passthrough check (#101)
+        run: |
+          cd test
+          bicc_net="$($COMPOSE ps --format '{{.Project}}' | head -1)_bicc-net"
+          docker run --rm \
+            --network "$bicc_net" \
+            -v "$(pwd)/raw_passthrough_check.py:/check.py:ro" \
+            python:3.12-slim python3 /check.py
+
       - name: Stack logs
         if: failure()
         run: cd test && $COMPOSE logs --tail=300
