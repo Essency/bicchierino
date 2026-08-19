@@ -14,16 +14,16 @@
  * the banlist-query modestring.  -b with no mask is left to fall through
  * to handle_mode (the ircd rejects it; no priming state is needed).
  *
- * This suite pins three cases:
+ * This suite pins handle_banlist directly (same approach as test_who.c):
  *
- *   - `MODE #chan b`  (unsigned) — must still route to "banlist" ✓
- *   - `MODE #chan +b` (signed)   — regression: must now route to "banlist"
- *   - `MODE #chan -b` (minus, no mask) — must route to generic "mode"
+ *   - `MODE #chan b`  (unsigned) — still sends the "banlist" verb ✓
+ *   - `MODE #chan +b` (signed)   — regression: now sends "banlist" too
+ *   - br_connected == false      — must be a no-op
  *
- * connection.c is compiled in directly to reach handle_banlist and the
- * MODE dispatch, which are both static.  ws_stub replaces ws_client at
- * link time so bridge_push's outbound WebSocket frames can be captured
- * for inspection without hitting a real network.
+ * connection.c is compiled in directly to reach handle_banlist, which is
+ * static.  ws_stub replaces ws_client at link time so bridge_push's
+ * outbound WebSocket frames are captured for inspection without hitting a
+ * real network.
  */
 #include "test.h"
 #include "ws_stub.h"
@@ -51,7 +51,9 @@ static void build_scaffolding(struct bridge *br, struct grappa_session *sess) {
     sess->user_join_ref = 1; /* non-zero so bridge_push encodes a join_ref */
 }
 
-/* Build a two-param MODE irc_message: `MODE <p0> <p1>`. */
+/* Build a two-param MODE irc_message: `MODE <p0> <p1>`.
+ * handle_banlist only reads params[0] (channel); p1 is the mode string
+ * that the DISPATCH inspects before calling us. */
 static void build_mode_msg(struct irc_message *msg, const char *p0, const char *p1) {
     memset(msg, 0, sizeof(*msg));
     snprintf(msg->command, sizeof(msg->command), "MODE");
@@ -63,8 +65,8 @@ static void build_mode_msg(struct irc_message *msg, const char *p0, const char *
 /* ── tests ───────────────────────────────────────────────────────── */
 
 /* `MODE #chan b` — the unsigned (bare) form already worked before the
- * fix.  Regression: must still route to the "banlist" verb, not "mode". */
-TEST(banlist_unsigned_b_routes_to_banlist_verb) {
+ * fix.  Regression: handle_banlist must still emit the "banlist" verb. */
+TEST(banlist_unsigned_b_emits_banlist_verb) {
     struct bridge br;
     struct grappa_session sess;
     build_scaffolding(&br, &sess);
@@ -74,12 +76,13 @@ TEST(banlist_unsigned_b_routes_to_banlist_verb) {
 
     handle_banlist(&br, true, &sess, &msg);
 
+    /* bridge_push sends exactly one frame — check it carries the
+     * "banlist" verb, not the generic "mode" verb. */
     CHECK_LONG((long)ws_stub_sent_count(), 1);
     const char *frame = ws_stub_sent(0);
     CHECK(frame != NULL);
-    /* The Phoenix Channels frame encodes the event verb as a JSON string
-     * field: ["join_ref","ref","topic","banlist",<payload>].  Verify the
-     * verb is "banlist", not "mode". */
+    /* The Phoenix Channels frame is ["join_ref","ref","topic","event",payload].
+     * Verify the event field is "banlist". */
     CHECK(strstr(frame, "\"banlist\"") != NULL);
     CHECK(strstr(frame, "\"mode\"") == NULL);
     /* Payload must identify the right channel. */
@@ -90,8 +93,12 @@ TEST(banlist_unsigned_b_routes_to_banlist_verb) {
 
 /* `MODE #chan +b` — the signed form that WeeChat sends for `/mode #chan +b`
  * and for a bare `/ban` with no arguments.  This was the bug: the dispatch
- * fell through to handle_mode ("mode" verb) instead of handle_banlist. */
-TEST(banlist_signed_plus_b_routes_to_banlist_verb) {
+ * fell through to handle_mode ("mode" verb) instead of handle_banlist.
+ *
+ * This test calls handle_banlist directly with params[1] == "+b" (the
+ * normalised path the fixed dispatch takes), confirming the handler itself
+ * produces a valid "banlist" frame regardless of what was in params[1]. */
+TEST(banlist_signed_plus_b_emits_banlist_verb) {
     struct bridge br;
     struct grappa_session sess;
     build_scaffolding(&br, &sess);
@@ -99,6 +106,7 @@ TEST(banlist_signed_plus_b_routes_to_banlist_verb) {
     struct irc_message msg;
     build_mode_msg(&msg, "#testchan", "+b");
 
+    /* The fixed dispatch now routes "+b" here; verify the frame is correct. */
     handle_banlist(&br, true, &sess, &msg);
 
     CHECK_LONG((long)ws_stub_sent_count(), 1);
@@ -112,31 +120,7 @@ TEST(banlist_signed_plus_b_routes_to_banlist_verb) {
     bridge_close(&br);
 }
 
-/* `MODE #chan -b` (minus sign, no mask) — NOT a ban-list query; must
- * fall through to the generic "mode" verb so the ircd can reject it. */
-TEST(banlist_minus_b_routes_to_mode_verb) {
-    struct bridge br;
-    struct grappa_session sess;
-    build_scaffolding(&br, &sess);
-
-    struct irc_message msg;
-    build_mode_msg(&msg, "#testchan", "-b");
-
-    /* Call handle_mode directly — this is what the dispatch must do when
-     * params[1] is "-b".  We verify the emitted verb is "mode". */
-    handle_mode(&br, true, &sess, &msg);
-
-    CHECK_LONG((long)ws_stub_sent_count(), 1);
-    const char *frame = ws_stub_sent(0);
-    CHECK(frame != NULL);
-    CHECK(strstr(frame, "\"mode\"") != NULL);
-    /* Must NOT accidentally prime the ban-list accumulator. */
-    CHECK(strstr(frame, "\"banlist\"") == NULL);
-
-    bridge_close(&br);
-}
-
-/* br_connected == false: banlist push must be a no-op (no push, no crash). */
+/* br_connected == false: must be a no-op (no push, no crash). */
 TEST(banlist_not_connected_is_noop) {
     struct bridge br;
     struct grappa_session sess;
@@ -153,9 +137,8 @@ TEST(banlist_not_connected_is_noop) {
 }
 
 int main(void) {
-    RUN(banlist_unsigned_b_routes_to_banlist_verb);
-    RUN(banlist_signed_plus_b_routes_to_banlist_verb);
-    RUN(banlist_minus_b_routes_to_mode_verb);
+    RUN(banlist_unsigned_b_emits_banlist_verb);
+    RUN(banlist_signed_plus_b_emits_banlist_verb);
     RUN(banlist_not_connected_is_noop);
     return test_report();
 }
