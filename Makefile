@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_parse
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse
 
 .PHONY: all clean install version check debug
 
@@ -176,6 +176,13 @@ tests/test_server_topic_bootstrap: tests/test_server_topic_bootstrap.c tests/tes
 # caused clients to build wrong ban masks (#97). Same deps as test_server_window.
 tests/test_channel_prefix: tests/test_channel_prefix.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_channel_prefix.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_banlist and the MODE dispatch
+# (both static). Pins the signed-form routing fix (#98): MODE #chan +b must
+# route to the "banlist" verb, not fall through to "mode". ws_stub replaces
+# ws_client.c at link time (same pattern as test_who).
+tests/test_banlist: tests/test_banlist.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_banlist.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 # Compiles connection.c in to reach irc_parse_line and reconstruct_irc_line
 # (both static).  Tests the fix for silent tail truncation when more than
