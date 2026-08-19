@@ -154,3 +154,12 @@ TEST(join_no_host_uses_bare_nick) {
                        "", NULL, NULL, buf, sizeof(buf));
     CHECK_STR(buf, ":OtherUser JOIN :#chan\r\n");
 }
+
+int main(void) {
+    RUN(privmsg_no_host_uses_bare_nick);
+    RUN(notice_no_host_uses_bare_nick);
+    RUN(privmsg_with_host_uses_full_prefix);
+    RUN(join_with_host_uses_full_prefix);
+    RUN(join_no_host_uses_bare_nick);
+    return test_report();
+}
