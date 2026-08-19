@@ -300,13 +300,38 @@ def check_registration_numerics(lines: list[str]) -> None:
 # ── Prefix helpers ────────────────────────────────────────────────────────────
 
 def assert_user_prefix(text: str, context: str) -> bool:
-    """Assert the prefix is nick!user@host; record failure and return False if not."""
+    """
+    Assert the prefix is either nick!user@host (with a REAL host, not the
+    bicchierino@bicchierino placeholder) or a bare nick (when grappa does not
+    carry the sender's host on this message kind — #97 fix).
+
+    The old placeholder host `nick!bicchierino@bicchierino` is a fabricated
+    value that causes IRC clients to overwrite the real host they learned from
+    JOIN with a fake one, breaking /kickban.  A bare nick is better: clients
+    keep the JOIN-learned host rather than poisoning it with wrong data.
+
+    Both forms are valid; only the placeholder is rejected.
+    """
     if not text.startswith(":"):
         fail(f"{context}: missing leading ':' in {text!r}")
         return False
     prefix = text.split()[0][1:]
+
+    # Bare nick (no ! at all) — #97 fix: honest absence of user@host.
+    if "!" not in prefix:
+        ok(f"{context}: prefix {prefix!r} is bare nick (no user@host in grappa meta — #97 fix)")
+        return True
+
+    # nick!user@host — must not be the bicchierino@bicchierino placeholder.
     if not USER_PFX_RE.match(prefix):
         fail(f"{context}: prefix {prefix!r} is not nick!user@host")
+        return False
+    _nick, uh = prefix.split("!", 1)
+    if uh == "bicchierino@bicchierino":
+        fail(
+            f"{context}: prefix {prefix!r} uses the bicchierino@bicchierino placeholder — "
+            f"clients build wrong ban masks from this (#97)"
+        )
         return False
     ok(f"{context}: prefix {prefix!r} matches nick!user@host")
     return True
