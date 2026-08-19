@@ -4177,7 +4177,10 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     if (strcmp(msg->command, "MODE") == 0) {
         /* `MODE #chan b` (bare, no +/-) is the wire form of a /banlist
          * query — needs the dedicated priming verb, not the generic
-         * "mode" push. See handle_banlist's own doc. */
+         * "mode" push. See handle_banlist's own doc.
+         * `MODE #chan +b` (signed form, e.g. WeeChat's `/mode #chan +b`
+         * and its bare `/ban`) is the same query intent: normalise the
+         * leading `+` so both forms reach handle_banlist (#98). */
         char folded_target[128], folded_own[64];
         ascii_fold_lower(msg->param_count >= 1 ? msg->params[0] : "", folded_target,
                           sizeof(folded_target));
@@ -4185,7 +4188,8 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
         if (msg->param_count == 1 && msg->params[0][0] == '#')
             handle_channel_modes_query(fd, br, *br_connected, sess->network_nick, sess, msg);
         else if (msg->param_count == 2 && msg->params[0][0] == '#' &&
-                 strcmp(msg->params[1], "b") == 0)
+                 (strcmp(msg->params[1], "b") == 0 ||
+                  strcmp(msg->params[1], "+b") == 0))
             handle_banlist(br, *br_connected, sess, msg);
         else if (msg->param_count >= 2 && msg->params[0][0] != '#' && folded_own[0] &&
                  strcmp(folded_target, folded_own) == 0)
