@@ -311,6 +311,19 @@ static bool irc_parse_line(const char *line, struct irc_message *msg) {
             break;
         }
 
+        /* When filling the last available slot, absorb the rest of the
+         * line — spaces included — rather than stopping at the next space
+         * and silently discarding the tail.  This matches bahamut's own
+         * parser: once the per-command param cap is reached, every ircd
+         * assigns the entire remainder to the last argument.
+         * reconstruct_irc_line() already emits ':' for a trailing param
+         * that contains spaces, so the rebuilt line stays wire-legal. */
+        if (msg->param_count == IRC_MAX_PARAMS - 1) {
+            snprintf(msg->params[msg->param_count], IRC_LINE_MAX, "%s", p);
+            msg->param_count++;
+            break;
+        }
+
         size_t len = 0;
         char *dst = msg->params[msg->param_count];
         while (*p && *p != ' ' && len < IRC_LINE_MAX - 1) dst[len++] = *p++;
@@ -4177,7 +4190,10 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     if (strcmp(msg->command, "MODE") == 0) {
         /* `MODE #chan b` (bare, no +/-) is the wire form of a /banlist
          * query — needs the dedicated priming verb, not the generic
-         * "mode" push. See handle_banlist's own doc. */
+         * "mode" push. See handle_banlist's own doc.
+         * `MODE #chan +b` (signed form, e.g. WeeChat's `/mode #chan +b`
+         * and its bare `/ban`) is the same query intent: normalise the
+         * leading `+` so both forms reach handle_banlist (#98). */
         char folded_target[128], folded_own[64];
         ascii_fold_lower(msg->param_count >= 1 ? msg->params[0] : "", folded_target,
                           sizeof(folded_target));
@@ -4185,7 +4201,8 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
         if (msg->param_count == 1 && msg->params[0][0] == '#')
             handle_channel_modes_query(fd, br, *br_connected, sess->network_nick, sess, msg);
         else if (msg->param_count == 2 && msg->params[0][0] == '#' &&
-                 strcmp(msg->params[1], "b") == 0)
+                 (strcmp(msg->params[1], "b") == 0 ||
+                  strcmp(msg->params[1], "+b") == 0))
             handle_banlist(br, *br_connected, sess, msg);
         else if (msg->param_count >= 2 && msg->params[0][0] != '#' && folded_own[0] &&
                  strcmp(folded_target, folded_own) == 0)
@@ -4259,18 +4276,29 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     return false;
 }
 
-/* Builds `nick!user@host`, falling back to bicchierino's own placeholder
- * host when the meta doesn't carry a real one (most kinds don't —
- * `Grappa.Scrollback.Meta`'s per-kind table, `meta.ex:68-131`: only
- * `:join`/`:part`/`:quit` ever carry `sender_user`/`sender_host`, and
- * even then only "when present" — both keys or neither, never half). */
+/* Builds `nick!user@host` when the meta carries a real sender_user/sender_host,
+ * or a bare `nick` when it does not.
+ *
+ * Most kinds don't carry the host pair — `Grappa.Scrollback.Meta`'s per-kind
+ * table (`meta.ex:68-131`): only `:join`/`:part`/`:quit` ever supply
+ * `sender_user`/`sender_host`, and even then only "when present" (both or
+ * neither, never half).
+ *
+ * The old fallback emitted `nick!bicchierino@bicchierino` — a fabricated host
+ * that LOOKS real.  IRC clients (WeeChat, irssi, …) treat a PRIVMSG prefix as
+ * authoritative and overwrite the host they learned from the JOIN with whatever
+ * the PRIVMSG prefix says.  The fabricated host therefore poisoned their stored
+ * identity, so a subsequent /kickban produced `*!*@bicchierino` instead of the
+ * real ban mask (#97).  A bare nick is RFC 1459-valid and honest: clients keep
+ * the host they learned from the JOIN rather than overwriting it with wrong
+ * data. */
 static void format_prefix(const json_value *meta, const char *sender, char *out, size_t out_sz) {
     const char *user = meta ? json_string(json_get(meta, "sender_user")) : NULL;
     const char *host = meta ? json_string(json_get(meta, "sender_host")) : NULL;
     if (user && host)
         snprintf(out, out_sz, "%s!%s@%s", sender, user, host);
     else
-        snprintf(out, out_sz, "%s!bicchierino@bicchierino", sender);
+        snprintf(out, out_sz, "%s", sender);
 }
 
 /* The renderable text of a row whose `body` may legitimately be absent.
@@ -4513,7 +4541,11 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         char sibling_prefix[196];
         const char *effective_prefix = prefix;
         if (is_sibling_dm) {
-            snprintf(sibling_prefix, sizeof(sibling_prefix), "%s!bicchierino@bicchierino", channel);
+            /* Use a bare nick prefix — same rationale as format_prefix()'s own
+             * fallback (#97): a fabricated host poisons the client's stored
+             * identity for ban-mask purposes.  A bare `:peer PRIVMSG me :body`
+             * is RFC-valid and routes to the right query window just as well. */
+            snprintf(sibling_prefix, sizeof(sibling_prefix), "%s", channel);
             effective_prefix = sibling_prefix;
             target = sess->network_nick;
         }

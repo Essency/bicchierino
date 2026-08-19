@@ -5,6 +5,16 @@ on:
     branches: ['**']
   pull_request:
 
+# Prevent duplicate runs when a push to a PR branch fires both the push
+# and pull_request triggers simultaneously.  cancel-in-progress: true
+# lets the newer run (typically the pull_request event, which carries PR
+# context) supersede the older one; the net effect is exactly one run
+# per commit, not two racing runs that preempt each other on the runner
+# queue and produce spurious cancellations.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build (${{ matrix.cc }})
