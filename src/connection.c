@@ -4227,18 +4227,29 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     return false;
 }
 
-/* Builds `nick!user@host`, falling back to bicchierino's own placeholder
- * host when the meta doesn't carry a real one (most kinds don't —
- * `Grappa.Scrollback.Meta`'s per-kind table, `meta.ex:68-131`: only
- * `:join`/`:part`/`:quit` ever carry `sender_user`/`sender_host`, and
- * even then only "when present" — both keys or neither, never half). */
+/* Builds `nick!user@host` when the meta carries a real sender_user/sender_host,
+ * or a bare `nick` when it does not.
+ *
+ * Most kinds don't carry the host pair — `Grappa.Scrollback.Meta`'s per-kind
+ * table (`meta.ex:68-131`): only `:join`/`:part`/`:quit` ever supply
+ * `sender_user`/`sender_host`, and even then only "when present" (both or
+ * neither, never half).
+ *
+ * The old fallback emitted `nick!bicchierino@bicchierino` — a fabricated host
+ * that LOOKS real.  IRC clients (WeeChat, irssi, …) treat a PRIVMSG prefix as
+ * authoritative and overwrite the host they learned from the JOIN with whatever
+ * the PRIVMSG prefix says.  The fabricated host therefore poisoned their stored
+ * identity, so a subsequent /kickban produced `*!*@bicchierino` instead of the
+ * real ban mask (#97).  A bare nick is RFC 1459-valid and honest: clients keep
+ * the host they learned from the JOIN rather than overwriting it with wrong
+ * data. */
 static void format_prefix(const json_value *meta, const char *sender, char *out, size_t out_sz) {
     const char *user = meta ? json_string(json_get(meta, "sender_user")) : NULL;
     const char *host = meta ? json_string(json_get(meta, "sender_host")) : NULL;
     if (user && host)
         snprintf(out, out_sz, "%s!%s@%s", sender, user, host);
     else
-        snprintf(out, out_sz, "%s!bicchierino@bicchierino", sender);
+        snprintf(out, out_sz, "%s", sender);
 }
 
 /* The renderable text of a row whose `body` may legitimately be absent.
@@ -4481,7 +4492,11 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         char sibling_prefix[196];
         const char *effective_prefix = prefix;
         if (is_sibling_dm) {
-            snprintf(sibling_prefix, sizeof(sibling_prefix), "%s!bicchierino@bicchierino", channel);
+            /* Use a bare nick prefix — same rationale as format_prefix()'s own
+             * fallback (#97): a fabricated host poisons the client's stored
+             * identity for ban-mask purposes.  A bare `:peer PRIVMSG me :body`
+             * is RFC-valid and routes to the right query window just as well. */
+            snprintf(sibling_prefix, sizeof(sibling_prefix), "%s", channel);
             effective_prefix = sibling_prefix;
             target = sess->network_nick;
         }

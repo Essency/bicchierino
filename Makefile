@@ -48,7 +48,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix
 
 .PHONY: all clean install version check
 
@@ -152,6 +152,13 @@ tests/test_isupport_bootstrap: tests/test_isupport_bootstrap.c tests/test.h src/
 # link time (same pattern as test_who). Same deps as test_who.
 tests/test_server_topic_bootstrap: tests/test_server_topic_bootstrap.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_topic_bootstrap.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_message_event (static).
+# Tests that channel PRIVMSG/JOIN without sender_user/sender_host produce a
+# bare nick prefix, not the fabricated `nick!bicchierino@bicchierino` that
+# caused clients to build wrong ban masks (#97). Same deps as test_server_window.
+tests/test_channel_prefix: tests/test_channel_prefix.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_channel_prefix.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) src/*.o $(TESTS)
