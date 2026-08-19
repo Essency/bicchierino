@@ -44,15 +44,6 @@ Anatomy of the test line (why bahamut + services cooperate end-to-end):
   slot in the 15-element array); with the fix, all 20 tokens arrive and
   "[Reason: a0 a1 … a19]" is present in the GLOBOPS, including "a19".
 
-Substitution note (original intent vs. implementation):
-  The original test plan called for OS TAGLINE ADD, but that command
-  requires services ULEVEL_SOP — above the basic ULEVEL_OPER that a
-  freshly-OPERed oper has.  AKILL (PERM/ADD) requires only ULEVEL_OPER
-  and its GLOBOPS notice includes the full reason text verbatim, making
-  it a perfect ULEVEL_OPER-accessible equivalent for this test.
-  192.0.2.0/24 is RFC 5737 TEST-NET-1: reserved for documentation, no
-  real host ever has this address, so the AKILL has no side effects.
-
 Auth setup:
   bicc-raw connects to bicchierino as the grappa account (PASS
   bahamut-test:test-password-not-secret), becoming bicc-grappa on the
@@ -62,6 +53,44 @@ Auth setup:
 
   The sealed testnet always has an O:line for "testoper"/"testoperpass"
   (OPER_NICK/OPER_PASS defaults, not overridden by bicchierino compose).
+
+  AKILL PERM access level — why NickServ identification is required:
+
+  services' oper_invoke_agent_command() uses the AKILL command table
+  entry { "AKILL", ULEVEL_OPER, ... } for the top-level dispatch.
+  That check passes for a bare IRC oper (ULEVEL_OPER = 0x03).
+
+  BUT handle_akill (akill.c line 726) has a second, stricter check
+  for the PERM / ADD / TIME subcommands:
+
+    else if (!CheckOperAccess(data->userLevel, CMDLEVEL_SOP))
+        send_notice_lang_to_user(..., OPER_ERROR_ACCESS_DENIED);
+
+  CMDLEVEL_SOP = 0x20.  ULEVEL_OPER = 0x03.  0x03 & 0x20 = 0 → the
+  check fails and services sends "Access denied." — the raw line
+  arrived correctly, but the command is rejected before the GLOBOPS.
+
+  services keeps a per-nick oper DB entry.  The M:bicc-grappa conf line
+  (services.conf.tmpl, rendered from compose.yaml SERVICES_MASTER) tells
+  oper_db_load to create a ULEVEL_MASTER (0x3FF) entry for bicc-grappa.
+  0x3FF has CMDLEVEL_SOP set, so bicc-grappa can do AKILL PERM — IF the
+  entry is loaded into user->oper.
+
+  check_oper() is what loads user->oper.  It is called from
+  users.c:1908 only when the user receives UMODE_r (identified to
+  NickServ).  servers_oper_add() — called when UMODE_o is set — only
+  updates statistics, it does NOT call check_oper.
+
+  Solution: register bicc-grappa's nick with NickServ in the test.
+  With SVC_EMAIL=0 and SVC_FORCE_AUTH=0 (testnet defaults), services
+  registers the nick and identifies the user immediately, setting +r.
+  That triggers check_oper, which finds the MASTER oper DB entry and
+  sets user->oper = MASTER → ULEVEL_MASTER for all subsequent OperServ
+  commands, including AKILL PERM.
+
+  Each CI run starts with an empty services DB so NS REGISTER always
+  succeeds.  A re-run against a persistent services DB gets "already
+  registered"; the test falls through to NS IDENTIFY in that case.
 
   raw-peer connects directly to bahamut-test:6667 and OPERs as a second
   independent GLOBOPS observer.
@@ -86,6 +115,7 @@ BAHAMUT_PORT = 6667
 CONNECT_TIMEOUT  = 10
 POST_REG_SECS    = 8    # seconds to drain post-004 burst before OPER
 POST_OPER_WAIT   = 3.0  # seconds to wait for UMODE +o to propagate to services
+POST_NS_WAIT     = 2.0  # seconds for NickServ +r to propagate → check_oper
 GLOBOPS_TIMEOUT  = 20.0 # wait this long for the GLOBOPS NOTICE
 
 # ── The raw line under test ───────────────────────────────────────────────────
@@ -413,6 +443,44 @@ def main() -> None:
     print(f"\nWaiting {POST_OPER_WAIT}s for oper status to propagate to services…", flush=True)
     time.sleep(POST_OPER_WAIT)
 
+    # ── NickServ registration → services ULEVEL_MASTER for AKILL PERM ────────
+    #
+    # AKILL PERM requires CMDLEVEL_SOP (0x20) inside handle_akill, not just the
+    # ULEVEL_OPER (0x03) that a bare IRC oper has.  services loads the
+    # ULEVEL_MASTER oper DB entry (created by M:bicc-grappa conf line) into
+    # user->oper only when check_oper() fires — and that happens only on
+    # UMODE_r, i.e., NickServ identification.  (See module docstring for the
+    # full services access level analysis.)
+    #
+    # With SVC_EMAIL=0 (testnet default), registration is immediate: services
+    # sets +r right away, no email step.  On a fresh CI run REGISTER always
+    # succeeds; on a persistent-DB re-run we fall through to IDENTIFY.
+    print("\n─ NickServ identify (bicc-grappa needs ULEVEL_MASTER for AKILL PERM) ─", flush=True)
+    bicc.send("PRIVMSG NickServ :REGISTER testpassword test@example.com")
+
+    ns_register_resp = bicc.recv_match(
+        timeout=5.0,
+        match_fn=lambda t: "NOTICE" in t and "NickServ" in t,
+    )
+    if ns_register_resp is not None:
+        clean_ns = strip_irc_formatting(ns_register_resp)
+        print(f"  NS REGISTER: {clean_ns!r}", flush=True)
+        if "already" in ns_register_resp.lower():
+            # Persistent DB: nick registered from a prior run — identify
+            bicc.send("PRIVMSG NickServ :IDENTIFY testpassword")
+            ns_id_resp = bicc.recv_match(
+                timeout=5.0,
+                match_fn=lambda t: "NOTICE" in t and "NickServ" in t,
+            )
+            if ns_id_resp is not None:
+                print(f"  NS IDENTIFY: {strip_irc_formatting(ns_id_resp)!r}", flush=True)
+    else:
+        print("  (no NickServ REGISTER response within 5s — services may not be ready)", flush=True)
+
+    # Wait for services to process +r and run check_oper for bicc-grappa.
+    print(f"\nWaiting {POST_NS_WAIT}s for NickServ +r to propagate (check_oper → ULEVEL_MASTER)…", flush=True)
+    time.sleep(POST_NS_WAIT)
+
     # ── Send the raw line through bicchierino ────────────────────────────────
     #
     # "OS" has no dedicated handler in bicchierino, so handle_irc_line
@@ -445,9 +513,13 @@ def main() -> None:
     if globops_bicc is None:
         fail(
             f"No AKILL GLOBOPS NOTICE received on bicc-raw within {GLOBOPS_TIMEOUT}s\n"
-            "  Possible causes: OPER failed (services rejected OS — UMODE_o missing?),\n"
-            "  AKILL mask rejected (validate_host), handle_raw not forwarding verbatim,\n"
-            "  or GLOBOPS NOTICE not relayed by grappa to the bicchierino client."
+            "  Possible causes:\n"
+            "  • OPER failed — bicc-grappa lacks UMODE_o (services requires isOper)\n"
+            "  • NickServ registration failed — bicc-grappa lacks ULEVEL_MASTER\n"
+            "    (AKILL PERM requires CMDLEVEL_SOP; bare IRC opers only have ULEVEL_OPER)\n"
+            "  • AKILL mask rejected by services validate_host\n"
+            "  • handle_raw not forwarding verbatim (pre-PR#104 truncation)\n"
+            "  • GLOBOPS NOTICE not relayed by grappa to the bicchierino client"
         )
     else:
         print(f"  bicc-raw GLOBOPS: {globops_bicc!r}", flush=True)
