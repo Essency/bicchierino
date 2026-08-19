@@ -311,6 +311,19 @@ static bool irc_parse_line(const char *line, struct irc_message *msg) {
             break;
         }
 
+        /* When filling the last available slot, absorb the rest of the
+         * line — spaces included — rather than stopping at the next space
+         * and silently discarding the tail.  This matches bahamut's own
+         * parser: once the per-command param cap is reached, every ircd
+         * assigns the entire remainder to the last argument.
+         * reconstruct_irc_line() already emits ':' for a trailing param
+         * that contains spaces, so the rebuilt line stays wire-legal. */
+        if (msg->param_count == IRC_MAX_PARAMS - 1) {
+            snprintf(msg->params[msg->param_count], IRC_LINE_MAX, "%s", p);
+            msg->param_count++;
+            break;
+        }
+
         size_t len = 0;
         char *dst = msg->params[msg->param_count];
         while (*p && *p != ' ' && len < IRC_LINE_MAX - 1) dst[len++] = *p++;
