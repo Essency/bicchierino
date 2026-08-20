@@ -184,9 +184,10 @@ tests/test_channel_prefix: tests/test_channel_prefix.c tests/test.h src/connecti
 tests/test_banlist: tests/test_banlist.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_banlist.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
-# Compiles connection.c in to reach irc_parse_line and reconstruct_irc_line
-# (both static).  Tests the fix for silent tail truncation when more than
-# IRC_MAX_PARAMS space-separated tokens arrive (#101). Same deps as test_render.
+# Compiles connection.c in to reach irc_parse_line (static).
+# Tests that irc_parse_line correctly dispatches commands with any number of
+# tokens, including lines over IRC_MAX_PARAMS (handle_raw now forwards the
+# original line verbatim, #101). Same deps as test_render.
 tests/test_parse: tests/test_parse.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_parse.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 

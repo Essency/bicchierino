@@ -311,19 +311,6 @@ static bool irc_parse_line(const char *line, struct irc_message *msg) {
             break;
         }
 
-        /* When filling the last available slot, absorb the rest of the
-         * line — spaces included — rather than stopping at the next space
-         * and silently discarding the tail.  This matches bahamut's own
-         * parser: once the per-command param cap is reached, every ircd
-         * assigns the entire remainder to the last argument.
-         * reconstruct_irc_line() already emits ':' for a trailing param
-         * that contains spaces, so the rebuilt line stays wire-legal. */
-        if (msg->param_count == IRC_MAX_PARAMS - 1) {
-            snprintf(msg->params[msg->param_count], IRC_LINE_MAX, "%s", p);
-            msg->param_count++;
-            break;
-        }
-
         size_t len = 0;
         char *dst = msg->params[msg->param_count];
         while (*p && *p != ' ' && len < IRC_LINE_MAX - 1) dst[len++] = *p++;
@@ -2414,27 +2401,6 @@ static void handle_oper(struct bridge *br, bool br_connected, struct grappa_sess
         fprintf(stderr, "bicchierino: OPER %s: push failed\n", name);
 }
 
-/* Reconstructs an IRC line from an already-parsed message — NOT
- * byte-identical to what the client originally sent (multiple spaces
- * between params, for instance, don't survive `irc_parse_line`), but
- * semantically equivalent, which is all `handle_raw`'s fallback below
- * needs: it forwards to grappa's own "unrestricted escape hatch"
- * verb, and any real ircd/services command downstream only cares about
- * the tokens, not the original whitespace. Trailing param gets the `:`
- * prefix back only when it contains a space or is otherwise
- * ambiguous — matches how a real client would have sent it, avoiding
- * an unnecessary `:` on every reconstructed one-word trailing param. */
-static void reconstruct_irc_line(const struct irc_message *msg, char *out, size_t out_sz) {
-    size_t len = (size_t)snprintf(out, out_sz, "%s", msg->command);
-    for (int i = 0; i < msg->param_count; i++) {
-        const char *p = msg->params[i];
-        bool last = i == msg->param_count - 1;
-        bool needs_colon = last && (p[0] == '\0' || strchr(p, ' ') || p[0] == ':');
-        int written = snprintf(out + len, out_sz - len, " %s%s", needs_colon ? ":" : "", p);
-        if (written > 0 && (size_t)written < out_sz - len) len += (size_t)written;
-    }
-}
-
 /* WIRE.md §6: `"raw"` push, payload `{"network_id", "line"}` ->
  * `Session.send_raw/3` (`grappa_channel.ex:1063-1074`) — grappa's own
  * comment calls this "the unrestricted escape hatch": every upstream/
@@ -2446,17 +2412,20 @@ static void reconstruct_irc_line(const struct irc_message *msg, char *out, size_
  * deliberately, not a placeholder: a real IRC client's `/quote <text>`
  * does not send a distinguishable "RAW" wire command at all, it sends
  * `<text>` verbatim, so THIS is the only place such a line could ever
- * be recognized as one. */
+ * be recognized as one.
+ *
+ * `raw_line` is the ORIGINAL bytes received from the client (stripped
+ * of CRLF by next_line), forwarded verbatim — bicchierino does not
+ * parse-then-reconstruct lines it has no dedicated handler for.
+ * irc_parse_line is still called upstream (in handle_irc_line) for
+ * command dispatch, but its output is never used here. */
 static void handle_raw(struct bridge *br, bool br_connected, struct grappa_session *sess,
-                        const struct irc_message *msg) {
+                        const char *raw_line) {
     if (!br_connected) return;
 
-    char line[IRC_LINE_MAX];
-    reconstruct_irc_line(msg, line, sizeof(line));
-
     char esc_line[IRC_LINE_MAX * 2];
-    if (!json_escape_into(line, esc_line, sizeof(esc_line))) {
-        fprintf(stderr, "bicchierino: RAW: reconstructed line too long to escape\n");
+    if (!json_escape_into(raw_line, esc_line, sizeof(esc_line))) {
+        fprintf(stderr, "bicchierino: RAW: line too long to escape\n");
         return;
     }
 
@@ -2465,7 +2434,7 @@ static void handle_raw(struct bridge *br, bool br_connected, struct grappa_sessi
              esc_line);
 
     if (!push_on_user_topic(br, sess, "raw", payload))
-        fprintf(stderr, "bicchierino: RAW %s: push failed\n", line);
+        fprintf(stderr, "bicchierino: RAW %s: push failed\n", raw_line);
 }
 
 /* WHOIS/WHO/NAMES/the bare-`b` BANLIST query MUST go out via their OWN
@@ -4127,7 +4096,8 @@ static bool handle_grappa_registry_command(int fd, struct http_client *hc,
  * transition on the very next iteration, not just within this call. */
 static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, bool *br_connected,
                              const struct config *cfg, const struct registration *reg,
-                             struct irc_message *msg, struct grappa_session *sess) {
+                             struct irc_message *msg, const char *raw_line,
+                             struct grappa_session *sess) {
     if (strcmp(msg->command, "PING") == 0) {
         send_line(fd, ":%s PONG %s :%s", IRCD_SERVER, IRCD_SERVER,
                   msg->param_count > 0 ? msg->params[0] : IRCD_SERVER);
@@ -4272,7 +4242,7 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
      * (see handle_whois's doc) is carved out first — RAW alone would
      * get the request upstream but the reply would have nowhere to
      * render. */
-    handle_raw(br, *br_connected, sess, msg);
+    handle_raw(br, *br_connected, sess, raw_line);
     return false;
 }
 
@@ -6549,7 +6519,7 @@ void *connection_run(void *arg) {
                 }
                 struct irc_message msg;
                 if (irc_parse_line(line, &msg) &&
-                    handle_irc_line(fd, &hc, &br, &br_connected, cfg, &reg, &msg, &sess)) {
+                    handle_irc_line(fd, &hc, &br, &br_connected, cfg, &reg, &msg, line, &sess)) {
                     client_quit = true;
                     break;
                 }
