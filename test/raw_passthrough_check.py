@@ -465,15 +465,23 @@ def main() -> None:
     if ns_register_resp is not None:
         clean_ns = strip_irc_formatting(ns_register_resp)
         print(f"  NS REGISTER: {clean_ns!r}", flush=True)
-        if "already" in ns_register_resp.lower():
-            # Persistent DB: nick registered from a prior run — identify
-            bicc.send("PRIVMSG NickServ :IDENTIFY testpassword")
-            ns_id_resp = bicc.recv_match(
-                timeout=5.0,
-                match_fn=lambda t: "NOTICE" in t and "NickServ" in t,
-            )
-            if ns_id_resp is not None:
-                print(f"  NS IDENTIFY: {strip_irc_formatting(ns_id_resp)!r}", flush=True)
+        # Always send IDENTIFY after REGISTER, regardless of whether it
+        # succeeded or the nick was already registered from a prior run.
+        # do_register() in services never calls check_oper() — only
+        # do_identify() does.  Without IDENTIFY, check_oper() never fires,
+        # user->oper is never loaded, and AKILL PERM fails with "permission
+        # denied" even though the M:bicc-grappa conf line creates the
+        # ULEVEL_MASTER oper DB entry.  This is true on both the fresh-DB
+        # (REGISTER → IDENTIFY) and persistent-DB ("already" → IDENTIFY) paths.
+        bicc.send("PRIVMSG NickServ :IDENTIFY testpassword")
+        ns_id_resp = bicc.recv_match(
+            timeout=5.0,
+            match_fn=lambda t: "NOTICE" in t and "NickServ" in t,
+        )
+        if ns_id_resp is not None:
+            print(f"  NS IDENTIFY: {strip_irc_formatting(ns_id_resp)!r}", flush=True)
+        else:
+            print("  (no NickServ IDENTIFY response within 5s)", flush=True)
     else:
         print("  (no NickServ REGISTER response within 5s — services may not be ready)", flush=True)
 
