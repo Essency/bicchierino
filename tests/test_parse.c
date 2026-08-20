@@ -1,22 +1,18 @@
-/* test_parse.c — irc_parse_line param-cap behaviour. (#101)
+/* test_parse.c — irc_parse_line behaviour. (#101)
  *
- * A client line whose space-separated token count exceeds IRC_MAX_PARAMS
- * was silently truncated: irc_parse_line stopped at the 15th token and
- * discarded the remainder without error.  The bug was introduced here, not
- * enforced by the upstream ircd — bahamut itself assigns the entire
- * remainder of the line (spaces included) to the last argument once its
- * own cap is reached, so a direct-ircd client kept the full text while a
- * bicchierino-mediated one did not.
+ * The root fix for #101 is architectural: handle_raw() now forwards the
+ * ORIGINAL line bytes received from the client verbatim (threaded from the
+ * poll loop through handle_irc_line), rather than calling reconstruct_irc_line
+ * on the re-tokenised struct irc_message.  reconstruct_irc_line and the
+ * last-slot absorb-at-cap block in irc_parse_line have both been removed.
  *
- * The fix: when filling the last available slot and the current param does
- * NOT start with ':', absorb the rest of the line verbatim.
- * reconstruct_irc_line() already emits ':' for a trailing param that
- * contains spaces, so the rebuilt line forwarded to grappa stays
- * wire-legal.
+ * irc_parse_line is still used for command dispatch (deciding which dedicated
+ * handler, if any, owns a command) — that usage is unchanged.  These tests
+ * cover the parser's own contract: correct tokenisation up to IRC_MAX_PARAMS,
+ * the colon-trailing-param rule, and the command name extraction.
  *
- * connection.c is compiled in directly to reach irc_parse_line and
- * reconstruct_irc_line, which are both static — the same approach as
- * test_render and test_whois.
+ * connection.c is compiled in directly to reach irc_parse_line, which is
+ * static — the same approach as test_render and test_whois.
  */
 #include "test.h"
 
@@ -50,38 +46,39 @@ TEST(exactly_max_params_parsed_intact) {
     CHECK(strcmp(msg.params[13], "p14") == 0);
 }
 
-/* A line with MORE than IRC_MAX_PARAMS tokens must NOT lose the tail:
- * the content from token 15 onward (including its spaces) must end up
- * verbatim in params[IRC_MAX_PARAMS-1]. */
-TEST(excess_tokens_collected_into_last_param) {
-    /* Command "OS" + 16 space-separated tokens = 16 params without the cap.
-     * Slot 14 (index IRC_MAX_PARAMS-1 = 14) must absorb tokens 15 and 16
-     * rather than stopping at the space after token 15.
-     *
-     * Tokens: tagline(0) add(1) w1(2)..w12(13) w13 w14(14, last slot)
-     *         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     *         14 individual words then the remainder in slot 14. */
+/* A line with MORE than IRC_MAX_PARAMS tokens must still parse
+ * successfully (handle_irc_line needs the command name for dispatch),
+ * filling the first IRC_MAX_PARAMS param slots with the first 15 tokens.
+ * The tail beyond the cap is not stored in msg.params — handle_raw
+ * forwards the ORIGINAL line verbatim instead of reconstructing from
+ * msg.params, so nothing is lost on the wire. */
+TEST(excess_tokens_parsed_for_dispatch) {
+    /* "OS" + 16 space-separated tokens = 17 tokens total without a cap. */
     const char *line =
-        "OS tagline add "                           /* "OS" + tokens 0-1 */
-        "w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 " /* tokens 2-13       */
-        "w13 w14";                                  /* overflow -> slot 14 */
+        "OS tagline add "
+        "w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 "
+        "w13 w14";
 
     struct irc_message msg = parse_ok(line);
 
-    /* Must fill every slot. */
+    /* Command must be correctly extracted for dispatch. */
+    CHECK(strcmp(msg.command, "OS") == 0);
+
+    /* Parser fills up to IRC_MAX_PARAMS slots; tail beyond the cap is
+     * not in msg.params (handle_raw uses the original line, not these). */
     CHECK_LONG((long)msg.param_count, IRC_MAX_PARAMS);
 
-    /* params[0] = "tagline", params[13] = "w12". */
+    /* First and 14th param slots are correct. */
     CHECK(strcmp(msg.params[0],  "tagline") == 0);
     CHECK(strcmp(msg.params[13], "w12")     == 0);
 
-    /* The last slot absorbs "w13 w14" — spaces intact, not just "w13". */
-    CHECK(strcmp(msg.params[IRC_MAX_PARAMS - 1], "w13 w14") == 0);
+    /* 15th slot (index 14) gets the 15th token only — stopping at the
+     * next space, not absorbing the remainder. */
+    CHECK(strcmp(msg.params[IRC_MAX_PARAMS - 1], "w13") == 0);
 }
 
-/* A colon-prefixed trailing param before the cap is still handled
- * correctly — the ':' path should not interact with the new last-slot
- * logic. */
+/* A colon-prefixed trailing param must still be handled correctly — the
+ * ':' path absorbs the rest of the line regardless of token count. */
 TEST(colon_trailing_param_still_works) {
     const char *line = "PRIVMSG #chan :hello world";
     struct irc_message msg = parse_ok(line);
@@ -91,33 +88,11 @@ TEST(colon_trailing_param_still_works) {
     CHECK(strcmp(msg.params[1], "hello world") == 0);
 }
 
-/* reconstruct_irc_line must emit ':' for the last param when it contains
- * spaces, producing a wire-legal line even when the last slot was filled
- * by the new last-slot absorption path. */
-TEST(reconstruct_adds_colon_for_spaced_last_param) {
-    const char *line =
-        "OS tagline add "
-        "w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 "
-        "w13 w14";
-
-    struct irc_message msg = parse_ok(line);
-
-    char out[IRC_LINE_MAX];
-    reconstruct_irc_line(&msg, out, sizeof(out));
-
-    /* The rebuilt line must carry the excess tokens with a ':' prefix. */
-    CHECK(strstr(out, ":w13 w14") != NULL);
-    /* And it must NOT silently end at "w12". */
-    CHECK(strstr(out, "w13") != NULL);
-    CHECK(strstr(out, "w14") != NULL);
-}
-
 /* ── main ────────────────────────────────────────────────────────── */
 
 int main(void) {
     RUN(exactly_max_params_parsed_intact);
-    RUN(excess_tokens_collected_into_last_param);
+    RUN(excess_tokens_parsed_for_dispatch);
     RUN(colon_trailing_param_still_works);
-    RUN(reconstruct_adds_colon_for_spaced_last_param);
     return test_report();
 }
