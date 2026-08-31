@@ -6532,7 +6532,10 @@ void *connection_run(void *arg) {
         if (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             fprintf(stderr, "bicchierino: grappa websocket closed mid-session\n");
             send_line(fd, "ERROR :lost grappa connection");
-            br_connected = false;
+            /* Do NOT clear br_connected here: cleanup: closes the bridge
+             * only if br_connected is true, and the bridge IS open — clearing
+             * the flag before reaching cleanup: is what caused the fd, TLS
+             * session, and reader buffer leak on every mid-session loss. */
             break;
         }
 
@@ -6592,7 +6595,10 @@ void *connection_run(void *arg) {
             }
             if (ws_lost) {
                 send_line(fd, "ERROR :lost grappa connection");
-                br_connected = false;
+                /* Do NOT clear br_connected here: same reason as the
+                 * POLLERR/POLLHUP path above — bridge_close must be
+                 * reached at cleanup:, which only fires it when the flag
+                 * is true.  Clearing it here was the leak. */
                 break;
             }
         }
