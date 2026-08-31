@@ -18,7 +18,7 @@ void ws_reader_free(struct ws_reader *r) {
  * Compacting before growing is what keeps a long-lived connection from
  * walking its buffer off into memory it never reuses. */
 static bool buf_reserve(struct ws_reader *r, size_t extra) {
-    if (r->off && r->len - r->off + extra > r->cap) {
+    if (r->off && r->len + extra > r->cap) {
         memmove(r->buf, r->buf + r->off, r->len - r->off);
         r->len -= r->off;
         r->off = 0;
