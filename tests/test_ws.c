@@ -264,6 +264,40 @@ TEST(a_binary_message_is_skipped_not_mistaken_for_text) {
     ws_reader_free(&r);
 }
 
+TEST(many_frames_keep_buffer_bounded) {
+    /* Regression for #106: buf_reserve used to compact only when even the
+     * live bytes (len - off) plus extra would not fit in cap, which is
+     * exactly the case where compaction is NOT enough and a realloc is
+     * coming anyway.  The case compaction actually solves — len + extra >
+     * cap while live bytes + extra <= cap — was skipped, so the consumed
+     * prefix was never reclaimed.
+     *
+     * Without the fix, len grows with every feed while off only chases it
+     * after each take.  cap therefore doubles every ~cap/framelen frames;
+     * with 100-byte frames cap first exceeds WS_MAX_MESSAGE at roughly
+     * 4194304 / 102 ≈ 41 000 frames.  100 000 frames puts us well past
+     * that and keeps the test under a second.  With the fix, cap never
+     * leaves the initial 4 KiB working-set. */
+    static char body[100];
+    memset(body, 'a', sizeof(body));
+    unsigned char frm[112]; /* 2-byte header + 100-byte body */
+    size_t flen = frame(frm, 0x1, true, body, sizeof(body));
+
+    struct ws_reader r;
+    ws_reader_init(&r);
+    for (size_t i = 0; i < 100000; i++) {
+        CHECK(ws_reader_feed(&r, frm, flen));
+        char *msg = NULL;
+        CHECK_LONG(ws_reader_take(&r, &msg, NULL), WS_TEXT);
+        free(msg);
+        /* cap must stay far below the per-message ceiling — if the
+         * consumed prefix is never reclaimed it reaches WS_MAX_MESSAGE
+         * after ~41 000 of these frames and the next feed returns false. */
+        CHECK(r.cap < WS_MAX_MESSAGE);
+    }
+    ws_reader_free(&r);
+}
+
 TEST(an_empty_message_is_still_a_message) {
     unsigned char buf[16];
     size_t n = frame(buf, 0x1, true, "", 0);
@@ -290,6 +324,7 @@ int main(void) {
     RUN(a_masked_frame_is_unmasked);
     RUN(a_close_ends_it_and_a_broken_frame_says_so);
     RUN(a_binary_message_is_skipped_not_mistaken_for_text);
+    RUN(many_frames_keep_buffer_bounded);
     RUN(an_empty_message_is_still_a_message);
     return test_report();
 }
