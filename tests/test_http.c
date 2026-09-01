@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 
 /* ── parse_grappa_url ────────────────────────────────────────────── */
 
@@ -559,10 +560,13 @@ TEST(conn_read_retries_eintr_and_delivers_the_data) {
     if (pid == 0) {
         close(fds[0]);
         kill(getppid(), SIGUSR1);
-        /* Tiny yield — parent should be blocked in read() by now. */
-        usleep(5000);
+        /* Short sleep so the parent is likely blocked in read() before
+         * the write arrives — nanosleep is POSIX 2008, usleep is not. */
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5 ms */
+        nanosleep(&ts, NULL);
         const char data[] = "hi";
-        write(fds[1], data, sizeof(data) - 1);
+        ssize_t nw = write(fds[1], data, sizeof(data) - 1);
+        (void)nw; /* in the child, losing the write is not a test failure */
         _exit(0);
     }
     close(fds[1]);
@@ -571,10 +575,10 @@ TEST(conn_read_retries_eintr_and_delivers_the_data) {
     int n = conn_read(NULL, fds[0], buf, sizeof(buf));
 
     /* Whether EINTR fired before or after the write, conn_read must
-     * return the data (if the signal arrived after write, read simply
-     * returned data directly — both outcomes are correct). */
+     * deliver the data (if the signal arrived after the write, read
+     * returned immediately — both outcomes are correct for this test). */
     CHECK(n > 0);
-    if (n > 0) CHECK(memcmp(buf, "hi", (size_t)n) == 0 || (size_t)n == 2);
+    if (n > 0) CHECK(memcmp(buf, "hi", (size_t)n) == 0);
 
     waitpid(pid, NULL, 0);
     sigaction(SIGUSR1, &old, NULL);
