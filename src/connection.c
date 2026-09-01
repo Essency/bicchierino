@@ -4324,15 +4324,22 @@ static const char *row_text(const json_value *message, const json_value *meta) {
  * The structured `meta` is deliberately not unpacked for the body: grappa
  * fills `body` with a plain spelling for exactly this reason ("the wire is
  * additive-only — an old client ignores the meta and shows the body").
- * `sender_kind` is the one meta key we DO read here, because it carries
- * semantic information that is not expressed anywhere else on the wire. */
+ * Two exceptions where we DO read meta keys, because each carries information
+ * that is not expressed anywhere else on the wire:
+ *
+ *   meta.sender_kind — "user" or "server"; grappa >= v0.15.0 (see above).
+ *
+ *   meta.numeric + meta.raw_params — when both are present the row carries
+ *   an IRC server numeric rather than a plain NOTICE.  grappa's own meta
+ *   catalogue says body is only the trailing param for numerics; since
+ *   grappa #424 the FULL param list lives in raw_params, so middle-param
+ *   numerics (STATS 211, etc.) would otherwise lose their payload (#113).
+ *   old-grappa rows that lack raw_params degrade silently to the NOTICE
+ *   path (additive-only wire contract). */
 static void handle_grappa_server_window_row(int fd, const struct grappa_session *sess,
                                              const char *kind, const char *sender,
                                              const json_value *message,
                                              const json_value *meta, long server_time_ms) {
-    const char *text = row_text(message, meta);
-    if (!text) return;
-
     /* Determine whether `sender` is a user nick or a server hostname.
      * Prefer meta.sender_kind ("user"/"server") from grappa >= v0.15.0;
      * fall back to the dot heuristic for older rows that lack the key. */
@@ -4360,6 +4367,48 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
         prefix = sender && sender[0] && strcmp(sender, "*") != 0 ? sender : IRCD_SERVER;
     }
     const char *target = sess->network_nick[0] ? sess->network_nick : "*";
+
+    /* Numeric path: meta.numeric (JSON number, 1–999) + meta.raw_params (array
+     * of strings, full param list in wire order).  Reconstruct the real IRC
+     * numeric line so middle params (STATS, TRACE, LIST, HELP, …) are not lost.
+     * raw_params last element is the trailing param (emitted with `:` prefix);
+     * all earlier elements are middle params (space-separated, no `:`). */
+    long numeric_n = 0;
+    const json_value *raw_params = meta ? json_get(meta, "raw_params") : NULL;
+    bool has_numeric = meta && json_long(json_get(meta, "numeric"), &numeric_n)
+                       && numeric_n >= 1 && numeric_n <= 999;
+
+    if (has_numeric && raw_params && json_len(raw_params) > 0) {
+        size_t n_p = json_len(raw_params);
+        char line[IRC_LINE_MAX];
+        size_t pos = 0, rem = sizeof(line);
+
+        int r = snprintf(line + pos, rem, ":%s %03ld %s", prefix, numeric_n, target);
+        if (r > 0 && (size_t)r < rem) { pos += (size_t)r; rem -= (size_t)r; }
+
+        /* Middle params — all but the last. */
+        for (size_t i = 0; i + 1 < n_p && rem > 1; i++) {
+            const char *p = json_string(json_at(raw_params, i));
+            if (!p) continue;
+            r = snprintf(line + pos, rem, " %s", p);
+            if (r > 0 && (size_t)r < rem) { pos += (size_t)r; rem -= (size_t)r; }
+        }
+
+        /* Trailing param — always colon-prefixed on the wire. */
+        if (rem > 2) {
+            const char *trailing = json_string(json_at(raw_params, n_p - 1));
+            if (trailing)
+                snprintf(line + pos, rem, " :%s", trailing);
+        }
+
+        send_tagged_line(fd, sess, server_time_ms, "%s", line);
+        return;
+    }
+
+    /* NOTICE path — needs renderable body text; exit silently if absent
+     * (server_event rows may legitimately have no body). */
+    const char *text = row_text(message, meta);
+    if (!text) return;
     send_tagged_line(fd, sess, server_time_ms, ":%s NOTICE %s :%s", prefix, target, text);
 }
 

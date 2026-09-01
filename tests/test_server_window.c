@@ -114,6 +114,66 @@ static void render_row_with_sender_kind(const char *kind, const char *sender,
     drain(tx, out, out_sz);
 }
 
+/* Renders a $server row carrying an IRC numeric.  `params` is the full
+ * raw_params list (in wire order: all middle params first, trailing last).
+ * `body` is the message's `body` field (may be "" for numerics whose payload
+ * is entirely in middle params; NULL is normalised to "" to make the JSON
+ * valid — grappa always sets body, though it may be empty).
+ *
+ * Meta shape matches grappa's own catalogue for `:notice` + `numeric`:
+ *   {"numeric": <n>, "raw_params": [<p0>, ..., <pN>]}
+ * numeric is a JSON NUMBER (Jason serialises the Elixir integer directly). */
+static void render_row_with_numeric(const char *sender, int numeric,
+                                    const char **params, int n_params,
+                                    const char *body,
+                                    char *out, size_t out_sz) {
+    struct grappa_session sess;
+    memset(&sess, 0, sizeof(sess));
+    snprintf(sess.network_nick, sizeof(sess.network_nick), "%s", "me");
+
+    int tx = open_client();
+    if (tx < 0) {
+        out[0] = '\0';
+        return;
+    }
+
+    /* Build the message JSON (body may be empty for middle-param-only rows). */
+    char msg_json[512];
+    {
+        char esc[256];
+        const char *b = body ? body : "";
+        json_escape_into(b, esc, sizeof(esc));
+        snprintf(msg_json, sizeof(msg_json), "{\"body\":\"%s\"}", esc);
+    }
+
+    /* Build the meta JSON: {"numeric":<n>,"raw_params":["p0",...,"pN"]}. */
+    char meta_json[1024];
+    {
+        int pos = snprintf(meta_json, sizeof(meta_json), "{\"numeric\":%d,\"raw_params\":[", numeric);
+        for (int i = 0; i < n_params && pos > 0 && (size_t)pos < sizeof(meta_json) - 4; i++) {
+            char esc[256];
+            json_escape_into(params[i], esc, sizeof(esc));
+            int r = snprintf(meta_json + pos, sizeof(meta_json) - (size_t)pos,
+                             "%s\"%s\"", i > 0 ? "," : "", esc);
+            if (r > 0) pos += r;
+        }
+        if (pos > 0 && (size_t)pos < sizeof(meta_json) - 2)
+            snprintf(meta_json + pos, sizeof(meta_json) - (size_t)pos, "]}");
+    }
+
+    char err[128];
+    json_doc *msg  = json_parse(msg_json,  strlen(msg_json),  err, sizeof(err));
+    if (!msg)  FAIL("render_row_with_numeric: msg parse failed");
+    json_doc *meta = json_parse(meta_json, strlen(meta_json), err, sizeof(err));
+    if (!meta) FAIL("render_row_with_numeric: meta parse failed");
+
+    handle_grappa_server_window_row(tx, &sess, "notice", sender,
+                                    json_root(msg), json_root(meta), 0);
+    json_free(msg);
+    json_free(meta);
+    drain(tx, out, out_sz);
+}
+
 /* A user's private notice: the client must see a user prefix, or it files
  * the line as server chrome and drops the nick-derived tags with it. */
 TEST(a_user_sender_gets_a_user_prefix) {
@@ -200,6 +260,103 @@ TEST(sender_kind_server_works_for_dotted_hostname) {
     CHECK_STR(buf, ":leaf4.azzurra.chat NOTICE me :*** Global notice\r\n");
 }
 
+/* ── Numeric rendering (#113) ────────────────────────────────────────────────
+ *
+ * When meta carries both `numeric` and `raw_params`, the row must be emitted
+ * as the real IRC numeric — not a NOTICE — so that middle params reach the
+ * client.  The issue's verification matrix:
+ *
+ *   /stats l → 211 with full link columns (many middle params)
+ *   /stats u → 242 with uptime in trailing only (regression guard)
+ *   /stats o → 243 with O-line fields in middle params (empty trailing)
+ *   end-of-stats → 219 with single trailing (regression guard)
+ *
+ * The NOTICE path must survive unchanged for bare notices (no numeric) and
+ * for old-grappa rows that carry numeric but no raw_params. */
+
+/* RPL_STATSLINKINFO (211): six middle params + trailing.  This is the
+ * primary regression — every column was previously dropped, leaving only
+ * the last field ("Open_since Idle TS"). */
+TEST(numeric_211_emits_full_params) {
+    char buf[1024];
+    const char *params[] = {
+        "leaf4.azzurra.chat", "0", "12345", "67890", "11111", "22222", "Open_since Idle TS"
+    };
+    render_row_with_numeric("hub.azzurra.chat", 211, params, 7, "Open_since Idle TS",
+                            buf, sizeof(buf));
+    CHECK_STR(buf, ":hub.azzurra.chat 211 me leaf4.azzurra.chat 0 12345 67890 11111 22222"
+                   " :Open_since Idle TS\r\n");
+}
+
+/* RPL_STATSUPTIME (242): trailing-only, all payload in body.  The pre-fix
+ * NOTICE path forwarded this correctly; the numeric path must preserve it
+ * and now also emit the real numeric code instead of NOTICE. */
+TEST(numeric_242_trailing_only_regression_guard) {
+    char buf[1024];
+    const char *params[] = { "Server Up 3 days 12:34:56" };
+    render_row_with_numeric("hub.azzurra.chat", 242, params, 1, "Server Up 3 days 12:34:56",
+                            buf, sizeof(buf));
+    /* Must be a 242, not a NOTICE; body text must be present. */
+    CHECK_STR(buf, ":hub.azzurra.chat 242 me :Server Up 3 days 12:34:56\r\n");
+}
+
+/* RPL_STATSOLINE (243): payload entirely in middle params, empty trailing.
+ * Pre-fix: body="" → NOTICE with empty body → "no line arrives" from the
+ * client's perspective (the NOTICE was sent but useless).  Post-fix: real
+ * 243 with O-line data. */
+TEST(numeric_243_empty_trailing_middle_params_present) {
+    char buf[1024];
+    const char *params[] = { "O", "*", "192.0.2.1", "testoper", "NetAdmin", "" };
+    render_row_with_numeric("hub.azzurra.chat", 243, params, 6, "",
+                            buf, sizeof(buf));
+    /* All five middle params must be present; trailing is empty but present. */
+    CHECK_STR(buf, ":hub.azzurra.chat 243 me O * 192.0.2.1 testoper NetAdmin :\r\n");
+}
+
+/* Single-trailing numeric (219 RPL_ENDOFSTATS): regression guard that the
+ * simplest case (one element in raw_params = just the trailing) is correct. */
+TEST(numeric_219_end_of_stats) {
+    char buf[1024];
+    const char *params[] = { "End of /STATS report." };
+    render_row_with_numeric("hub.azzurra.chat", 219, params, 1, "End of /STATS report.",
+                            buf, sizeof(buf));
+    CHECK_STR(buf, ":hub.azzurra.chat 219 me :End of /STATS report.\r\n");
+}
+
+/* Numeric with no raw_params (old grappa that pre-dates grappa #424):
+ * must fall back to the NOTICE path unchanged. */
+TEST(numeric_without_raw_params_falls_back_to_notice) {
+    char buf[1024];
+    /* Build meta with only numeric (no raw_params key). */
+    struct grappa_session sess;
+    memset(&sess, 0, sizeof(sess));
+    snprintf(sess.network_nick, sizeof(sess.network_nick), "%s", "me");
+
+    int tx = open_client();
+    if (tx < 0) { buf[0] = '\0'; return; }
+
+    json_doc *msg_d = body_doc("some text");
+    const char *meta_json = "{\"numeric\":211}";
+    char err[64];
+    json_doc *meta_d = json_parse(meta_json, strlen(meta_json), err, sizeof(err));
+    if (!meta_d) FAIL("numeric_without_raw_params_falls_back_to_notice: meta parse failed");
+
+    handle_grappa_server_window_row(tx, &sess, "notice", "hub.azzurra.chat",
+                                    json_root(msg_d), json_root(meta_d), 0);
+    json_free(msg_d);
+    json_free(meta_d);
+    drain(tx, buf, sizeof(buf));
+    CHECK_STR(buf, ":hub.azzurra.chat NOTICE me :some text\r\n");
+}
+
+/* Bare notice with no numeric key: the NOTICE path must be entirely
+ * unaffected by the new numeric check. */
+TEST(bare_notice_without_numeric_stays_notice) {
+    char buf[1024];
+    render_row("notice", "hub.azzurra.chat", "*** Global -- from oper: hello", buf, sizeof(buf));
+    CHECK_STR(buf, ":hub.azzurra.chat NOTICE me :*** Global -- from oper: hello\r\n");
+}
+
 /* The prefix-less sentinel. "*" is not a usable IRC prefix, so the bridge
  * speaks under its own name rather than emitting something a client has
  * to guess at. */
@@ -225,5 +382,12 @@ int main(void) {
     RUN(sender_kind_server_overrides_dot_heuristic);
     RUN(sender_kind_user_works_for_normal_nick);
     RUN(sender_kind_server_works_for_dotted_hostname);
+    /* numeric rendering (#113) */
+    RUN(numeric_211_emits_full_params);
+    RUN(numeric_242_trailing_only_regression_guard);
+    RUN(numeric_243_empty_trailing_middle_params_present);
+    RUN(numeric_219_end_of_stats);
+    RUN(numeric_without_raw_params_falls_back_to_notice);
+    RUN(bare_notice_without_numeric_stays_notice);
     return test_report();
 }
