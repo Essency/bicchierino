@@ -128,11 +128,17 @@ class IRCConn:
 
 # ── IRC helpers ───────────────────────────────────────────────────────────────
 
-def irc_register(conn: IRCConn, nick: str, password: str) -> bool:
-    """Send PASS/NICK/USER; drain through 004.  Return True on success."""
+def irc_register(conn: IRCConn, nick: str, password: str, user: str = "") -> bool:
+    """Send PASS/NICK/USER; drain through 004.  Return True on success.
+
+    `user` is the grappa account name sent in USER (bicchierino routes logins
+    by this field, not the IRC nick).  Defaults to `nick` when omitted, but
+    callers that need a specific grappa account should pass it explicitly.
+    """
+    acct = user if user else nick
     conn.send(f"PASS {password}")
     conn.send(f"NICK {nick}")
-    conn.send(f"USER {nick} 0 * :bicchierino-test")
+    conn.send(f"USER {acct} 0 * :bicchierino-test")
     deadline = time.monotonic() + 60.0
     while time.monotonic() < deadline:
         text = conn.recv_line(timeout=60.0)
@@ -278,7 +284,7 @@ def main() -> None:
 
     # ── Register ──────────────────────────────────────────────────────────────
     print("Registering as bicc-raw…", flush=True)
-    if not irc_register(conn, "bicc-raw", "bahamut-test:test-password-not-secret"):
+    if not irc_register(conn, "bicc-raw", "bahamut-test:test-password-not-secret", user="bicc"):
         print("FATAL: registration failed (no 004 received)", file=sys.stderr)
         conn.close()
         sys.exit(1)
