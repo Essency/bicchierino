@@ -1,5 +1,6 @@
 #include "ws_client.h"
 
+#include <errno.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -261,7 +262,17 @@ ws_result ws_client_recv(struct ws_client *wsc, char **payload, size_t *len) {
 
     unsigned char chunk[4096];
     int n = conn_read(wsc->ssl, wsc->fd, chunk, sizeof(chunk));
-    if (n <= 0) return n == 0 ? WS_CLOSED : WS_ERROR;
+    if (n == 0) return WS_CLOSED;
+    if (n < 0) {
+        /* EAGAIN / EWOULDBLOCK: SO_RCVTIMEO expired (or TLS returned
+         * WANT_READ / WANT_WRITE, mapped to EAGAIN by conn_read).  This
+         * is not an error — no data arrived yet.  Return WS_NEED_MORE so
+         * the Phase 2 poll() loop goes back to waiting rather than
+         * tearing down a healthy session (#111).
+         * EINTR is already absorbed by conn_read's own retry loop. */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return WS_NEED_MORE;
+        return WS_ERROR;
+    }
     if (!ws_reader_feed(&wsc->reader, chunk, (size_t)n)) return WS_ERROR;
 
     return ws_reader_take(&wsc->reader, payload, len);
