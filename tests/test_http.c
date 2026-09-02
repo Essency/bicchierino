@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 
 /* ── parse_grappa_url ────────────────────────────────────────────── */
 
@@ -489,6 +490,101 @@ TEST(read_into_zero_is_a_no_op) {
  * note is that the untested path exists, so nobody reads the suite as
  * covering a short read from the network. */
 
+/* ── conn_read EAGAIN / EINTR handling (#111) ────────────────────── */
+
+/* conn_read must translate EAGAIN (SO_RCVTIMEO expiry) into -1 with
+ * errno preserved, so ws_client_recv can return WS_NEED_MORE rather
+ * than WS_ERROR and avoid tearing down a healthy session.
+ *
+ * A socketpair with a sub-millisecond SO_RCVTIMEO triggers the condition
+ * without burning HTTP_IO_TIMEOUT_SEC of wall clock. */
+TEST(conn_read_preserves_eagain_errno_on_read_timeout) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+
+    /* 1 ms timeout: read(2) returns -1/EAGAIN immediately when nothing
+     * has been written to the other end — the same mechanism that fires
+     * after HTTP_IO_TIMEOUT_SEC on the real grappa socket. */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
+    setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char buf[16];
+    int n = conn_read(NULL, fds[0], buf, sizeof(buf));
+
+    /* Must return -1 with errno EAGAIN or EWOULDBLOCK — NOT any other
+     * value that ws_client_recv would interpret as WS_ERROR. */
+    CHECK_LONG(n, -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* conn_read must retry transparently when read(2) is interrupted by a
+ * signal (EINTR) — the rest of the codebase (connection.c:1533,
+ * main.c:165) handles EINTR the same way around poll(). */
+static volatile sig_atomic_t g_eintr_test_fired;
+static void eintr_test_handler(int sig) { (void)sig; g_eintr_test_fired = 1; }
+
+TEST(conn_read_retries_eintr_and_delivers_the_data) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+
+    /* Install a SIGUSR1 handler WITHOUT SA_RESTART so the signal
+     * interrupts read(2) and produces EINTR rather than being
+     * transparently restarted by the kernel. */
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = eintr_test_handler;
+    /* sa_flags deliberately omits SA_RESTART */
+    sigaction(SIGUSR1, &sa, &old);
+    g_eintr_test_fired = 0;
+
+    /* Fork a child that: sends SIGUSR1 to the parent (causing EINTR on
+     * the blocked read), then immediately writes data so conn_read's
+     * retry loop finds data waiting. */
+    pid_t pid = fork();
+    if (pid < 0) {
+        FAIL("fork");
+        sigaction(SIGUSR1, &old, NULL);
+        close(fds[0]);
+        close(fds[1]);
+        return;
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        kill(getppid(), SIGUSR1);
+        /* Short sleep so the parent is likely blocked in read() before
+         * the write arrives — nanosleep is POSIX 2008, usleep is not. */
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 }; /* 5 ms */
+        nanosleep(&ts, NULL);
+        const char data[] = "hi";
+        ssize_t nw = write(fds[1], data, sizeof(data) - 1);
+        (void)nw; /* in the child, losing the write is not a test failure */
+        _exit(0);
+    }
+    close(fds[1]);
+
+    char buf[16];
+    int n = conn_read(NULL, fds[0], buf, sizeof(buf));
+
+    /* Whether EINTR fired before or after the write, conn_read must
+     * deliver the data (if the signal arrived after the write, read
+     * returned immediately — both outcomes are correct for this test). */
+    CHECK(n > 0);
+    if (n > 0) CHECK(memcmp(buf, "hi", (size_t)n) == 0);
+
+    waitpid(pid, NULL, 0);
+    sigaction(SIGUSR1, &old, NULL);
+    close(fds[0]);
+}
+
 /* ── socket timeouts on the grappa leg ───────────────────────────── */
 
 /* Unlike everything above, these need a peer: the property under test is
@@ -758,6 +854,8 @@ int main(void) {
     RUN(readline_refuses_a_line_that_does_not_fit);
     RUN(read_into_copies_exactly_n_bytes);
     RUN(read_into_zero_is_a_no_op);
+    RUN(conn_read_preserves_eagain_errno_on_read_timeout);
+    RUN(conn_read_retries_eintr_and_delivers_the_data);
     RUN(tcp_connect_bounds_the_connect_itself);
     RUN(tls_connect_bounds_reads_and_writes);
     return test_report();

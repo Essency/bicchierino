@@ -319,6 +319,20 @@ jobs:
             -v "$(pwd)/raw_passthrough_check.py:/check.py:ro" \
             python:3.12-slim python3 /check.py
 
+      # Server-numeric rendering regression (#113): $server rows that carry
+      # an IRC numeric must arrive as the real numeric (:<server> NNN <nick>
+      # [params] :<trailing>), not as a NOTICE that drops every middle param.
+      # Checks STATS u (242, trailing-only — regression guard) and STATS l
+      # (211, multi-param — the primary regression case).
+      - name: Server numeric rendering check (#113)
+        run: |
+          cd test
+          bicc_net="$($COMPOSE ps --format '{{.Project}}' | head -1)_bicc-net"
+          docker run --rm \
+            --network "$bicc_net" \
+            -v "$(pwd)/numerics_check.py:/check.py:ro" \
+            python:3.12-slim python3 /check.py
+
       - name: Stack logs
         if: failure()
         run: cd test && $COMPOSE logs --tail=300

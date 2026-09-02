@@ -1,5 +1,6 @@
 #include "http.h"
 
+#include <errno.h>
 #include <netdb.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -127,8 +128,32 @@ static bool parse_grappa_url(const char *url, struct parsed_url *out) {
  * which this codebase never sets) is all-or-nothing. Without the loop
  * the plaintext path would silently truncate a request under load. */
 int conn_read(SSL *ssl, int fd, void *buf, size_t len) {
-    if (ssl) return SSL_read(ssl, buf, (int)len);
-    ssize_t n = read(fd, buf, len);
+    if (ssl) {
+        /* SSL_read returning <= 0 does not have the same meaning as
+         * plain read(2) — SSL_get_error is the only way to distinguish
+         * a clean shutdown from a transient want-more-data from a real
+         * error.  Map WANT_READ / WANT_WRITE onto EAGAIN so
+         * ws_client_recv can treat them as "no complete data yet"
+         * instead of as a fatal error (#111).  Explicitly set errno for
+         * the non-transient case too, so a stale EAGAIN left by a
+         * previous syscall can never fool the caller into thinking the
+         * socket is healthy when it is not. */
+        int n = SSL_read(ssl, buf, (int)len);
+        if (n > 0) return n;
+        int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_ZERO_RETURN) return 0; /* clean TLS close_notify */
+        errno = (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) ? EAGAIN : EIO;
+        return -1;
+    }
+    /* Plain read: retry on EINTR (a signal interrupted the syscall —
+     * nothing is wrong with the connection, just retry).  Leave errno
+     * as-is after any other negative return so the caller can
+     * distinguish EAGAIN / EWOULDBLOCK (SO_RCVTIMEO expiry — try again
+     * later) from a real I/O error (#111). */
+    ssize_t n;
+    do {
+        n = read(fd, buf, len);
+    } while (n == -1 && errno == EINTR);
     return (int)n;
 }
 

@@ -1,5 +1,6 @@
 #include "ws_client.h"
 
+#include <errno.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -7,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strncasecmp — POSIX, but not implicitly pulled in by string.h */
+#include <sys/socket.h> /* setsockopt, SOL_SOCKET, SO_RCVTIMEO, SO_SNDTIMEO */
+#include <sys/time.h>   /* struct timeval */
 #include <unistd.h>
 
 #include "http.h"
@@ -186,6 +189,22 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
     }
 
     ws_reader_init(&out->reader);
+
+    /* Clear the HTTP-phase I/O timeout — it must not persist into the
+     * long-lived WebSocket phase, where silence is the normal state.
+     * grappa's own ping cadence is documented at 30-60 s (connection.c
+     * §ping), which straddles the 30 s HTTP_IO_TIMEOUT_SEC deadline rather
+     * than staying safely inside it.  A zero timeval is the kernel's
+     * "block forever" (i.e. no timeout) — the Phase 2 poll()-gated read
+     * loop supplies its own timing and must not be disrupted by a stale
+     * SO_RCVTIMEO left over from the HTTP exchange.
+     * Mirrors the identical clear connection.c performs on the IRC client
+     * fd after registration (connection.c "SO_RCVTIMEO left over from
+     * Phase 1"). */
+    struct timeval no_tv = {0, 0};
+    setsockopt(out->fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
+    setsockopt(out->fd, SOL_SOCKET, SO_SNDTIMEO, &no_tv, sizeof(no_tv));
+
     /* Bytes past the header terminator are already websocket frames —
      * TCP has no message boundaries, the peer's first frame(s) may have
      * arrived in the same segment as the 101 response. Feed them in
@@ -261,7 +280,17 @@ ws_result ws_client_recv(struct ws_client *wsc, char **payload, size_t *len) {
 
     unsigned char chunk[4096];
     int n = conn_read(wsc->ssl, wsc->fd, chunk, sizeof(chunk));
-    if (n <= 0) return n == 0 ? WS_CLOSED : WS_ERROR;
+    if (n == 0) return WS_CLOSED;
+    if (n < 0) {
+        /* EAGAIN / EWOULDBLOCK: SO_RCVTIMEO expired (or TLS returned
+         * WANT_READ / WANT_WRITE, mapped to EAGAIN by conn_read).  This
+         * is not an error — no data arrived yet.  Return WS_NEED_MORE so
+         * the Phase 2 poll() loop goes back to waiting rather than
+         * tearing down a healthy session (#111).
+         * EINTR is already absorbed by conn_read's own retry loop. */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return WS_NEED_MORE;
+        return WS_ERROR;
+    }
     if (!ws_reader_feed(&wsc->reader, chunk, (size_t)n)) return WS_ERROR;
 
     return ws_reader_take(&wsc->reader, payload, len);
