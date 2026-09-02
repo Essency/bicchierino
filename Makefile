@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse
 
 .PHONY: all clean install version check debug
 
@@ -106,6 +106,13 @@ tests/test_config: tests/test_config.c tests/test.h src/config.c src/config.h
 # half does TLS, even though none of it is exercised.
 tests/test_http: tests/test_http.c tests/test.h src/http.c src/http.h
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_http.c -lssl -lcrypto
+
+# Links the real http.c (for conn_read), ws_client.c (the function
+# under test), and ws.c (the ws_reader that ws_client_recv calls).
+# Tests that EAGAIN from conn_read surfaces as WS_NEED_MORE rather
+# than WS_ERROR (#111).
+tests/test_ws_client: tests/test_ws_client.c tests/test.h src/http.c src/http.h src/ws_client.c src/ws_client.h src/ws.c src/ws.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_ws_client.c src/http.c src/ws_client.c src/ws.c -lssl -lcrypto
 
 # ws_stub.c replaces ws_client.c at link time. The REAL ws.c comes along:
 # bridge_recv_buffered forwards straight into that reader, and a stubbed
