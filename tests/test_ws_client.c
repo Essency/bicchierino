@@ -24,6 +24,7 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <signal.h>
+#include <strings.h> /* strncasecmp — POSIX, not implicitly pulled in by string.h */
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -194,7 +195,10 @@ static void serve_ws_upgrade(int connfd) {
                         "Sec-WebSocket-Accept: %s\r\n"
                         "\r\n",
                         accept_b64);
-    if (rlen > 0) (void)write(connfd, resp, (size_t)rlen);
+    if (rlen > 0) {
+        ssize_t nw = write(connfd, resp, (size_t)rlen);
+        (void)nw; /* in the child, losing the write is not a test failure */
+    }
 
     /* Stay alive until the parent kills us — the connection must remain
      * open so ws_client_connect can verify the socket options on it. */
