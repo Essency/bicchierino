@@ -323,6 +323,35 @@ TEST(numeric_219_end_of_stats) {
     CHECK_STR(buf, ":hub.azzurra.chat 219 me :End of /STATS report.\r\n");
 }
 
+/* RPL_ISON (303) — empty notify list / nobody in list online.
+ *
+ * Both bahamut (s_user.c:3435-3438) and solanum (m_ison.c:101) build the
+ * 303 line by appending "nick " for every online nick.  When nobody in the
+ * ISON query is online — or when bicchierino sends an ISON for a notify list
+ * whose entries are all offline — the ircd sends:
+ *
+ *   :<server> 303 <nick> :
+ *
+ * grappa persists this as raw_params: [""] — a single-element array whose
+ * only element is the empty trailing param.  The pre-fix NOTICE path rendered
+ * this as "NOTICE me :" (still wrong: a NOTICE, not a numeric, and body=""
+ * means row_text() returns "", which some callers treat as absent).  The
+ * numeric path must emit the real 303 with the empty trailing present.
+ *
+ * This is the complement of the 243 case (empty trailing WITH middle params).
+ * Here there are NO middle params at all — n_p = 1, the middle-param loop
+ * does not execute, and only the empty trailing is emitted.  Verifying this
+ * case catches any future regression where empty-trailing handling is broken
+ * specifically for the no-middle-param shape. */
+TEST(numeric_303_ison_empty_list) {
+    char buf[1024];
+    const char *params[] = { "" };
+    render_row_with_numeric("hub.azzurra.chat", 303, params, 1, "",
+                            buf, sizeof(buf));
+    /* Must be a 303, not a NOTICE; trailing must be present (colon only). */
+    CHECK_STR(buf, ":hub.azzurra.chat 303 me :\r\n");
+}
+
 /* Numeric with no raw_params (old grappa that pre-dates grappa #424):
  * must fall back to the NOTICE path unchanged. */
 TEST(numeric_without_raw_params_falls_back_to_notice) {
@@ -387,6 +416,7 @@ int main(void) {
     RUN(numeric_242_trailing_only_regression_guard);
     RUN(numeric_243_empty_trailing_middle_params_present);
     RUN(numeric_219_end_of_stats);
+    RUN(numeric_303_ison_empty_list);
     RUN(numeric_without_raw_params_falls_back_to_notice);
     RUN(bare_notice_without_numeric_stays_notice);
     return test_report();
