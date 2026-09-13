@@ -514,11 +514,13 @@ struct grappa_session {
      * (WeeChat, etc.) build their nicklist groups from the correct prefix set.
      *
      * `isupport_changed` is pushed by `push_isupport_if_live/3` (grappa
-     * v0.14.0, confirmed against the vendored `test/grappa`), which is called
-     * exclusively from `push_channel_snapshot/4` — the `{:after_join,
-     * {:channel, ...}}` handler. The user-topic snapshot (`push_user_snapshot`
-     * → `push_session_snapshot`) does NOT push isupport (#90 root cause: #82
-     * joined the user topic hoping this would work, but it never did).
+     * v0.14.0), called from `push_channel_snapshot/4` — the `{:after_join,
+     * {:channel, ...}}` handler — AND (since grappa v1.1.0/#1255) from the
+     * user-topic snapshot (`session_snapshot/2`) so that the live PREFIX/
+     * CHANMODES arrive before any channel topic is joined.  On a multi-
+     * network account this means the user-topic join delivers one
+     * `isupport_changed` per network, which is why the handler filters by
+     * `network_id` before acting.
      *
      * The channel-topic snapshot itself arrives in a SEPARATE message after
      * the `phx_reply` bridge_join already consumed: grappa schedules it via
@@ -1453,8 +1455,12 @@ static void bridge_event_dispatch(void *ctx_raw, const char *payload, size_t pay
 /* Phase 1 of the three-phase topic join (#82/#90): join the user topic.
  * The user-topic snapshot seeds per-session state (umodes, session identity,
  * invited windows — see grappa's push_user_snapshot/push_session_snapshot).
- * It does NOT push isupport_changed (#90 root cause); that comes from the
- * channel-shaped topic joined in Phase 2 (join_server_topic). */
+ * As of grappa v1.1.0/#1255 the user-topic snapshot ALSO delivers
+ * isupport_changed (one per network held by the account); the handler
+ * filters by network_id so only the event for THIS connection's network
+ * takes effect.  The channel-topic join (Phase 2) still delivers its
+ * own isupport_changed for the same network — deduplicated by
+ * isupport_005_sent in the handler. */
 static void join_user_topic(int fd, const char *nick, struct bridge *br,
                              struct grappa_session *sess) {
     struct bridge_event_ctx ctx = {fd, nick, br, sess};
@@ -5395,6 +5401,18 @@ static void handle_grappa_members_seeded_event(int fd, const char *nick,
 static void handle_grappa_isupport_changed_event(int fd, const char *nick,
                                                    struct grappa_session *sess,
                                                    const json_value *payload) {
+    /* On a multi-network account the user topic delivers isupport_changed
+     * for EVERY network the account holds (grappa fans it via
+     * Broadcaster.to_user/2 keyed by network_id).  Drop events whose
+     * network_id does not match this connection's own network before the
+     * isupport_005_sent latch can fire on the wrong network's data.
+     * Events that carry no network_id field (legacy or pre-filter payloads)
+     * pass through unchanged. */
+    long event_network_id = 0;
+    bool has_network_id   = false;
+    json_long_opt(payload, "network_id", &event_network_id, &has_network_id);
+    if (has_network_id && event_network_id != sess->network_id) return;
+
     if (sess->isupport_005_sent) return;
 
     const json_value *groups[4] = {
@@ -5530,6 +5548,13 @@ static void handle_grappa_join_failed_event(int fd, const char *nick, struct gra
  * same "never send things that are not true" posture as the 005 fix. */
 static void handle_grappa_umode_changed_event(int fd, const struct grappa_session *sess,
                                                const char *nick, const json_value *payload) {
+    /* Same multi-network filter as handle_grappa_isupport_changed_event:
+     * umode_changed also rides the user topic and carries network_id. */
+    long event_network_id = 0;
+    bool has_network_id   = false;
+    json_long_opt(payload, "network_id", &event_network_id, &has_network_id);
+    if (has_network_id && event_network_id != sess->network_id) return;
+
     const json_value *modes = json_get(payload, "modes");
     if (!modes || json_type_of(modes) != JSON_ARRAY) return;
 
