@@ -188,8 +188,9 @@ TEST(incoming_dm_unaffected_by_echo_message_cap) {
 
     char buf[512];
     drain(tx, buf, sizeof(buf));
-    /* Routes to `target = sender` (Peer) — normal incoming DM shape */
-    CHECK_STR(buf, ":Peer PRIVMSG me :hi there\r\n");
+    /* For incoming DMs, target is re-keyed to sender (WIRE.md §5) —
+     * the query window is keyed by the sender nick, not own nick. */
+    CHECK_STR(buf, ":Peer PRIVMSG Peer :hi there\r\n");
 }
 
 int main(void) {
