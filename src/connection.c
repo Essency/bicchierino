@@ -411,6 +411,7 @@ struct registration {
     bool cap_message_tags;
     bool cap_batch;
     bool cap_chathistory;
+    bool cap_echo_message;
 };
 
 struct network_entry {
@@ -457,6 +458,7 @@ struct grappa_session {
     bool cap_message_tags;
     bool cap_batch;
     bool cap_chathistory;
+    bool cap_echo_message;
 
     /* WS join_refs (WIRE.md §4) — every later push on a topic must carry
      * the join_ref that topic's own phx_join returned, or Phoenix
@@ -749,7 +751,10 @@ static void send_tagged_line(int fd, const struct grappa_session *sess, long ser
  *
  * The advertised set otherwise mirrors shottino's own CAP LS list
  * (`shottino.c:20944-20946`) minus the caps shottino has that
- * bicchierino doesn't implement at all (`multi-prefix`, `echo-message`).
+ * bicchierino doesn't implement at all (`multi-prefix`). `echo-message`
+ * is now implemented (#123): when negotiated, sibling-client DMs are
+ * delivered as the real `:me PRIVMSG peer :body` wire shape instead of
+ * the fallback-for-vanilla-clients rewrite.
  *
  * `REQ` is atomic per line, matching common ircd practice: if EVERY
  * token in one REQ is a capability bicchierino recognizes, the whole
@@ -765,7 +770,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
 
     if (strcasecmp(sub, "LS") == 0) {
         reg->cap_negotiating = true;
-        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory",
+        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory echo-message",
                   IRCD_SERVER, target);
         return;
     }
@@ -774,10 +779,11 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         reg->cap_negotiating = true;
         char enabled[128] = "";
         size_t len = 0;
-        const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory"};
+        const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory",
+                               "echo-message"};
         bool flags[] = {reg->cap_server_time, reg->cap_message_tags, reg->cap_batch,
-                        reg->cap_chathistory};
-        for (size_t i = 0; i < 4; i++) {
+                        reg->cap_chathistory, reg->cap_echo_message};
+        for (size_t i = 0; i < 5; i++) {
             if (!flags[i]) continue;
             int written =
                 snprintf(enabled + len, sizeof(enabled) - len, "%s%s", len ? " " : "", names[i]);
@@ -792,7 +798,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         const char *want = msg->param_count > 1 ? msg->params[1] : "";
         bool all_known = true;
         bool want_server_time = false, want_message_tags = false, want_batch = false,
-             want_chathistory = false;
+             want_chathistory = false, want_echo_message = false;
         const char *cursor = want;
         char tok[64];
         while (next_space_token(&cursor, tok, sizeof(tok))) {
@@ -800,6 +806,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
             else if (strcmp(tok, "message-tags") == 0) want_message_tags = true;
             else if (strcmp(tok, "batch") == 0) want_batch = true;
             else if (strcmp(tok, "draft/chathistory") == 0) want_chathistory = true;
+            else if (strcmp(tok, "echo-message") == 0) want_echo_message = true;
             else all_known = false;
         }
         if (all_known) {
@@ -807,6 +814,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
             reg->cap_message_tags = reg->cap_message_tags || want_message_tags;
             reg->cap_batch = reg->cap_batch || want_batch;
             reg->cap_chathistory = reg->cap_chathistory || want_chathistory;
+            reg->cap_echo_message = reg->cap_echo_message || want_echo_message;
             send_line(fd, ":%s CAP %s ACK :%s", IRCD_SERVER, target, want);
         } else {
             send_line(fd, ":%s CAP %s NAK :%s", IRCD_SERVER, target, want);
@@ -4565,11 +4573,17 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         bool is_sibling_dm = is_self && channel[0] != '#' && !is_incoming_dm;
         char sibling_prefix[196];
         const char *effective_prefix = prefix;
-        if (is_sibling_dm) {
+        if (is_sibling_dm && !sess->cap_echo_message) {
             /* Use a bare nick prefix — same rationale as format_prefix()'s own
              * fallback (#97): a fabricated host poisons the client's stored
              * identity for ban-mask purposes.  A bare `:peer PRIVMSG me :body`
-             * is RFC-valid and routes to the right query window just as well. */
+             * is RFC-valid and routes to the right query window just as well.
+             *
+             * When the client negotiated echo-message (below), we skip this
+             * rewrite entirely and send the real `:me PRIVMSG peer :body` wire
+             * shape — the exact form echo-message-aware clients (e.g. WeeChat
+             * 4.10.0, irc-protocol.c:3232/3269/3324) already know how to route
+             * into the peer's query window and render as an outbound line. */
             snprintf(sibling_prefix, sizeof(sibling_prefix), "%s", channel);
             effective_prefix = sibling_prefix;
             target = sess->network_nick;
@@ -4591,7 +4605,7 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
          * PRIVMSG (never NOTICE), matching the wire convention. */
         char body_with_marker[900];
         const char *effective_body = body;
-        if (is_sibling_dm) {
+        if (is_sibling_dm && !sess->cap_echo_message) {
             if (strcmp(kind, "action") == 0) {
                 /* The marker must land INSIDE the CTCP frame, right
                  * after "ACTION ", not in front of the whole string —
@@ -6389,6 +6403,7 @@ void *connection_run(void *arg) {
     sess.cap_message_tags = reg.cap_message_tags;
     sess.cap_batch = reg.cap_batch;
     sess.cap_chathistory = reg.cap_chathistory;
+    sess.cap_echo_message = reg.cap_echo_message;
 
     /* One persistent HTTP/1.1 connection for every REST call this
      * session makes (login, both bootstrap GETs, every PRIVMSG send,
