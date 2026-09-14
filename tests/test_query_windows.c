@@ -1,11 +1,13 @@
-/* test_query_windows.c — query_windows_list diff logic (#120).
+/* test_query_windows.c — query_windows_list diff logic (#120) and
+ * grappa-to-client query-window-closed notification (#121).
  *
- * Bug: handle_grappa_query_windows_list_event was append-only.  grappa
- * broadcasts the FULL current DM window list on every change, so a
- * shrinking list is the wire signal for a closed query window.  The old
- * code only walked the incoming array to ADD newly-seen peers; it never
- * did a reverse pass to REMOVE peers that disappeared, leaving stale
- * PubSub subscriptions open and ratcheting MAX_DM_PEERS upward forever.
+ * Bug (fixed in #120): handle_grappa_query_windows_list_event was
+ * append-only.  grappa broadcasts the FULL current DM window list on
+ * every change, so a shrinking list is the wire signal for a closed
+ * query window.  The old code only walked the incoming array to ADD
+ * newly-seen peers; it never did a reverse pass to REMOVE peers that
+ * disappeared, leaving stale PubSub subscriptions open and ratcheting
+ * MAX_DM_PEERS upward forever.
  *
  * Fix (also in this commit): a reverse pass after the forward pass.
  * For every entry in dm_peer_names absent from the incoming list:
@@ -13,6 +15,12 @@
  *     ws_stub here) and compact the slot.
  * For every entry in pending_dm_peer_names absent from the list:
  *   — just compact the slot (bridge_join never ran, no leave needed).
+ *
+ * Enhancement (#121): when a peer is removed in the reverse pass,
+ * bicchierino now also sends a NOTICE to the client's fd so the close
+ * event is observable without a WeeChat script.  Tests here use a
+ * socketpair so the write() inside notify_query_window_closed() has
+ * somewhere to land; the existing phx_leave assertions still pass.
  *
  * Test structure follows test_server_topic_bootstrap.c: include
  * connection.c to reach the static handler, ws_stub.c at link time to
@@ -29,6 +37,32 @@
 #include "ws_stub.h"
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
+
+static int g_rx = -1;
+
+/* Open a socketpair, leave the read end in g_rx, return the write end. */
+static int open_pair(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        FAIL("socketpair");
+        return -1;
+    }
+    g_rx = sv[0];
+    return sv[1];
+}
+
+/* Close write end, drain everything the handler wrote, close read end. */
+static size_t drain_pair(int tx, char *out, size_t cap) {
+    close(tx);
+    size_t total = 0;
+    ssize_t n;
+    while (total + 1 < cap && (n = read(g_rx, out + total, cap - total - 1)) > 0)
+        total += (size_t)n;
+    out[total] = '\0';
+    close(g_rx);
+    g_rx = -1;
+    return total;
+}
 
 static struct grappa_session make_sess(void) {
     struct grappa_session s = {0};
@@ -70,11 +104,21 @@ static json_doc *make_list_payload(const char **nicks) {
 }
 
 /* Convenience: call handle_grappa_query_windows_list_event with a list
- * payload for the given nicks, using the provided sess and bridge. */
+ * payload for the given nicks, using the provided sess and bridge.
+ * Uses fd=-1 so any NOTICE write is a no-op (EBADF, ignored). */
 static void call_handler(struct grappa_session *sess, struct bridge *br,
                           const char **nicks) {
     json_doc *d = make_list_payload(nicks);
-    handle_grappa_query_windows_list_event(sess, br, json_root(d));
+    handle_grappa_query_windows_list_event(-1, "testuser", sess, br, json_root(d));
+    json_free(d);
+}
+
+/* Like call_handler but feeds a real socketpair write end so we can
+ * read back what bicchierino sent to the client. */
+static void call_handler_fd(int fd, struct grappa_session *sess, struct bridge *br,
+                              const char **nicks) {
+    json_doc *d = make_list_payload(nicks);
+    handle_grappa_query_windows_list_event(fd, "testuser", sess, br, json_root(d));
     json_free(d);
 }
 
@@ -278,6 +322,88 @@ TEST(case_folding_prevents_leave_for_same_folded_nick) {
     bridge_close(&br);
 }
 
+/* ── grappa-to-client NOTICE tests (#121) ────────────────────────────────── */
+
+/* When a joined peer disappears from the list, bicchierino must send a
+ * NOTICE to the client fd (so the event is visible in the server buffer
+ * even without a WeeChat script). */
+TEST(closed_joined_peer_sends_client_notice) {
+    ws_stub_reset();
+    struct grappa_session sess = make_sess();
+    struct bridge br = make_bridge();
+
+    snprintf(sess.dm_peer_names[0], sizeof(sess.dm_peer_names[0]), "alice");
+    sess.dm_peer_join_refs[0] = 42;
+    sess.dm_peer_count = 1;
+
+    char buf[512];
+    int tx = open_pair();
+    if (tx < 0) return;
+
+    const char *empty[] = {NULL};
+    call_handler_fd(tx, &sess, &br, empty);
+    drain_pair(tx, buf, sizeof(buf));
+
+    /* A NOTICE from IRCD_SERVER to the registered nick must be present. */
+    CHECK(strstr(buf, ":bicchierino NOTICE testuser :") != NULL);
+    /* The peer nick must appear in the message body. */
+    CHECK(strstr(buf, "alice") != NULL);
+
+    bridge_close(&br);
+}
+
+/* With message-tags CAP negotiated, the NOTICE must carry the
+ * bicchierino/query-window-closed tag with the peer nick as value. */
+TEST(closed_joined_peer_sends_tagged_notice_with_cap_message_tags) {
+    ws_stub_reset();
+    struct grappa_session sess = make_sess();
+    sess.cap_message_tags = true;
+    struct bridge br = make_bridge();
+
+    snprintf(sess.dm_peer_names[0], sizeof(sess.dm_peer_names[0]), "bob");
+    sess.dm_peer_join_refs[0] = 7;
+    sess.dm_peer_count = 1;
+
+    char buf[512];
+    int tx = open_pair();
+    if (tx < 0) return;
+
+    const char *empty[] = {NULL};
+    call_handler_fd(tx, &sess, &br, empty);
+    drain_pair(tx, buf, sizeof(buf));
+
+    /* Tag must be present with the peer nick as value. */
+    CHECK(strstr(buf, "@bicchierino/query-window-closed=bob") != NULL);
+    CHECK(strstr(buf, ":bicchierino NOTICE testuser :") != NULL);
+
+    bridge_close(&br);
+}
+
+/* A still-open peer must produce NO NOTICE and NO phx_leave. */
+TEST(still_open_peer_produces_no_notice) {
+    ws_stub_reset();
+    struct grappa_session sess = make_sess();
+    struct bridge br = make_bridge();
+
+    snprintf(sess.dm_peer_names[0], sizeof(sess.dm_peer_names[0]), "carol");
+    sess.dm_peer_join_refs[0] = 3;
+    sess.dm_peer_count = 1;
+
+    char buf[512];
+    int tx = open_pair();
+    if (tx < 0) return;
+
+    const char *nicks[] = {"carol", NULL};
+    call_handler_fd(tx, &sess, &br, nicks);
+    drain_pair(tx, buf, sizeof(buf));
+
+    /* No NOTICE, no phx_leave. */
+    CHECK(strstr(buf, "NOTICE") == NULL);
+    CHECK_LONG(ws_stub_sent_count(), 0);
+
+    bridge_close(&br);
+}
+
 int main(void) {
     RUN(new_peer_is_queued_as_pending);
     RUN(known_pending_peer_is_not_re_queued);
@@ -287,5 +413,8 @@ int main(void) {
     RUN(closed_pending_peer_is_dropped_without_leave);
     RUN(closed_peers_release_cap_for_new_ones);
     RUN(case_folding_prevents_leave_for_same_folded_nick);
+    RUN(closed_joined_peer_sends_client_notice);
+    RUN(closed_joined_peer_sends_tagged_notice_with_cap_message_tags);
+    RUN(still_open_peer_produces_no_notice);
     return test_report();
 }
