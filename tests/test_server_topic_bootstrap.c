@@ -73,6 +73,9 @@ static struct grappa_session make_sess(void) {
     snprintf(s.subject_name, sizeof(s.subject_name), "testuser");
     snprintf(s.network_nick, sizeof(s.network_nick), "testuser");
     snprintf(s.network_slug, sizeof(s.network_slug), "testnet");
+    /* Must match ISUPPORT_PUSH_FRAME's network_id so the network_id filter
+     * (fix for #124) passes rather than silently dropping the event. */
+    s.network_id = 1;
     return s;
 }
 

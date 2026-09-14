@@ -168,9 +168,83 @@ TEST(isupport_005_is_sent_only_once_per_session) {
     CHECK(second == NULL);
 }
 
+/* ── network_id filter tests (#124) ─────────────────────────────── */
+
+/* Regression for #124: on a two-network account the user topic delivers
+ * isupport_changed for EVERY network the account holds.  The handler must
+ * drop events whose network_id does not match sess->network_id, so the
+ * first network grappa happens to iterate cannot latch the wrong 005 into
+ * a sibling connection. */
+
+/* Payload with a MATCHING network_id: 005 must be sent. */
+TEST(network_id_match_sends_005) {
+    char err[128];
+    /* Payload includes network_id=7; session has network_id=7 → match → send. */
+    const char *json =
+        "{\"kind\":\"isupport_changed\",\"network_id\":7,"
+        "\"chanmodes_a\":[\"b\"],\"chanmodes_b\":[\"k\"],"
+        "\"chanmodes_c\":[\"l\"],\"chanmodes_d\":[\"m\",\"n\"],"
+        "\"prefix\":{\"o\":\"@\",\"v\":\"+\"}}";
+    json_doc *d = json_parse(json, strlen(json), err, sizeof(err));
+    if (!d) { FAIL("json_parse"); return; }
+
+    struct grappa_session sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.welcome_sent = true;
+    sess.network_id   = 7;   /* matches payload */
+
+    char out[1024];
+    int tx = open_client();
+    if (tx < 0) { json_free(d); return; }
+
+    handle_grappa_isupport_changed_event(tx, "nick", &sess, json_root(d));
+    json_free(d);
+    size_t len = drain(tx, out, sizeof(out));
+
+    /* Event for OUR network: 005 must be present. */
+    CHECK(len > 0);
+    CHECK(strstr(out, " 005 ") != NULL);
+}
+
+/* Payload with a MISMATCHED network_id: handler must return early, no
+ * 005 sent, isupport_005_sent must NOT latch (so the correct event can
+ * still send later). */
+TEST(network_id_mismatch_drops_event) {
+    char err[128];
+    /* Payload is for network_id=2; session is for network_id=1 → mismatch. */
+    const char *json =
+        "{\"kind\":\"isupport_changed\",\"network_id\":2,"
+        "\"chanmodes_a\":[\"b\"],\"chanmodes_b\":[\"k\"],"
+        "\"chanmodes_c\":[\"l\"],\"chanmodes_d\":[\"m\",\"n\"],"
+        "\"prefix\":{\"o\":\"@\",\"h\":\"%\",\"v\":\"+\"}}";
+    json_doc *d = json_parse(json, strlen(json), err, sizeof(err));
+    if (!d) { FAIL("json_parse"); return; }
+
+    struct grappa_session sess;
+    memset(&sess, 0, sizeof(sess));
+    sess.welcome_sent = true;
+    sess.network_id   = 1;   /* does NOT match payload's network_id=2 */
+
+    char out[1024];
+    int tx = open_client();
+    if (tx < 0) { json_free(d); return; }
+
+    handle_grappa_isupport_changed_event(tx, "nick", &sess, json_root(d));
+    json_free(d);
+    size_t len = drain(tx, out, sizeof(out));
+
+    /* Event for a SIBLING network: must be silently dropped. */
+    CHECK(len == 0);
+    /* The latch must NOT have fired — a subsequent matching event must
+     * still be able to send. */
+    CHECK(!sess.isupport_005_sent);
+}
+
 int main(void) {
     RUN(statusmsg_matches_prefix_sigils_for_three_level_prefix);
     RUN(statusmsg_matches_prefix_sigils_for_two_level_prefix);
     RUN(isupport_005_is_sent_only_once_per_session);
+    RUN(network_id_match_sends_005);
+    RUN(network_id_mismatch_drops_event);
     return test_report();
 }

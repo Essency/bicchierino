@@ -411,6 +411,7 @@ struct registration {
     bool cap_message_tags;
     bool cap_batch;
     bool cap_chathistory;
+    bool cap_echo_message;
 };
 
 struct network_entry {
@@ -457,6 +458,7 @@ struct grappa_session {
     bool cap_message_tags;
     bool cap_batch;
     bool cap_chathistory;
+    bool cap_echo_message;
 
     /* WS join_refs (WIRE.md §4) — every later push on a topic must carry
      * the join_ref that topic's own phx_join returned, or Phoenix
@@ -514,11 +516,13 @@ struct grappa_session {
      * (WeeChat, etc.) build their nicklist groups from the correct prefix set.
      *
      * `isupport_changed` is pushed by `push_isupport_if_live/3` (grappa
-     * v0.14.0, confirmed against the vendored `test/grappa`), which is called
-     * exclusively from `push_channel_snapshot/4` — the `{:after_join,
-     * {:channel, ...}}` handler. The user-topic snapshot (`push_user_snapshot`
-     * → `push_session_snapshot`) does NOT push isupport (#90 root cause: #82
-     * joined the user topic hoping this would work, but it never did).
+     * v0.14.0), called from `push_channel_snapshot/4` — the `{:after_join,
+     * {:channel, ...}}` handler — AND (since grappa v1.1.0/#1255) from the
+     * user-topic snapshot (`session_snapshot/2`) so that the live PREFIX/
+     * CHANMODES arrive before any channel topic is joined.  On a multi-
+     * network account this means the user-topic join delivers one
+     * `isupport_changed` per network, which is why the handler filters by
+     * `network_id` before acting.
      *
      * The channel-topic snapshot itself arrives in a SEPARATE message after
      * the `phx_reply` bridge_join already consumed: grappa schedules it via
@@ -637,6 +641,18 @@ struct grappa_session {
      * single-threaded per connection — so there is never a second batch
      * in flight to collide with. */
     unsigned long chathistory_batch_seq;
+
+    /* `GRAPPA visible on|off` (#122) — whether this connection reports
+     * itself as foreground-visible to grappa's presence layer.  Defaults
+     * true so a client that never sends the verb behaves exactly as before
+     * (the unconditional `{"visible":true}` that was here before this fix).
+     * The heartbeat re-push and the initial post-join push both read this
+     * field instead of the old literal, so the setting sticks for the life
+     * of the connection without any additional state.
+     *
+     * Initialised explicitly to true in connection_run — `{0}` zero-fills
+     * the struct which would silently default this to false. */
+    bool visible;
 };
 
 /* Current wall-clock time as unix milliseconds — the fallback
@@ -747,7 +763,10 @@ static void send_tagged_line(int fd, const struct grappa_session *sess, long ser
  *
  * The advertised set otherwise mirrors shottino's own CAP LS list
  * (`shottino.c:20944-20946`) minus the caps shottino has that
- * bicchierino doesn't implement at all (`multi-prefix`, `echo-message`).
+ * bicchierino doesn't implement at all (`multi-prefix`). `echo-message`
+ * is now implemented (#123): when negotiated, sibling-client DMs are
+ * delivered as the real `:me PRIVMSG peer :body` wire shape instead of
+ * the fallback-for-vanilla-clients rewrite.
  *
  * `REQ` is atomic per line, matching common ircd practice: if EVERY
  * token in one REQ is a capability bicchierino recognizes, the whole
@@ -763,7 +782,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
 
     if (strcasecmp(sub, "LS") == 0) {
         reg->cap_negotiating = true;
-        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory",
+        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory echo-message",
                   IRCD_SERVER, target);
         return;
     }
@@ -772,10 +791,11 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         reg->cap_negotiating = true;
         char enabled[128] = "";
         size_t len = 0;
-        const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory"};
+        const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory",
+                               "echo-message"};
         bool flags[] = {reg->cap_server_time, reg->cap_message_tags, reg->cap_batch,
-                        reg->cap_chathistory};
-        for (size_t i = 0; i < 4; i++) {
+                        reg->cap_chathistory, reg->cap_echo_message};
+        for (size_t i = 0; i < 5; i++) {
             if (!flags[i]) continue;
             int written =
                 snprintf(enabled + len, sizeof(enabled) - len, "%s%s", len ? " " : "", names[i]);
@@ -790,7 +810,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         const char *want = msg->param_count > 1 ? msg->params[1] : "";
         bool all_known = true;
         bool want_server_time = false, want_message_tags = false, want_batch = false,
-             want_chathistory = false;
+             want_chathistory = false, want_echo_message = false;
         const char *cursor = want;
         char tok[64];
         while (next_space_token(&cursor, tok, sizeof(tok))) {
@@ -798,6 +818,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
             else if (strcmp(tok, "message-tags") == 0) want_message_tags = true;
             else if (strcmp(tok, "batch") == 0) want_batch = true;
             else if (strcmp(tok, "draft/chathistory") == 0) want_chathistory = true;
+            else if (strcmp(tok, "echo-message") == 0) want_echo_message = true;
             else all_known = false;
         }
         if (all_known) {
@@ -805,6 +826,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
             reg->cap_message_tags = reg->cap_message_tags || want_message_tags;
             reg->cap_batch = reg->cap_batch || want_batch;
             reg->cap_chathistory = reg->cap_chathistory || want_chathistory;
+            reg->cap_echo_message = reg->cap_echo_message || want_echo_message;
             send_line(fd, ":%s CAP %s ACK :%s", IRCD_SERVER, target, want);
         } else {
             send_line(fd, ":%s CAP %s NAK :%s", IRCD_SERVER, target, want);
@@ -1453,8 +1475,12 @@ static void bridge_event_dispatch(void *ctx_raw, const char *payload, size_t pay
 /* Phase 1 of the three-phase topic join (#82/#90): join the user topic.
  * The user-topic snapshot seeds per-session state (umodes, session identity,
  * invited windows — see grappa's push_user_snapshot/push_session_snapshot).
- * It does NOT push isupport_changed (#90 root cause); that comes from the
- * channel-shaped topic joined in Phase 2 (join_server_topic). */
+ * As of grappa v1.1.0/#1255 the user-topic snapshot ALSO delivers
+ * isupport_changed (one per network held by the account); the handler
+ * filters by network_id so only the event for THIS connection's network
+ * takes effect.  The channel-topic join (Phase 2) still delivers its
+ * own isupport_changed for the same network — deduplicated by
+ * isupport_005_sent in the handler. */
 static void join_user_topic(int fd, const char *nick, struct bridge *br,
                              struct grappa_session *sess) {
     struct bridge_event_ctx ctx = {fd, nick, br, sess};
@@ -1613,9 +1639,12 @@ static void join_channel_topics(int fd, const char *nick, struct bridge *br,
     if (sess->user_join_ref) {
         char user_topic[160];
         snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess->subject_name);
-        if (bridge_push(br, user_topic, sess->user_join_ref, "visibility",
-                         "{\"visible\":true}")) {
-            fprintf(stderr, "bicchierino: visibility:true pushed\n");
+        char vis_payload[32];
+        snprintf(vis_payload, sizeof(vis_payload), "{\"visible\":%s}",
+                 sess->visible ? "true" : "false");
+        if (bridge_push(br, user_topic, sess->user_join_ref, "visibility", vis_payload)) {
+            fprintf(stderr, "bicchierino: visibility:%s pushed\n",
+                    sess->visible ? "true" : "false");
         } else {
             fprintf(stderr, "bicchierino: visibility push failed\n");
         }
@@ -2776,6 +2805,7 @@ static void handle_channel_modes_query(int fd, struct bridge *br, bool br_connec
  * authorization logic to maintain.
  *
  * v1 command set:
+ *   /grappa visible on|off
  *   /grappa whoami
  *   /grappa sessions
  *   /grappa session kick <id>
@@ -3740,7 +3770,8 @@ static void grappa_admin_vhost_revoke(int fd, const char *nick, struct http_clie
 /* /grappa help — static command list, one NOTICE per command. */
 static void grappa_admin_help(int fd, const char *nick) {
     static const char *const lines[] = {
-        "grappa admin commands (IRC /quote GRAPPA <subcommand>):",
+        "grappa commands (IRC /quote GRAPPA <subcommand>):",
+        "  visible on|off                      — set push-notification visibility for this connection",
         "  whoami                              — show your identity and admin status",
         "  sessions                            — list live grappa sessions",
         "  session kick <session-id>           — disconnect session (use [id] from sessions list)",
@@ -4130,8 +4161,57 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
      * to the admin API handler, which makes REST calls to grappa's
      * :admin_authn-gated surface.  The `GRAPPA NETWORK <slug>` Case B
      * selector is handled in the `!sess->network_resolved` block above
-     * and never reaches this point. */
+     * and never reaches this point.
+     *
+     * `GRAPPA visible on|off` (#122) is also handled locally — it sets
+     * sess->visible and pushes the value to grappa immediately.  Immediate
+     * rather than "stop re-pushing and let it age out": the 60s staleness
+     * window would eventually suppress push, but the `true->false`
+     * transition is also what arms grappa's auto-away debounce, and only an
+     * explicit write triggers it.  No admin auth required — every client
+     * manages their own visibility; the push rides the session's own token
+     * and join_ref exactly like the heartbeat push does.
+     *
+     * Handled before the registry / admin branches so it can write to a
+     * non-const sess and reach the live bridge pointer directly. */
     if (strcmp(msg->command, "GRAPPA") == 0) {
+        const char *sub = msg->param_count >= 1 ? msg->params[0] : "";
+        if (strcasecmp(sub, "visible") == 0) {
+            const char *arg = msg->param_count >= 2 ? msg->params[1] : "";
+            if (strcasecmp(arg, "on") == 0) {
+                sess->visible = true;
+            } else if (strcasecmp(arg, "off") == 0) {
+                sess->visible = false;
+            } else {
+                grappa_admin_notice(fd, sess->network_nick,
+                                    "usage: /quote GRAPPA visible on|off");
+                return false;
+            }
+            if (*br_connected && sess->user_join_ref) {
+                char user_topic[160];
+                snprintf(user_topic, sizeof(user_topic), "grappa:user:%s",
+                         sess->subject_name);
+                char vis_payload[32];
+                snprintf(vis_payload, sizeof(vis_payload), "{\"visible\":%s}",
+                         sess->visible ? "true" : "false");
+                if (bridge_push(br, user_topic, sess->user_join_ref,
+                                "visibility", vis_payload)) {
+                    grappa_admin_notice(fd, sess->network_nick,
+                                        "visibility set to %s",
+                                        sess->visible ? "true" : "false");
+                } else {
+                    grappa_admin_notice(fd, sess->network_nick,
+                                        "visibility updated locally but push failed"
+                                        " (will retry on next heartbeat)");
+                }
+            } else {
+                grappa_admin_notice(fd, sess->network_nick,
+                                    "visibility set to %s (bridge not connected yet"
+                                    " — will push on next heartbeat)",
+                                    sess->visible ? "true" : "false");
+            }
+            return false;
+        }
         if (!handle_grappa_registry_command(fd, hc, cfg, reg, sess, msg))
             handle_grappa_admin(fd, hc, cfg, sess->network_nick, sess, msg);
         return false;
@@ -4559,11 +4639,17 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
         bool is_sibling_dm = is_self && channel[0] != '#' && !is_incoming_dm;
         char sibling_prefix[196];
         const char *effective_prefix = prefix;
-        if (is_sibling_dm) {
+        if (is_sibling_dm && !sess->cap_echo_message) {
             /* Use a bare nick prefix — same rationale as format_prefix()'s own
              * fallback (#97): a fabricated host poisons the client's stored
              * identity for ban-mask purposes.  A bare `:peer PRIVMSG me :body`
-             * is RFC-valid and routes to the right query window just as well. */
+             * is RFC-valid and routes to the right query window just as well.
+             *
+             * When the client negotiated echo-message (below), we skip this
+             * rewrite entirely and send the real `:me PRIVMSG peer :body` wire
+             * shape — the exact form echo-message-aware clients (e.g. WeeChat
+             * 4.10.0, irc-protocol.c:3232/3269/3324) already know how to route
+             * into the peer's query window and render as an outbound line. */
             snprintf(sibling_prefix, sizeof(sibling_prefix), "%s", channel);
             effective_prefix = sibling_prefix;
             target = sess->network_nick;
@@ -4585,7 +4671,7 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
          * PRIVMSG (never NOTICE), matching the wire convention. */
         char body_with_marker[900];
         const char *effective_body = body;
-        if (is_sibling_dm) {
+        if (is_sibling_dm && !sess->cap_echo_message) {
             if (strcmp(kind, "action") == 0) {
                 /* The marker must land INSIDE the CTCP frame, right
                  * after "ACTION ", not in front of the whole string —
@@ -5395,6 +5481,18 @@ static void handle_grappa_members_seeded_event(int fd, const char *nick,
 static void handle_grappa_isupport_changed_event(int fd, const char *nick,
                                                    struct grappa_session *sess,
                                                    const json_value *payload) {
+    /* On a multi-network account the user topic delivers isupport_changed
+     * for EVERY network the account holds (grappa fans it via
+     * Broadcaster.to_user/2 keyed by network_id).  Drop events whose
+     * network_id does not match this connection's own network before the
+     * isupport_005_sent latch can fire on the wrong network's data.
+     * Events that carry no network_id field (legacy or pre-filter payloads)
+     * pass through unchanged. */
+    long event_network_id = 0;
+    bool has_network_id   = false;
+    json_long_opt(payload, "network_id", &event_network_id, &has_network_id);
+    if (has_network_id && event_network_id != sess->network_id) return;
+
     if (sess->isupport_005_sent) return;
 
     const json_value *groups[4] = {
@@ -5530,6 +5628,13 @@ static void handle_grappa_join_failed_event(int fd, const char *nick, struct gra
  * same "never send things that are not true" posture as the 005 fix. */
 static void handle_grappa_umode_changed_event(int fd, const struct grappa_session *sess,
                                                const char *nick, const json_value *payload) {
+    /* Same multi-network filter as handle_grappa_isupport_changed_event:
+     * umode_changed also rides the user topic and carries network_id. */
+    long event_network_id = 0;
+    bool has_network_id   = false;
+    json_long_opt(payload, "network_id", &event_network_id, &has_network_id);
+    if (has_network_id && event_network_id != sess->network_id) return;
+
     const json_value *modes = json_get(payload, "modes");
     if (!modes || json_type_of(modes) != JSON_ARRAY) return;
 
@@ -5575,13 +5680,22 @@ static void handle_grappa_away_confirmed_event(int fd, const char *nick,
  * ...}, ...]}}`, keyed by network_id AS A STRING since JSON object keys
  * are always strings, even though the Elixir side types it as
  * `integer()`). See `dm_peer_names`'s own doc on `struct grappa_session`
- * for why bicchierino needs this at all — this only QUEUES newly-seen
+ * for why bicchierino needs this at all.
+ *
+ * grappa broadcasts the FULL current DM window list on every change
+ * (`QueryWindows.open/4` and `QueryWindows.close/4` both end in
+ * `broadcast_windows_list/2`), so a list that SHRINKS is the wire
+ * signal for a closed query window.  Forward pass queues newly-seen
  * peers into `pending_dm_peer_names`; the actual `bridge_join` happens
- * in the Phase 2 main loop, same deferred pattern as `dm_needs_rejoin`,
- * for the same nested-bridge_join hazard (this can run nested inside
+ * in the Phase 2 main loop (same deferred pattern as `dm_needs_rejoin`,
+ * for the same nested-bridge_join hazard — this can run nested inside
  * another `bridge_join`'s wait loop via `bridge_event_dispatch`, e.g.
- * mid-bootstrap — confirmed live). */
+ * mid-bootstrap — confirmed live).  Reverse pass pushes `phx_leave` and
+ * compacts both arrays for every peer now absent from the list.
+ * `phx_leave` is fire-and-forget (never blocks), so it is safe inline
+ * even when nested — same reasoning as the rename path at line 4700. */
 static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
+                                                     struct bridge *br,
                                                      const json_value *payload) {
     char net_key[32];
     snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
@@ -5589,6 +5703,7 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
     const json_value *list = json_get(windows, net_key);
     if (!list || json_type_of(list) != JSON_ARRAY) return;
 
+    /* Forward pass: queue newly-seen peers. */
     for (size_t i = 0; i < json_len(list); i++) {
         const json_value *entry = json_at(list, i);
         const char *target_nick = NULL;
@@ -5611,6 +5726,65 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
         snprintf(sess->pending_dm_peer_names[sess->pending_dm_peer_count++],
                  sizeof(sess->pending_dm_peer_names[0]), "%s", folded);
     }
+
+    /* Reverse pass: compact dm_peer_names (already-joined topics).
+     * For each slot absent from the incoming list, push phx_leave and
+     * drop the slot; keep all others in place. */
+    size_t write = 0;
+    for (size_t j = 0; j < sess->dm_peer_count; j++) {
+        bool in_list = false;
+        for (size_t i = 0; i < json_len(list) && !in_list; i++) {
+            const json_value *entry = json_at(list, i);
+            const char *target_nick = NULL;
+            if (!json_str_req(entry, "target_nick", &target_nick)) continue;
+            char folded[64];
+            ascii_fold_lower(target_nick, folded, sizeof(folded));
+            if (strcmp(sess->dm_peer_names[j], folded) == 0) in_list = true;
+        }
+        if (!in_list) {
+            if (br) {
+                char dm_peer_topic[512];
+                snprintf(dm_peer_topic, sizeof(dm_peer_topic),
+                         "grappa:user:%s/network:%s/channel:%s",
+                         sess->subject_name, sess->network_slug, sess->dm_peer_names[j]);
+                bridge_push(br, dm_peer_topic, sess->dm_peer_join_refs[j], "phx_leave", "{}");
+                fprintf(stderr,
+                        "bicchierino: left stale DM peer topic %s (query window closed)\n",
+                        dm_peer_topic);
+            }
+        } else {
+            if (write != j) {
+                snprintf(sess->dm_peer_names[write], sizeof(sess->dm_peer_names[0]),
+                         "%s", sess->dm_peer_names[j]);
+                sess->dm_peer_join_refs[write] = sess->dm_peer_join_refs[j];
+            }
+            write++;
+        }
+    }
+    sess->dm_peer_count = write;
+
+    /* Reverse pass: compact pending_dm_peer_names (queued but not yet
+     * joined — bridge_join never ran, so no phx_leave is needed). */
+    write = 0;
+    for (size_t j = 0; j < sess->pending_dm_peer_count; j++) {
+        bool in_list = false;
+        for (size_t i = 0; i < json_len(list) && !in_list; i++) {
+            const json_value *entry = json_at(list, i);
+            const char *target_nick = NULL;
+            if (!json_str_req(entry, "target_nick", &target_nick)) continue;
+            char folded[64];
+            ascii_fold_lower(target_nick, folded, sizeof(folded));
+            if (strcmp(sess->pending_dm_peer_names[j], folded) == 0) in_list = true;
+        }
+        if (in_list) {
+            if (write != j)
+                snprintf(sess->pending_dm_peer_names[write],
+                         sizeof(sess->pending_dm_peer_names[0]),
+                         "%s", sess->pending_dm_peer_names[j]);
+            write++;
+        }
+    }
+    sess->pending_dm_peer_count = write;
 }
 
 /* WIRE.md §3/§6: `names_reply` payload is `{kind, network, channel,
@@ -6163,7 +6337,7 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "away_confirmed") == 0) {
         handle_grappa_away_confirmed_event(fd, nick, inner);
     } else if (strcmp(kind, "query_windows_list") == 0) {
-        handle_grappa_query_windows_list_event(sess, inner);
+        handle_grappa_query_windows_list_event(sess, br, inner);
     } else if (strcmp(kind, "joined") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
@@ -6295,6 +6469,8 @@ void *connection_run(void *arg) {
     sess.cap_message_tags = reg.cap_message_tags;
     sess.cap_batch = reg.cap_batch;
     sess.cap_chathistory = reg.cap_chathistory;
+    sess.cap_echo_message = reg.cap_echo_message;
+    sess.visible = true; /* explicit: {0} zero-fills, but default must be true (§122) */
 
     /* One persistent HTTP/1.1 connection for every REST call this
      * session makes (login, both bootstrap GETs, every PRIVMSG send,
@@ -6458,8 +6634,10 @@ void *connection_run(void *arg) {
             if (sess.user_join_ref) {
                 char user_topic[160];
                 snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess.subject_name);
-                bridge_push(&br, user_topic, sess.user_join_ref, "visibility",
-                            "{\"visible\":true}");
+                char vis_payload[32];
+                snprintf(vis_payload, sizeof(vis_payload), "{\"visible\":%s}",
+                         sess.visible ? "true" : "false");
+                bridge_push(&br, user_topic, sess.user_join_ref, "visibility", vis_payload);
             }
             next_heartbeat = time(NULL) + 25;
         }
