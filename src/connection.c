@@ -5614,13 +5614,22 @@ static void handle_grappa_away_confirmed_event(int fd, const char *nick,
  * ...}, ...]}}`, keyed by network_id AS A STRING since JSON object keys
  * are always strings, even though the Elixir side types it as
  * `integer()`). See `dm_peer_names`'s own doc on `struct grappa_session`
- * for why bicchierino needs this at all — this only QUEUES newly-seen
+ * for why bicchierino needs this at all.
+ *
+ * grappa broadcasts the FULL current DM window list on every change
+ * (`QueryWindows.open/4` and `QueryWindows.close/4` both end in
+ * `broadcast_windows_list/2`), so a list that SHRINKS is the wire
+ * signal for a closed query window.  Forward pass queues newly-seen
  * peers into `pending_dm_peer_names`; the actual `bridge_join` happens
- * in the Phase 2 main loop, same deferred pattern as `dm_needs_rejoin`,
- * for the same nested-bridge_join hazard (this can run nested inside
+ * in the Phase 2 main loop (same deferred pattern as `dm_needs_rejoin`,
+ * for the same nested-bridge_join hazard — this can run nested inside
  * another `bridge_join`'s wait loop via `bridge_event_dispatch`, e.g.
- * mid-bootstrap — confirmed live). */
+ * mid-bootstrap — confirmed live).  Reverse pass pushes `phx_leave` and
+ * compacts both arrays for every peer now absent from the list.
+ * `phx_leave` is fire-and-forget (never blocks), so it is safe inline
+ * even when nested — same reasoning as the rename path at line 4700. */
 static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
+                                                     struct bridge *br,
                                                      const json_value *payload) {
     char net_key[32];
     snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
@@ -5628,6 +5637,7 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
     const json_value *list = json_get(windows, net_key);
     if (!list || json_type_of(list) != JSON_ARRAY) return;
 
+    /* Forward pass: queue newly-seen peers. */
     for (size_t i = 0; i < json_len(list); i++) {
         const json_value *entry = json_at(list, i);
         const char *target_nick = NULL;
@@ -5650,6 +5660,65 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
         snprintf(sess->pending_dm_peer_names[sess->pending_dm_peer_count++],
                  sizeof(sess->pending_dm_peer_names[0]), "%s", folded);
     }
+
+    /* Reverse pass: compact dm_peer_names (already-joined topics).
+     * For each slot absent from the incoming list, push phx_leave and
+     * drop the slot; keep all others in place. */
+    size_t write = 0;
+    for (size_t j = 0; j < sess->dm_peer_count; j++) {
+        bool in_list = false;
+        for (size_t i = 0; i < json_len(list) && !in_list; i++) {
+            const json_value *entry = json_at(list, i);
+            const char *target_nick = NULL;
+            if (!json_str_req(entry, "target_nick", &target_nick)) continue;
+            char folded[64];
+            ascii_fold_lower(target_nick, folded, sizeof(folded));
+            if (strcmp(sess->dm_peer_names[j], folded) == 0) in_list = true;
+        }
+        if (!in_list) {
+            if (br) {
+                char dm_peer_topic[512];
+                snprintf(dm_peer_topic, sizeof(dm_peer_topic),
+                         "grappa:user:%s/network:%s/channel:%s",
+                         sess->subject_name, sess->network_slug, sess->dm_peer_names[j]);
+                bridge_push(br, dm_peer_topic, sess->dm_peer_join_refs[j], "phx_leave", "{}");
+                fprintf(stderr,
+                        "bicchierino: left stale DM peer topic %s (query window closed)\n",
+                        dm_peer_topic);
+            }
+        } else {
+            if (write != j) {
+                snprintf(sess->dm_peer_names[write], sizeof(sess->dm_peer_names[0]),
+                         "%s", sess->dm_peer_names[j]);
+                sess->dm_peer_join_refs[write] = sess->dm_peer_join_refs[j];
+            }
+            write++;
+        }
+    }
+    sess->dm_peer_count = write;
+
+    /* Reverse pass: compact pending_dm_peer_names (queued but not yet
+     * joined — bridge_join never ran, so no phx_leave is needed). */
+    write = 0;
+    for (size_t j = 0; j < sess->pending_dm_peer_count; j++) {
+        bool in_list = false;
+        for (size_t i = 0; i < json_len(list) && !in_list; i++) {
+            const json_value *entry = json_at(list, i);
+            const char *target_nick = NULL;
+            if (!json_str_req(entry, "target_nick", &target_nick)) continue;
+            char folded[64];
+            ascii_fold_lower(target_nick, folded, sizeof(folded));
+            if (strcmp(sess->pending_dm_peer_names[j], folded) == 0) in_list = true;
+        }
+        if (in_list) {
+            if (write != j)
+                snprintf(sess->pending_dm_peer_names[write],
+                         sizeof(sess->pending_dm_peer_names[0]),
+                         "%s", sess->pending_dm_peer_names[j]);
+            write++;
+        }
+    }
+    sess->pending_dm_peer_count = write;
 }
 
 /* WIRE.md §3/§6: `names_reply` payload is `{kind, network, channel,
@@ -6202,7 +6271,7 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "away_confirmed") == 0) {
         handle_grappa_away_confirmed_event(fd, nick, inner);
     } else if (strcmp(kind, "query_windows_list") == 0) {
-        handle_grappa_query_windows_list_event(sess, inner);
+        handle_grappa_query_windows_list_event(sess, br, inner);
     } else if (strcmp(kind, "joined") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
