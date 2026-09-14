@@ -2590,6 +2590,68 @@ static void handle_banlist(struct bridge *br, bool br_connected, struct grappa_s
         fprintf(stderr, "bicchierino: BANLIST %s: push failed\n", channel);
 }
 
+/* Issue #121 — `QUERYOPEN <nick>` / `QUERYCLOSE <nick>`: explicit
+ * client-to-grappa query-window lifecycle verbs.
+ *
+ * IRC has no native signal for "I opened/closed a DM buffer":
+ *   - A DM buffer open fires no command (the first PRIVMSG is the
+ *     implicit open, which grappa already captures via
+ *     `maybe_open_query_window`).
+ *   - A DM buffer close fires no command at all (WeeChat's
+ *     `buffer_closing` callback emits PART only for real channels,
+ *     confirmed in irc-buffer.c:209-214).
+ *
+ * These two commands fill the gap:
+ *   QUERYOPEN  <nick>   -> push `"open_query_window"` to the user topic,
+ *                          payload `{"network_id": <id>, "target_nick": "<nick>"}`
+ *   QUERYCLOSE <nick>   -> push `"close_query_window"` to the user topic,
+ *                          same payload shape
+ *
+ * grappa's own `GrappaChannel.handle_in` for both verbs is idempotent
+ * (confirmed reading `grappa_channel.ex:1440-1494`): open upserts on a
+ * unique index, close is a no-op if the row is already gone.  So a
+ * client that sends QUERYOPEN when the window is already open (or
+ * QUERYCLOSE when it's already closed) causes no harm.
+ *
+ * No confirmation NOTICE is sent: grappa will broadcast the updated
+ * `query_windows_list` back on the user topic, which bicchierino already
+ * handles (subscriptions added/removed transparently) — the round-trip
+ * IS the confirmation, same pattern as channel JOIN (REST → optimistic
+ * echo + WS snapshot), not "push + explicit NOTICE". */
+static void handle_query_open(struct bridge *br, bool br_connected,
+                               struct grappa_session *sess,
+                               const struct irc_message *msg) {
+    if (!br_connected || msg->param_count < 1 || !msg->params[0][0]) return;
+    const char *target = msg->params[0];
+    char esc_target[300];
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: QUERYOPEN %s: nick too long to escape\n", target);
+        return;
+    }
+    char payload[700];
+    snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"target_nick\":\"%s\"}",
+             sess->network_id, esc_target);
+    if (!push_on_user_topic(br, sess, "open_query_window", payload))
+        fprintf(stderr, "bicchierino: QUERYOPEN %s: push failed\n", target);
+}
+
+static void handle_query_close(struct bridge *br, bool br_connected,
+                                struct grappa_session *sess,
+                                const struct irc_message *msg) {
+    if (!br_connected || msg->param_count < 1 || !msg->params[0][0]) return;
+    const char *target = msg->params[0];
+    char esc_target[300];
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: QUERYCLOSE %s: nick too long to escape\n", target);
+        return;
+    }
+    char payload[700];
+    snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"target_nick\":\"%s\"}",
+             sess->network_id, esc_target);
+    if (!push_on_user_topic(br, sess, "close_query_window", payload))
+        fprintf(stderr, "bicchierino: QUERYCLOSE %s: push failed\n", target);
+}
+
 /* WIRE.md §6: `"links"` push, payload `{"network_id", "mask"?}` ->
  * `Session.send_links/3`, primes `state.links_pending` — same
  * priming-verb class as whois/who/names/banlist (confirmed reading
@@ -4229,6 +4291,14 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
         handle_part(fd, hc, br, *br_connected, cfg, sess->network_nick, sess, msg);
         return false;
     }
+    if (strcmp(msg->command, "QUERYOPEN") == 0) {
+        handle_query_open(br, *br_connected, sess, msg);
+        return false;
+    }
+    if (strcmp(msg->command, "QUERYCLOSE") == 0) {
+        handle_query_close(br, *br_connected, sess, msg);
+        return false;
+    }
     if (strcmp(msg->command, "TOPIC") == 0) {
         handle_topic(hc, br, *br_connected, cfg, sess, msg);
         return false;
@@ -5694,9 +5764,50 @@ static void handle_grappa_away_confirmed_event(int fd, const char *nick,
  * compacts both arrays for every peer now absent from the list.
  * `phx_leave` is fire-and-forget (never blocks), so it is safe inline
  * even when nested — same reasoning as the rename path at line 4700. */
-static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
-                                                     struct bridge *br,
-                                                     const json_value *payload) {
+/* Issue #121 — grappa-to-client direction: when grappa's
+ * `query_windows_list` broadcast drops a peer (i.e. some OTHER session
+ * or the web client closed that DM window), bicchierino cannot issue an
+ * IRC command that makes the client close its buffer — no such verb
+ * exists in the IRC protocol (PART is channel-only on both sides).
+ * Instead, send a NOTICE from the server so the event is visible in the
+ * client's server buffer.  Clients that negotiated `message-tags` also
+ * receive a `bicchierino/query-window-closed` tag carrying the peer
+ * nick, which a WeeChat (or other) script can hook on to close the
+ * buffer automatically.  Clients that did not negotiate the CAP see only
+ * the plain NOTICE text — one harmless informational line — and their
+ * existing buffers are left open, same as today.
+ *
+ * The NOTICE is sent from IRCD_SERVER (not from a user prefix) so it
+ * lands in the server/status buffer in well-behaved clients, not in a
+ * separate query window.
+ *
+ * Sending is best-effort (fd=-1 in tests, write() failure on a closed
+ * socket) — a missed announcement is a UX degradation, not a protocol
+ * error; the PubSub cleanup (phx_leave) below still runs unconditionally. */
+static void notify_query_window_closed(int fd, const struct grappa_session *sess,
+                                        const char *peer_nick) {
+    const char *own_nick = sess->network_nick[0] ? sess->network_nick : "*";
+    if (sess->cap_message_tags) {
+        /* IRC message-tag values must escape space, semicolons, and
+         * backslash per the IRCv3 message-tags spec.  A nick is a
+         * restricted identifier (A-Za-z0-9[]\\`^{|}-_ — no spaces,
+         * semicolons, or bare backslashes) so no escaping is needed
+         * in practice, but we keep the field narrow to be safe. */
+        send_line(fd,
+                  "@bicchierino/query-window-closed=%s :%s NOTICE %s "
+                  ":Query window for %s closed by another session",
+                  peer_nick, IRCD_SERVER, own_nick, peer_nick);
+    } else {
+        send_line(fd, ":%s NOTICE %s :Query window for %s closed by another session",
+                  IRCD_SERVER, own_nick, peer_nick);
+    }
+}
+
+static void handle_grappa_query_windows_list_event(int fd, const char *nick,
+                                                    struct grappa_session *sess,
+                                                    struct bridge *br,
+                                                    const json_value *payload) {
+    (void)nick; /* currently unused; kept for potential future use */
     char net_key[32];
     snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
     const json_value *windows = json_get(payload, "windows");
@@ -5729,7 +5840,8 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
 
     /* Reverse pass: compact dm_peer_names (already-joined topics).
      * For each slot absent from the incoming list, push phx_leave and
-     * drop the slot; keep all others in place. */
+     * drop the slot; keep all others in place.
+     * Also notifies the client (see notify_query_window_closed above). */
     size_t write = 0;
     for (size_t j = 0; j < sess->dm_peer_count; j++) {
         bool in_list = false;
@@ -5742,6 +5854,9 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
             if (strcmp(sess->dm_peer_names[j], folded) == 0) in_list = true;
         }
         if (!in_list) {
+            /* Notify the client that this peer's query window was closed
+             * by another session (grappa-to-client direction, #121). */
+            notify_query_window_closed(fd, sess, sess->dm_peer_names[j]);
             if (br) {
                 char dm_peer_topic[512];
                 snprintf(dm_peer_topic, sizeof(dm_peer_topic),
@@ -6337,7 +6452,7 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "away_confirmed") == 0) {
         handle_grappa_away_confirmed_event(fd, nick, inner);
     } else if (strcmp(kind, "query_windows_list") == 0) {
-        handle_grappa_query_windows_list_event(sess, br, inner);
+        handle_grappa_query_windows_list_event(fd, nick, sess, br, inner);
     } else if (strcmp(kind, "joined") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
