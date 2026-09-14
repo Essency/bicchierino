@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_query_windows
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_query_windows tests/test_query_window_cmds tests/test_markread
 
 .PHONY: all clean install version check debug
 
@@ -222,6 +222,25 @@ tests/test_sibling_dm: tests/test_sibling_dm.c tests/test.h src/connection.c src
 # as test_who, test_banlist).
 tests/test_query_windows: tests/test_query_windows.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_query_windows.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_markread and
+# handle_grappa_read_cursor_set_event (both static). Pins the draft/read-marker
+# bridge (#118): query form returns timestamp=*, SET form with empty ring returns
+# timestamp=*, and a seeded ring hit emits MARKREAD with an ISO8601 timestamp.
+# grappa → IRC direction: cap_read_marker=false silently drops the event; true
+# with a matching ring entry emits the correct MARKREAD line. Same deps as
+# test_sibling_dm.
+tests/test_markread: tests/test_markread.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_markread.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_irc_line, handle_query_open,
+# handle_query_close (all static). Tests the QUERYOPEN/QUERYCLOSE client-to-
+# grappa push (#121): correct grappa verb, correct payload, no-op when bridge
+# disconnected or no argument given. ws_stub replaces ws_client.c at link time
+# so bridge_push frames are captured (same pattern as test_who, test_banlist,
+# test_query_windows).
+tests/test_query_window_cmds: tests/test_query_window_cmds.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_query_window_cmds.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)

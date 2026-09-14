@@ -5,3 +5,6 @@ src/*.o
 # Internal process doc, mirrored from the private repo — local reference
 # only, never published to this public repo.
 /CLAUDE.md
+tests/test_*
+!tests/test_*.c
+!tests/test_*.h

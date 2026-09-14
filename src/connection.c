@@ -412,6 +412,7 @@ struct registration {
     bool cap_batch;
     bool cap_chathistory;
     bool cap_echo_message;
+    bool cap_read_marker;
 };
 
 struct network_entry {
@@ -459,6 +460,7 @@ struct grappa_session {
     bool cap_batch;
     bool cap_chathistory;
     bool cap_echo_message;
+    bool cap_read_marker;
 
     /* WS join_refs (WIRE.md §4) — every later push on a topic must carry
      * the join_ref that topic's own phx_join returned, or Phoenix
@@ -782,7 +784,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
 
     if (strcasecmp(sub, "LS") == 0) {
         reg->cap_negotiating = true;
-        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory echo-message",
+        send_line(fd, ":%s CAP %s LS :server-time message-tags batch draft/chathistory echo-message draft/read-marker",
                   IRCD_SERVER, target);
         return;
     }
@@ -792,10 +794,10 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         char enabled[128] = "";
         size_t len = 0;
         const char *names[] = {"server-time", "message-tags", "batch", "draft/chathistory",
-                               "echo-message"};
+                               "echo-message", "draft/read-marker"};
         bool flags[] = {reg->cap_server_time, reg->cap_message_tags, reg->cap_batch,
-                        reg->cap_chathistory, reg->cap_echo_message};
-        for (size_t i = 0; i < 5; i++) {
+                        reg->cap_chathistory, reg->cap_echo_message, reg->cap_read_marker};
+        for (size_t i = 0; i < 6; i++) {
             if (!flags[i]) continue;
             int written =
                 snprintf(enabled + len, sizeof(enabled) - len, "%s%s", len ? " " : "", names[i]);
@@ -810,7 +812,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
         const char *want = msg->param_count > 1 ? msg->params[1] : "";
         bool all_known = true;
         bool want_server_time = false, want_message_tags = false, want_batch = false,
-             want_chathistory = false, want_echo_message = false;
+             want_chathistory = false, want_echo_message = false, want_read_marker = false;
         const char *cursor = want;
         char tok[64];
         while (next_space_token(&cursor, tok, sizeof(tok))) {
@@ -819,6 +821,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
             else if (strcmp(tok, "batch") == 0) want_batch = true;
             else if (strcmp(tok, "draft/chathistory") == 0) want_chathistory = true;
             else if (strcmp(tok, "echo-message") == 0) want_echo_message = true;
+            else if (strcmp(tok, "draft/read-marker") == 0) want_read_marker = true;
             else all_known = false;
         }
         if (all_known) {
@@ -827,6 +830,7 @@ static void handle_cap_command(int fd, struct registration *reg, const struct ir
             reg->cap_batch = reg->cap_batch || want_batch;
             reg->cap_chathistory = reg->cap_chathistory || want_chathistory;
             reg->cap_echo_message = reg->cap_echo_message || want_echo_message;
+            reg->cap_read_marker = reg->cap_read_marker || want_read_marker;
             send_line(fd, ":%s CAP %s ACK :%s", IRCD_SERVER, target, want);
         } else {
             send_line(fd, ":%s CAP %s NAK :%s", IRCD_SERVER, target, want);
@@ -1334,7 +1338,8 @@ static void present_channels(int fd, const char *nick, const struct grappa_sessi
  * call it and is defined earlier for readability (right next to
  * present_channels/send_network_reminder, the rest of the Case B flow). */
 static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
-                                struct grappa_session *sess);
+                                struct grappa_session *sess, struct http_client *hc,
+                                const struct config *cfg);
 
 /* Case B's in-band selector, `GRAPPA NETWORK <slug>` — an IRC-side
  * admin-style command, arriving earlier than planned because
@@ -1403,7 +1408,7 @@ static void handle_grappa_network(int fd, struct http_client *hc, struct bridge 
 
     *br_connected = bridge_connect(cfg->grappa_url, sess->token, sess->subject_name, br);
     if (*br_connected) {
-        join_grappa_topics(fd, sess->network_nick, br, sess);
+        join_grappa_topics(fd, sess->network_nick, br, sess, hc, cfg);
     } else {
         fprintf(stderr, "bicchierino: websocket handshake FAILED (post network-select)\n");
         send_line(fd,
@@ -1457,7 +1462,8 @@ static void send_network_reminder(int fd, const char *nick, const struct grappa_
  * reproducibly, for #testchannel's entire topic/modes/members snapshot
  * during a bootstrap that auto-rejoined an already-joined channel. */
 static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
-                                 struct grappa_session *sess, const char *payload,
+                                 struct grappa_session *sess, struct http_client *hc,
+                                 const struct config *cfg, const char *payload,
                                  size_t payload_len);
 
 struct bridge_event_ctx {
@@ -1465,11 +1471,14 @@ struct bridge_event_ctx {
     const char *nick;
     struct bridge *br;
     struct grappa_session *sess;
+    struct http_client *hc;
+    const struct config *cfg;
 };
 
 static void bridge_event_dispatch(void *ctx_raw, const char *payload, size_t payload_len) {
     const struct bridge_event_ctx *ctx = ctx_raw;
-    handle_grappa_event(ctx->fd, ctx->nick, ctx->br, ctx->sess, payload, payload_len);
+    handle_grappa_event(ctx->fd, ctx->nick, ctx->br, ctx->sess, ctx->hc, ctx->cfg,
+                        payload, payload_len);
 }
 
 /* Phase 1 of the three-phase topic join (#82/#90): join the user topic.
@@ -1482,8 +1491,9 @@ static void bridge_event_dispatch(void *ctx_raw, const char *payload, size_t pay
  * own isupport_changed for the same network — deduplicated by
  * isupport_005_sent in the handler. */
 static void join_user_topic(int fd, const char *nick, struct bridge *br,
-                             struct grappa_session *sess) {
-    struct bridge_event_ctx ctx = {fd, nick, br, sess};
+                             struct grappa_session *sess, struct http_client *hc,
+                             const struct config *cfg) {
+    struct bridge_event_ctx ctx = {fd, nick, br, sess, hc, cfg};
 
     char user_topic[160];
     snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess->subject_name);
@@ -1508,8 +1518,9 @@ static void join_user_topic(int fd, const char *nick, struct bridge *br,
  * Its join_ref is local (unlike the user topic's, which heartbeat/visibility
  * pushes need). */
 static void join_server_topic(int fd, const char *nick, struct bridge *br,
-                               struct grappa_session *sess) {
-    struct bridge_event_ctx ctx = {fd, nick, br, sess};
+                               struct grappa_session *sess, struct http_client *hc,
+                               const struct config *cfg) {
+    struct bridge_event_ctx ctx = {fd, nick, br, sess, hc, cfg};
 
     char server_topic[512];
     snprintf(server_topic, sizeof(server_topic), "grappa:user:%s/network:%s/channel:%s",
@@ -1539,7 +1550,8 @@ static void join_server_topic(int fd, const char *nick, struct bridge *br,
  * polling (the common case in a well-loaded deployment where grappa's
  * scheduler fires :after_join quickly). */
 static void await_channel_snapshot(int fd, const char *nick, struct bridge *br,
-                                   struct grappa_session *sess) {
+                                   struct grappa_session *sess, struct http_client *hc,
+                                   const struct config *cfg) {
     if (sess->cached_prefix_letters[0]) return; /* already cached */
     if (br->wsc.fd < 0) return;                 /* no real socket (test stub) */
 
@@ -1578,7 +1590,7 @@ static void await_channel_snapshot(int fd, const char *nick, struct bridge *br,
                 break;
             }
             if (r == WS_TEXT) {
-                handle_grappa_event(fd, nick, br, sess, payload, payload_len);
+                handle_grappa_event(fd, nick, br, sess, hc, cfg, payload, payload_len);
                 free(payload);
                 continue;
             }
@@ -1603,8 +1615,9 @@ static void await_channel_snapshot(int fd, const char *nick, struct bridge *br,
  * JOIN for its channels.  `$server` is NOT joined here — it was joined in
  * Phase 2 (join_server_topic), before send_welcome. */
 static void join_channel_topics(int fd, const char *nick, struct bridge *br,
-                                 struct grappa_session *sess) {
-    struct bridge_event_ctx ctx = {fd, nick, br, sess};
+                                 struct grappa_session *sess, struct http_client *hc,
+                                 const struct config *cfg) {
+    struct bridge_event_ctx ctx = {fd, nick, br, sess, hc, cfg};
 
     for (size_t i = 0; i < sess->channel_count; i++) {
         char folded_channel[128];
@@ -1662,10 +1675,11 @@ static void join_channel_topics(int fd, const char *nick, struct bridge *br,
  *                    matter the same way)
  *   3. channel topics — real channels, DM listener, visibility push */
 static void join_grappa_topics(int fd, const char *nick, struct bridge *br,
-                                struct grappa_session *sess) {
-    join_user_topic(fd, nick, br, sess);
-    join_server_topic(fd, nick, br, sess);
-    join_channel_topics(fd, nick, br, sess);
+                                struct grappa_session *sess, struct http_client *hc,
+                                const struct config *cfg) {
+    join_user_topic(fd, nick, br, sess, hc, cfg);
+    join_server_topic(fd, nick, br, sess, hc, cfg);
+    join_channel_topics(fd, nick, br, sess, hc, cfg);
 }
 
 /* WIRE.md §2.5's corrected text: sending a message is REST, not a WS
@@ -2071,7 +2085,7 @@ static void handle_join(int fd, struct http_client *hc, struct bridge *br, bool 
                 char topic[512];
                 snprintf(topic, sizeof(topic), "grappa:user:%s/network:%s/channel:%s",
                          sess->subject_name, sess->network_slug, folded_channel);
-                struct bridge_event_ctx ctx = {fd, nick, br, sess};
+                struct bridge_event_ctx ctx = {fd, nick, br, sess, hc, cfg};
                 if (!bridge_join(br, topic, &sess->channel_join_refs[idx], bridge_event_dispatch,
                                   &ctx))
                     fprintf(stderr, "bicchierino: join %s failed\n", topic);
@@ -2590,6 +2604,68 @@ static void handle_banlist(struct bridge *br, bool br_connected, struct grappa_s
         fprintf(stderr, "bicchierino: BANLIST %s: push failed\n", channel);
 }
 
+/* Issue #121 — `QUERYOPEN <nick>` / `QUERYCLOSE <nick>`: explicit
+ * client-to-grappa query-window lifecycle verbs.
+ *
+ * IRC has no native signal for "I opened/closed a DM buffer":
+ *   - A DM buffer open fires no command (the first PRIVMSG is the
+ *     implicit open, which grappa already captures via
+ *     `maybe_open_query_window`).
+ *   - A DM buffer close fires no command at all (WeeChat's
+ *     `buffer_closing` callback emits PART only for real channels,
+ *     confirmed in irc-buffer.c:209-214).
+ *
+ * These two commands fill the gap:
+ *   QUERYOPEN  <nick>   -> push `"open_query_window"` to the user topic,
+ *                          payload `{"network_id": <id>, "target_nick": "<nick>"}`
+ *   QUERYCLOSE <nick>   -> push `"close_query_window"` to the user topic,
+ *                          same payload shape
+ *
+ * grappa's own `GrappaChannel.handle_in` for both verbs is idempotent
+ * (confirmed reading `grappa_channel.ex:1440-1494`): open upserts on a
+ * unique index, close is a no-op if the row is already gone.  So a
+ * client that sends QUERYOPEN when the window is already open (or
+ * QUERYCLOSE when it's already closed) causes no harm.
+ *
+ * No confirmation NOTICE is sent: grappa will broadcast the updated
+ * `query_windows_list` back on the user topic, which bicchierino already
+ * handles (subscriptions added/removed transparently) — the round-trip
+ * IS the confirmation, same pattern as channel JOIN (REST → optimistic
+ * echo + WS snapshot), not "push + explicit NOTICE". */
+static void handle_query_open(struct bridge *br, bool br_connected,
+                               struct grappa_session *sess,
+                               const struct irc_message *msg) {
+    if (!br_connected || msg->param_count < 1 || !msg->params[0][0]) return;
+    const char *target = msg->params[0];
+    char esc_target[300];
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: QUERYOPEN %s: nick too long to escape\n", target);
+        return;
+    }
+    char payload[700];
+    snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"target_nick\":\"%s\"}",
+             sess->network_id, esc_target);
+    if (!push_on_user_topic(br, sess, "open_query_window", payload))
+        fprintf(stderr, "bicchierino: QUERYOPEN %s: push failed\n", target);
+}
+
+static void handle_query_close(struct bridge *br, bool br_connected,
+                                struct grappa_session *sess,
+                                const struct irc_message *msg) {
+    if (!br_connected || msg->param_count < 1 || !msg->params[0][0]) return;
+    const char *target = msg->params[0];
+    char esc_target[300];
+    if (!json_escape_into(target, esc_target, sizeof(esc_target))) {
+        fprintf(stderr, "bicchierino: QUERYCLOSE %s: nick too long to escape\n", target);
+        return;
+    }
+    char payload[700];
+    snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"target_nick\":\"%s\"}",
+             sess->network_id, esc_target);
+    if (!push_on_user_topic(br, sess, "close_query_window", payload))
+        fprintf(stderr, "bicchierino: QUERYCLOSE %s: push failed\n", target);
+}
+
 /* WIRE.md §6: `"links"` push, payload `{"network_id", "mask"?}` ->
  * `Session.send_links/3`, primes `state.links_pending` — same
  * priming-verb class as whois/who/names/banlist (confirmed reading
@@ -2730,6 +2806,13 @@ static void handle_motd_cmd(struct bridge *br, bool br_connected, struct grappa_
  * which precedes them, can dispatch to it. */
 static void handle_chathistory(int fd, struct http_client *hc, const struct config *cfg,
                                 struct grappa_session *sess, const struct irc_message *msg);
+
+/* Defined further down (needs `chathistory_ring_nearest_id`,
+ * `parse_iso8601_utc_epoch`, `url_encode`, `chathistory_fetch` — all
+ * defined later in this file) — declared here so `handle_irc_line`
+ * can dispatch to it. */
+static void handle_markread(int fd, struct http_client *hc, const struct config *cfg,
+                              const struct grappa_session *sess, const struct irc_message *msg);
 
 /* `MODE #chan` — bare, no modestring at all — is a real, legitimate
  * query some clients issue for "what are this channel's current
@@ -4229,6 +4312,14 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
         handle_part(fd, hc, br, *br_connected, cfg, sess->network_nick, sess, msg);
         return false;
     }
+    if (strcmp(msg->command, "QUERYOPEN") == 0) {
+        handle_query_open(br, *br_connected, sess, msg);
+        return false;
+    }
+    if (strcmp(msg->command, "QUERYCLOSE") == 0) {
+        handle_query_close(br, *br_connected, sess, msg);
+        return false;
+    }
     if (strcmp(msg->command, "TOPIC") == 0) {
         handle_topic(hc, br, *br_connected, cfg, sess, msg);
         return false;
@@ -4311,6 +4402,10 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
     }
     if (strcmp(msg->command, "CHATHISTORY") == 0) {
         handle_chathistory(fd, hc, cfg, sess, msg);
+        return false;
+    }
+    if (strcmp(msg->command, "MARKREAD") == 0) {
+        handle_markread(fd, hc, cfg, sess, msg);
         return false;
     }
 
@@ -5694,9 +5789,50 @@ static void handle_grappa_away_confirmed_event(int fd, const char *nick,
  * compacts both arrays for every peer now absent from the list.
  * `phx_leave` is fire-and-forget (never blocks), so it is safe inline
  * even when nested — same reasoning as the rename path at line 4700. */
-static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
-                                                     struct bridge *br,
-                                                     const json_value *payload) {
+/* Issue #121 — grappa-to-client direction: when grappa's
+ * `query_windows_list` broadcast drops a peer (i.e. some OTHER session
+ * or the web client closed that DM window), bicchierino cannot issue an
+ * IRC command that makes the client close its buffer — no such verb
+ * exists in the IRC protocol (PART is channel-only on both sides).
+ * Instead, send a NOTICE from the server so the event is visible in the
+ * client's server buffer.  Clients that negotiated `message-tags` also
+ * receive a `bicchierino/query-window-closed` tag carrying the peer
+ * nick, which a WeeChat (or other) script can hook on to close the
+ * buffer automatically.  Clients that did not negotiate the CAP see only
+ * the plain NOTICE text — one harmless informational line — and their
+ * existing buffers are left open, same as today.
+ *
+ * The NOTICE is sent from IRCD_SERVER (not from a user prefix) so it
+ * lands in the server/status buffer in well-behaved clients, not in a
+ * separate query window.
+ *
+ * Sending is best-effort (fd=-1 in tests, write() failure on a closed
+ * socket) — a missed announcement is a UX degradation, not a protocol
+ * error; the PubSub cleanup (phx_leave) below still runs unconditionally. */
+static void notify_query_window_closed(int fd, const struct grappa_session *sess,
+                                        const char *peer_nick) {
+    const char *own_nick = sess->network_nick[0] ? sess->network_nick : "*";
+    if (sess->cap_message_tags) {
+        /* IRC message-tag values must escape space, semicolons, and
+         * backslash per the IRCv3 message-tags spec.  A nick is a
+         * restricted identifier (A-Za-z0-9[]\\`^{|}-_ — no spaces,
+         * semicolons, or bare backslashes) so no escaping is needed
+         * in practice, but we keep the field narrow to be safe. */
+        send_line(fd,
+                  "@bicchierino/query-window-closed=%s :%s NOTICE %s "
+                  ":Query window for %s closed by another session",
+                  peer_nick, IRCD_SERVER, own_nick, peer_nick);
+    } else {
+        send_line(fd, ":%s NOTICE %s :Query window for %s closed by another session",
+                  IRCD_SERVER, own_nick, peer_nick);
+    }
+}
+
+static void handle_grappa_query_windows_list_event(int fd, const char *nick,
+                                                    struct grappa_session *sess,
+                                                    struct bridge *br,
+                                                    const json_value *payload) {
+    (void)nick; /* currently unused; kept for potential future use */
     char net_key[32];
     snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
     const json_value *windows = json_get(payload, "windows");
@@ -5729,7 +5865,8 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
 
     /* Reverse pass: compact dm_peer_names (already-joined topics).
      * For each slot absent from the incoming list, push phx_leave and
-     * drop the slot; keep all others in place. */
+     * drop the slot; keep all others in place.
+     * Also notifies the client (see notify_query_window_closed above). */
     size_t write = 0;
     for (size_t j = 0; j < sess->dm_peer_count; j++) {
         bool in_list = false;
@@ -5742,6 +5879,9 @@ static void handle_grappa_query_windows_list_event(struct grappa_session *sess,
             if (strcmp(sess->dm_peer_names[j], folded) == 0) in_list = true;
         }
         if (!in_list) {
+            /* Notify the client that this peer's query window was closed
+             * by another session (grappa-to-client direction, #121). */
+            notify_query_window_closed(fd, sess, sess->dm_peer_names[j]);
             if (br) {
                 char dm_peer_topic[512];
                 snprintf(dm_peer_topic, sizeof(dm_peer_topic),
@@ -6235,6 +6375,190 @@ static void handle_grappa_server_reply_event(int fd, const char *nick, const jso
     }
 }
 
+/* ── MARKREAD (IRCv3 `draft/read-marker`) ────────────────────────────── */
+
+/* Resolves `cursor_id` (grappa's `last_read_message_id`, an integer
+ * message id) to a unix-ms timestamp suitable for MARKREAD's
+ * `timestamp=` value.  Two-step:
+ *
+ *   1. Check the chathistory ring — O(N) scan, but N ≤ 256 and this runs
+ *      once per read-cursor push, not per message.  Exact match preferred
+ *      (the message itself arrived live this session); falls back to the
+ *      ring entry with the smallest id delta if no exact match exists
+ *      (nearby message = nearby timestamp, close enough for a read marker).
+ *
+ *   2. If the ring is empty or the best delta is large (> 1000 ids apart
+ *      — a signal that we've never been near this message this session),
+ *      do a REST lookup: GET .../messages?around=<id>&limit=1.  `hc` may
+ *      be NULL during bootstrap (no REST available yet); in that case skip
+ *      REST and fall back to the ring-best or 0. */
+static long resolve_read_cursor_time(struct http_client *hc, const struct config *cfg,
+                                      const struct grappa_session *sess, const char *channel,
+                                      long cursor_id) {
+    /* Ring scan: find the entry whose id is closest to cursor_id. */
+    long best_id = 0, best_time = 0, best_delta = -1;
+    for (size_t i = 0; i < sess->chathistory_ring_count; i++) {
+        long delta = sess->chathistory_ring_ids[i] - cursor_id;
+        if (delta < 0) delta = -delta;
+        if (best_delta < 0 || delta < best_delta) {
+            best_delta = delta;
+            best_id = sess->chathistory_ring_ids[i];
+            best_time = sess->chathistory_ring_times[i];
+        }
+    }
+    (void)best_id;
+
+    /* Exact or very near match in ring — use it directly. */
+    if (best_delta >= 0 && best_delta <= 1000) return best_time;
+
+    /* Ring miss or ring empty: REST lookup (skipped if no HTTP client). */
+    if (!hc || !cfg || !channel || !channel[0]) return best_time;
+
+    json_doc *doc = NULL;
+    const json_value *root = NULL;
+    if (!chathistory_fetch(hc, cfg, sess, channel, "around", cursor_id, 1, &doc, &root)) {
+        return best_time;
+    }
+    long fetched_time = best_time;
+    if (json_type_of(root) == JSON_ARRAY && json_len(root) > 0) {
+        const json_value *first = json_at(root, 0);
+        if (first) json_long_opt(first, "server_time", &fetched_time, NULL);
+    }
+    json_free(doc);
+    return fetched_time;
+}
+
+/* `read_cursor_set` — grappa broadcasts `{kind: "read_cursor_set",
+ * last_read_message_id: <int>, badge_count: <int>}` on the per-channel
+ * topic whenever any device (REST or PWA) advances the cursor.  The same
+ * cross-device fan-out that keeps cicchetto's badge/divider in sync also
+ * reaches bicchierino as an event on the already-joined channel topic.
+ *
+ * We translate it to `draft/read-marker` MARKREAD for any client that
+ * negotiated the cap.  The id→timestamp mapping uses the chathistory ring
+ * first (messages seen live this session) and falls back to a REST round-
+ * trip for a cursor that landed on a message we have never observed (read
+ * on another device while the bridge was down, or a session-start snapshot
+ * marking messages from before we connected).
+ *
+ * The channel name is NOT in the event payload — it is in the Phoenix
+ * topic string (`grappa:user:.../network:.../channel:<name>`) at position
+ * [2] of the envelope, so the caller passes `topic_str` directly. */
+static void handle_grappa_read_cursor_set_event(int fd, struct http_client *hc,
+                                                  const struct config *cfg,
+                                                  const struct grappa_session *sess,
+                                                  const json_value *inner,
+                                                  const char *topic_str) {
+    if (!sess->cap_read_marker) return;
+
+    /* Extract the channel name from the topic suffix "/channel:<name>". */
+    const char *ch_prefix = "/channel:";
+    const char *channel = topic_str ? strstr(topic_str, ch_prefix) : NULL;
+    if (!channel) return;
+    channel += strlen(ch_prefix); /* points at channel name */
+    if (!channel[0]) return;
+
+    long cursor_id = 0;
+    if (!json_long_req(inner, "last_read_message_id", &cursor_id)) return;
+    if (cursor_id <= 0) return;
+
+    long ts_ms = resolve_read_cursor_time(hc, cfg, sess, channel, cursor_id);
+    if (ts_ms <= 0) {
+        /* No timestamp available — skip rather than emit a fabricated one. */
+        return;
+    }
+
+    char ts[64];
+    format_server_time_tag(ts_ms, ts, sizeof(ts));
+    send_line(fd, ":%s MARKREAD %s timestamp=%s", IRCD_SERVER, channel, ts);
+}
+
+/* Inbound `MARKREAD <target> [timestamp=<ISO8601>]` from the IRC client.
+ *
+ * SET form (`timestamp=...` present): convert the ISO8601 timestamp to the
+ * nearest message id via the chathistory ring, then POST to grappa's
+ * read-cursor endpoint so the PWA's unread badge / read divider advances.
+ * Echo the server's MARKREAD line back (grappa's advance-only clamp may
+ * result in a higher id than requested, but we don't re-fetch it here —
+ * the fan-out `read_cursor_set` will arrive on the WS topic and echo the
+ * authoritative value shortly anyway).
+ *
+ * QUERY form (no timestamp, or `timestamp=*`): respond with `timestamp=*`
+ * (never marked / value not cached locally).  grappa has no GET endpoint
+ * for the read cursor, and bicchierino doesn't cache it per-channel; a
+ * proper implementation would require a new REST surface or a per-channel
+ * field on `struct grappa_session`.  Tolerated for spec compliance — a
+ * well-behaved client only queries when it hasn't seen a server push yet. */
+static void handle_markread(int fd, struct http_client *hc, const struct config *cfg,
+                              const struct grappa_session *sess, const struct irc_message *msg) {
+    const char *nick = sess->network_nick;
+
+    if (msg->param_count < 1) {
+        send_line(fd, "FAIL MARKREAD NEED_MORE_PARAMS MARKREAD :Missing target");
+        return;
+    }
+    const char *target = msg->params[0];
+
+    /* Query form (no timestamp param, or `timestamp=*`). */
+    if (msg->param_count < 2 || strncmp(msg->params[1], "timestamp=", 10) != 0 ||
+        strcmp(msg->params[1] + 10, "*") == 0) {
+        send_line(fd, ":%s MARKREAD %s timestamp=*", IRCD_SERVER, target);
+        return;
+    }
+
+    const char *ts_str = msg->params[1] + 10; /* skip "timestamp=" */
+
+    /* Parse the ISO8601 timestamp to unix seconds, convert to ms. */
+    long epoch_sec = 0;
+    if (!parse_iso8601_utc_epoch(ts_str, &epoch_sec)) {
+        send_line(fd, "FAIL MARKREAD INVALID_PARAMS MARKREAD :Invalid timestamp");
+        return;
+    }
+    long target_ms = epoch_sec * 1000L;
+
+    /* Resolve to the nearest id we have observed for this timestamp. */
+    long nearest_id = 0;
+    if (!chathistory_ring_nearest_id(sess, target_ms, &nearest_id)) {
+        /* Ring is empty — no messages seen this session, nothing to advance. */
+        send_line(fd, ":%s MARKREAD %s timestamp=*", IRCD_SERVER, target);
+        return;
+    }
+
+    /* POST /networks/:slug/channels/:target/read-cursor with {"message_id": N} */
+    char encoded_slug[192];
+    url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
+    char encoded_target[300];
+    url_encode(target, encoded_target, sizeof(encoded_target));
+    char path[1024];
+    snprintf(path, sizeof(path), "/networks/%s/channels/%s/read-cursor",
+             encoded_slug, encoded_target);
+
+    char json_body[64];
+    snprintf(json_body, sizeof(json_body), "{\"message_id\":%ld}", nearest_id);
+
+    struct http_response resp;
+    if (!http_client_request(hc, cfg->grappa_url, "POST", path, sess->token, json_body, &resp)) {
+        fprintf(stderr, "bicchierino: MARKREAD to %s: grappa not reachable\n", target);
+        /* Echo back what the client asked for so it sees some feedback. */
+        send_line(fd, ":%s MARKREAD %s timestamp=%s", IRCD_SERVER, target, ts_str);
+        return;
+    }
+    if (resp.status != 200 && resp.status != 201 && resp.status != 202) {
+        fprintf(stderr, "bicchierino: MARKREAD to %s: unexpected HTTP status %d\n", target,
+                resp.status);
+    }
+    http_response_free(&resp);
+
+    /* Echo the MARKREAD back.  The authoritative fan-out read_cursor_set
+     * will arrive over WS shortly and send another MARKREAD with the
+     * clamped id's real timestamp — this immediate echo confirms receipt
+     * to clients that expect a synchronous response (spec §2: "The server
+     * MUST respond to any MARKREAD command"). */
+    send_line(fd, ":%s MARKREAD %s timestamp=%s", IRCD_SERVER, target, ts_str);
+
+    (void)nick;
+}
+
 /* One complete WS text frame from the Phase 2 drain loop. `"message"`,
  * `"topic_changed"`, `"channel_modes_changed"`, `"members_seeded"`,
  * `"isupport_changed"`, `"join_failed"`, `"names_reply"`, `"who_reply"`,
@@ -6260,7 +6584,8 @@ static void handle_grappa_server_reply_event(int fd, const char *nick, const jso
  * logs, TODO(next) per WIRE.md §6 — one verb at a time, reading
  * grappa_channel.ex for each, not guessed. */
 static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
-                                 struct grappa_session *sess, const char *payload,
+                                 struct grappa_session *sess, struct http_client *hc,
+                                 const struct config *cfg, const char *payload,
                                  size_t payload_len) {
     char err[128];
     json_doc *doc = json_parse(payload, payload_len, err, sizeof(err));
@@ -6286,8 +6611,10 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
         return;
     }
 
+    const json_value *topic_val = json_at(root, 2);
     const json_value *event = json_at(root, 3);
     const json_value *inner = json_at(root, 4);
+    const char *topic_str = json_string(topic_val); /* NULL if not a string */
 
     if (json_str_is(event, "phx_reply")) {
         /* Nothing to act on yet — bridge_join already consumed its own
@@ -6337,7 +6664,9 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "away_confirmed") == 0) {
         handle_grappa_away_confirmed_event(fd, nick, inner);
     } else if (strcmp(kind, "query_windows_list") == 0) {
-        handle_grappa_query_windows_list_event(sess, br, inner);
+        handle_grappa_query_windows_list_event(fd, nick, sess, br, inner);
+    } else if (strcmp(kind, "read_cursor_set") == 0) {
+        handle_grappa_read_cursor_set_event(fd, hc, cfg, sess, inner, topic_str);
     } else if (strcmp(kind, "joined") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
@@ -6470,6 +6799,7 @@ void *connection_run(void *arg) {
     sess.cap_batch = reg.cap_batch;
     sess.cap_chathistory = reg.cap_chathistory;
     sess.cap_echo_message = reg.cap_echo_message;
+    sess.cap_read_marker = reg.cap_read_marker;
     sess.visible = true; /* explicit: {0} zero-fills, but default must be true (§122) */
 
     /* One persistent HTTP/1.1 connection for every REST call this
@@ -6525,9 +6855,9 @@ void *connection_run(void *arg) {
          * Identical value at this exact point. */
         br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
         if (br_connected) {
-            join_user_topic(fd, sess.network_nick, &br, &sess);
-            join_server_topic(fd, sess.network_nick, &br, &sess);
-            await_channel_snapshot(fd, sess.network_nick, &br, &sess);
+            join_user_topic(fd, sess.network_nick, &br, &sess, &hc, cfg);
+            join_server_topic(fd, sess.network_nick, &br, &sess, &hc, cfg);
+            await_channel_snapshot(fd, sess.network_nick, &br, &sess, &hc, cfg);
         }
 
         send_welcome(fd, sess.network_nick, &sess);
@@ -6560,7 +6890,7 @@ void *connection_run(void *arg) {
          * topic_changed, ...) stay buffered in the OS socket until the
          * Phase 2 poll()-on-two-fds steady-state loop reads them. */
         if (br_connected) {
-            join_channel_topics(fd, sess.network_nick, &br, &sess);
+            join_channel_topics(fd, sess.network_nick, &br, &sess, &hc, cfg);
         } else {
             fprintf(stderr, "bicchierino: websocket handshake FAILED\n");
             send_line(fd,
@@ -6657,7 +6987,7 @@ void *connection_run(void *arg) {
             char dm_topic[512];
             snprintf(dm_topic, sizeof(dm_topic), "grappa:user:%s/network:%s/channel:%s",
                      sess.subject_name, sess.network_slug, folded_nick);
-            struct bridge_event_ctx ctx = {fd, sess.network_nick, &br, &sess};
+            struct bridge_event_ctx ctx = {fd, sess.network_nick, &br, &sess, &hc, cfg};
             sess.dm_joined =
                 bridge_join(&br, dm_topic, &sess.dm_join_ref, bridge_event_dispatch, &ctx);
             if (sess.dm_joined)
@@ -6685,7 +7015,7 @@ void *connection_run(void *arg) {
                 snprintf(dm_peer_topic, sizeof(dm_peer_topic),
                          "grappa:user:%s/network:%s/channel:%s", sess.subject_name,
                          sess.network_slug, sess.pending_dm_peer_names[i]);
-                struct bridge_event_ctx ctx = {fd, sess.network_nick, &br, &sess};
+                struct bridge_event_ctx ctx = {fd, sess.network_nick, &br, &sess, &hc, cfg};
                 unsigned long join_ref = 0;
                 if (bridge_join(&br, dm_peer_topic, &join_ref, bridge_event_dispatch, &ctx)) {
                     snprintf(sess.dm_peer_names[sess.dm_peer_count],
@@ -6788,7 +7118,8 @@ void *connection_run(void *arg) {
                 first_read = false;
                 if (r == WS_NEED_MORE) break;
                 if (r == WS_TEXT) {
-                    handle_grappa_event(fd, sess.network_nick, &br, &sess, payload, payload_len);
+                    handle_grappa_event(fd, sess.network_nick, &br, &sess, &hc, cfg,
+                                        payload, payload_len);
                     free(payload);
                     continue;
                 }
