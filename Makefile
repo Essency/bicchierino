@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm
 
 .PHONY: all clean install version check debug
 
@@ -197,6 +197,14 @@ tests/test_banlist: tests/test_banlist.c tests/test.h tests/ws_stub.c tests/ws_s
 # original line verbatim, #101). Same deps as test_render.
 tests/test_parse: tests/test_parse.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_parse.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_message_event (static).
+# Pins the echo-message gate fix (#123): sibling-client DMs must be sent as
+# the real `:me PRIVMSG peer :body` wire shape when cap_echo_message is set,
+# and as the vanilla-client-compatible rewrite otherwise. Same deps as
+# test_channel_prefix.
+tests/test_sibling_dm: tests/test_sibling_dm.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_sibling_dm.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)
