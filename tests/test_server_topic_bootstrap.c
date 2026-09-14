@@ -141,7 +141,7 @@ TEST(join_server_topic_populates_cache) {
     int tx = open_client();
     if (tx < 0) return;
 
-    join_server_topic(tx, "testuser", &br, &sess);
+    join_server_topic(tx, "testuser", &br, &sess, NULL, NULL);
     drain(tx, (char[4096]){0}, 4096);
 
     /* Cache must be populated from the isupport push. */
@@ -168,9 +168,9 @@ TEST(server_topic_join_then_welcome_emits_full_005) {
     int tx = open_client();
     if (tx < 0) return;
 
-    join_server_topic(tx, "testuser", &br, &sess);
+    join_server_topic(tx, "testuser", &br, &sess, NULL, NULL);
     /* await_channel_snapshot: cache already set, returns immediately. */
-    await_channel_snapshot(tx, "testuser", &br, &sess);
+    await_channel_snapshot(tx, "testuser", &br, &sess, NULL, NULL);
 
     char out[4096];
     send_welcome(tx, "testuser", &sess);
@@ -207,9 +207,9 @@ TEST(no_isupport_push_leaves_cache_empty) {
     int tx = open_client();
     if (tx < 0) return;
 
-    join_user_topic(tx, "testuser", &br, &sess);
+    join_user_topic(tx, "testuser", &br, &sess, NULL, NULL);
     /* await_channel_snapshot: fd<0 guard → returns immediately; cache still empty. */
-    await_channel_snapshot(tx, "testuser", &br, &sess);
+    await_channel_snapshot(tx, "testuser", &br, &sess, NULL, NULL);
 
     char out[4096];
     send_welcome(tx, "testuser", &sess);
