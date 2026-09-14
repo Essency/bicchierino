@@ -641,6 +641,18 @@ struct grappa_session {
      * single-threaded per connection — so there is never a second batch
      * in flight to collide with. */
     unsigned long chathistory_batch_seq;
+
+    /* `GRAPPA visible on|off` (#122) — whether this connection reports
+     * itself as foreground-visible to grappa's presence layer.  Defaults
+     * true so a client that never sends the verb behaves exactly as before
+     * (the unconditional `{"visible":true}` that was here before this fix).
+     * The heartbeat re-push and the initial post-join push both read this
+     * field instead of the old literal, so the setting sticks for the life
+     * of the connection without any additional state.
+     *
+     * Initialised explicitly to true in connection_run — `{0}` zero-fills
+     * the struct which would silently default this to false. */
+    bool visible;
 };
 
 /* Current wall-clock time as unix milliseconds — the fallback
@@ -1627,9 +1639,12 @@ static void join_channel_topics(int fd, const char *nick, struct bridge *br,
     if (sess->user_join_ref) {
         char user_topic[160];
         snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess->subject_name);
-        if (bridge_push(br, user_topic, sess->user_join_ref, "visibility",
-                         "{\"visible\":true}")) {
-            fprintf(stderr, "bicchierino: visibility:true pushed\n");
+        char vis_payload[32];
+        snprintf(vis_payload, sizeof(vis_payload), "{\"visible\":%s}",
+                 sess->visible ? "true" : "false");
+        if (bridge_push(br, user_topic, sess->user_join_ref, "visibility", vis_payload)) {
+            fprintf(stderr, "bicchierino: visibility:%s pushed\n",
+                    sess->visible ? "true" : "false");
         } else {
             fprintf(stderr, "bicchierino: visibility push failed\n");
         }
@@ -2790,6 +2805,7 @@ static void handle_channel_modes_query(int fd, struct bridge *br, bool br_connec
  * authorization logic to maintain.
  *
  * v1 command set:
+ *   /grappa visible on|off
  *   /grappa whoami
  *   /grappa sessions
  *   /grappa session kick <id>
@@ -3754,7 +3770,8 @@ static void grappa_admin_vhost_revoke(int fd, const char *nick, struct http_clie
 /* /grappa help — static command list, one NOTICE per command. */
 static void grappa_admin_help(int fd, const char *nick) {
     static const char *const lines[] = {
-        "grappa admin commands (IRC /quote GRAPPA <subcommand>):",
+        "grappa commands (IRC /quote GRAPPA <subcommand>):",
+        "  visible on|off                      — set push-notification visibility for this connection",
         "  whoami                              — show your identity and admin status",
         "  sessions                            — list live grappa sessions",
         "  session kick <session-id>           — disconnect session (use [id] from sessions list)",
@@ -4144,8 +4161,57 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
      * to the admin API handler, which makes REST calls to grappa's
      * :admin_authn-gated surface.  The `GRAPPA NETWORK <slug>` Case B
      * selector is handled in the `!sess->network_resolved` block above
-     * and never reaches this point. */
+     * and never reaches this point.
+     *
+     * `GRAPPA visible on|off` (#122) is also handled locally — it sets
+     * sess->visible and pushes the value to grappa immediately.  Immediate
+     * rather than "stop re-pushing and let it age out": the 60s staleness
+     * window would eventually suppress push, but the `true->false`
+     * transition is also what arms grappa's auto-away debounce, and only an
+     * explicit write triggers it.  No admin auth required — every client
+     * manages their own visibility; the push rides the session's own token
+     * and join_ref exactly like the heartbeat push does.
+     *
+     * Handled before the registry / admin branches so it can write to a
+     * non-const sess and reach the live bridge pointer directly. */
     if (strcmp(msg->command, "GRAPPA") == 0) {
+        const char *sub = msg->param_count >= 1 ? msg->params[0] : "";
+        if (strcasecmp(sub, "visible") == 0) {
+            const char *arg = msg->param_count >= 2 ? msg->params[1] : "";
+            if (strcasecmp(arg, "on") == 0) {
+                sess->visible = true;
+            } else if (strcasecmp(arg, "off") == 0) {
+                sess->visible = false;
+            } else {
+                grappa_admin_notice(fd, sess->network_nick,
+                                    "usage: /quote GRAPPA visible on|off");
+                return false;
+            }
+            if (*br_connected && sess->user_join_ref) {
+                char user_topic[160];
+                snprintf(user_topic, sizeof(user_topic), "grappa:user:%s",
+                         sess->subject_name);
+                char vis_payload[32];
+                snprintf(vis_payload, sizeof(vis_payload), "{\"visible\":%s}",
+                         sess->visible ? "true" : "false");
+                if (bridge_push(br, user_topic, sess->user_join_ref,
+                                "visibility", vis_payload)) {
+                    grappa_admin_notice(fd, sess->network_nick,
+                                        "visibility set to %s",
+                                        sess->visible ? "true" : "false");
+                } else {
+                    grappa_admin_notice(fd, sess->network_nick,
+                                        "visibility updated locally but push failed"
+                                        " (will retry on next heartbeat)");
+                }
+            } else {
+                grappa_admin_notice(fd, sess->network_nick,
+                                    "visibility set to %s (bridge not connected yet"
+                                    " — will push on next heartbeat)",
+                                    sess->visible ? "true" : "false");
+            }
+            return false;
+        }
         if (!handle_grappa_registry_command(fd, hc, cfg, reg, sess, msg))
             handle_grappa_admin(fd, hc, cfg, sess->network_nick, sess, msg);
         return false;
@@ -6404,6 +6470,7 @@ void *connection_run(void *arg) {
     sess.cap_batch = reg.cap_batch;
     sess.cap_chathistory = reg.cap_chathistory;
     sess.cap_echo_message = reg.cap_echo_message;
+    sess.visible = true; /* explicit: {0} zero-fills, but default must be true (§122) */
 
     /* One persistent HTTP/1.1 connection for every REST call this
      * session makes (login, both bootstrap GETs, every PRIVMSG send,
@@ -6567,8 +6634,10 @@ void *connection_run(void *arg) {
             if (sess.user_join_ref) {
                 char user_topic[160];
                 snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess.subject_name);
-                bridge_push(&br, user_topic, sess.user_join_ref, "visibility",
-                            "{\"visible\":true}");
+                char vis_payload[32];
+                snprintf(vis_payload, sizeof(vis_payload), "{\"visible\":%s}",
+                         sess.visible ? "true" : "false");
+                bridge_push(&br, user_topic, sess.user_join_ref, "visibility", vis_payload);
             }
             next_heartbeat = time(NULL) + 25;
         }
