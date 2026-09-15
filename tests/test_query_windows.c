@@ -322,6 +322,103 @@ TEST(case_folding_prevents_leave_for_same_folded_nick) {
     bridge_close(&br);
 }
 
+/* ── Bug #135: removal-only list with absent network key ─────────────────── */
+
+/* Build a query_windows_list payload whose "windows" object has NO entry for
+ * network_id=1 at all — {"kind":"query_windows_list","windows":{}}.  This is
+ * exactly what grappa sends when ALL windows for this network are closed
+ * (list_for_subject returns %{}, render_grouped maps to %{}, serialises to
+ * JSON "{}").  Before the #135 fix the handler returned early on !list,
+ * leaving stale dm_peer subscriptions open. */
+static void call_handler_no_network_key(struct grappa_session *sess, struct bridge *br) {
+    const char *raw = "{\"kind\":\"query_windows_list\",\"windows\":{}}";
+    char err[128];
+    json_doc *d = json_parse(raw, strlen(raw), err, sizeof(err));
+    if (!d) FAIL("call_handler_no_network_key: parse failed");
+    handle_grappa_query_windows_list_event(-1, "testuser", sess, br, json_root(d));
+    json_free(d);
+}
+
+static void call_handler_no_network_key_fd(int fd, struct grappa_session *sess,
+                                            struct bridge *br) {
+    const char *raw = "{\"kind\":\"query_windows_list\",\"windows\":{}}";
+    char err[128];
+    json_doc *d = json_parse(raw, strlen(raw), err, sizeof(err));
+    if (!d) FAIL("call_handler_no_network_key_fd: parse failed");
+    handle_grappa_query_windows_list_event(fd, "testuser", sess, br, json_root(d));
+    json_free(d);
+}
+
+/* Bug #135 — a removal-only list whose "windows" object lacks the current
+ * network_id key must still release joined dm_peer subscriptions.
+ * Before the fix: handler returned early on !list, alice stayed subscribed.
+ * After the fix: reverse pass runs with an empty set, alice is released. */
+TEST(removal_only_absent_network_key_releases_joined_peer) {
+    ws_stub_reset();
+    struct grappa_session sess = make_sess();
+    struct bridge br = make_bridge();
+
+    snprintf(sess.dm_peer_names[0], sizeof(sess.dm_peer_names[0]), "alice");
+    sess.dm_peer_join_refs[0] = 99;
+    sess.dm_peer_count = 1;
+
+    /* Payload: {"windows":{}} — grappa's wire when ALL windows are closed. */
+    call_handler_no_network_key(&sess, &br);
+
+    /* alice must be gone and a phx_leave must have been sent. */
+    CHECK_LONG(sess.dm_peer_count, 0);
+    CHECK_LONG(ws_stub_sent_count(), 1);
+    const char *frame = ws_stub_sent(0);
+    CHECK(strstr(frame, "phx_leave") != NULL);
+    CHECK(strstr(frame, "grappa:user:testuser/network:testnet/channel:alice") != NULL);
+
+    bridge_close(&br);
+}
+
+/* Bug #135 — NOTICE must also be sent to the client when the network key is
+ * absent (same path as the non-empty-list removal). */
+TEST(removal_only_absent_network_key_sends_client_notice) {
+    ws_stub_reset();
+    struct grappa_session sess = make_sess();
+    struct bridge br = make_bridge();
+
+    snprintf(sess.dm_peer_names[0], sizeof(sess.dm_peer_names[0]), "bob");
+    sess.dm_peer_join_refs[0] = 11;
+    sess.dm_peer_count = 1;
+
+    char buf[512];
+    int tx = open_pair();
+    if (tx < 0) return;
+
+    call_handler_no_network_key_fd(tx, &sess, &br);
+    drain_pair(tx, buf, sizeof(buf));
+
+    CHECK(strstr(buf, ":bicchierino NOTICE testuser :") != NULL);
+    CHECK(strstr(buf, "bob") != NULL);
+    CHECK_LONG(sess.dm_peer_count, 0);
+
+    bridge_close(&br);
+}
+
+/* Bug #135 — a pending peer absent because the network key is missing must
+ * also be silently dropped (same as the empty-list case, no phx_leave
+ * since bridge_join never ran). */
+TEST(removal_only_absent_network_key_drops_pending_peer) {
+    ws_stub_reset();
+    struct grappa_session sess = make_sess();
+    struct bridge br = make_bridge();
+
+    snprintf(sess.pending_dm_peer_names[0], sizeof(sess.pending_dm_peer_names[0]), "charlie");
+    sess.pending_dm_peer_count = 1;
+
+    call_handler_no_network_key(&sess, &br);
+
+    CHECK_LONG(sess.pending_dm_peer_count, 0);
+    CHECK_LONG(ws_stub_sent_count(), 0); /* no phx_leave: never joined */
+
+    bridge_close(&br);
+}
+
 /* ── grappa-to-client NOTICE tests (#121) ────────────────────────────────── */
 
 /* When a joined peer disappears from the list, bicchierino must send a
@@ -413,6 +510,9 @@ int main(void) {
     RUN(closed_pending_peer_is_dropped_without_leave);
     RUN(closed_peers_release_cap_for_new_ones);
     RUN(case_folding_prevents_leave_for_same_folded_nick);
+    RUN(removal_only_absent_network_key_releases_joined_peer);
+    RUN(removal_only_absent_network_key_sends_client_notice);
+    RUN(removal_only_absent_network_key_drops_pending_peer);
     RUN(closed_joined_peer_sends_client_notice);
     RUN(closed_joined_peer_sends_tagged_notice_with_cap_message_tags);
     RUN(still_open_peer_produces_no_notice);
