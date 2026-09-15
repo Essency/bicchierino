@@ -4692,14 +4692,27 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
             bool has_id = false;
             json_long_opt(message, "id", &id, &has_id);
             /* Correlated by id: this IS my own optimistic echo, from
-             * THIS connection — the client already showed it when it
-             * was typed, drop the confirmation. NOT correlated: same
-             * identity, but a SIBLING connection sent it (see
+             * THIS connection.  What happens next depends on whether
+             * the client negotiated `echo-message`:
+             *
+             *   - No echo-message: the client already showed the line
+             *     locally when it was typed — drop the confirmation
+             *     (return).  This was the only branch before #133.
+             *
+             *   - echo-message negotiated: the client suppressed its
+             *     own local echo and is waiting for the server to send
+             *     the line back.  We MUST NOT return; fall through so
+             *     the line is delivered.  The id is still consumed from
+             *     the ring so it cannot mis-fire on a future event.
+             *
+             * NOT correlated (consume returns false): same identity,
+             * but a SIBLING connection sent it (see
              * `pending_self_msg_ids`'s own doc on `struct
              * grappa_session`) — genuinely new to THIS connection,
              * must still render, just not necessarily verbatim (see
              * the DM case below). */
-            if (has_id && consume_pending_self_id(sess, id)) return;
+            if (has_id && consume_pending_self_id(sess, id) &&
+                !sess->cap_echo_message) return;
         }
         const char *body = NULL;
         if (!json_str_req(message, "body", &body)) return;
