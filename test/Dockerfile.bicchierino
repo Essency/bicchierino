@@ -1,0 +1,38 @@
+# bicchierino, built from this repo, with the test CA trusted.
+#
+# The CA install is the whole reason this needs a Dockerfile rather than
+# a stock image: bicchierino verifies grappa's certificate against the
+# SYSTEM trust store (SSL_CTX_set_default_verify_paths, http.c:101) and
+# never skips that check. Putting the throwaway CA there is how a sealed
+# test stack gets a verifying client to connect — without patching the
+# client, which would mean testing a binary that is not the one shipped.
+FROM debian:bookworm-slim AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libssl-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+# Same warnings-as-errors posture CI uses: a test stack built looser than
+# CI can pass on code CI would reject.
+RUN make clean && make CFLAGS="-O2 -Werror"
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 ca-certificates iproute2 iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/bicchierino /usr/local/bin/bicchierino
+
+# The stack's own CA. update-ca-certificates rebuilds the bundle that
+# set_default_verify_paths reads, so no bicchierino-side configuration is
+# involved at all — it simply finds the chain valid.
+COPY test/certs/ca.pem /usr/local/share/ca-certificates/bicchierino-test-ca.crt
+RUN update-ca-certificates
+
+COPY test/bicchierino.config /etc/bicchierino/bicchierino.config
+
+EXPOSE 6667
+CMD ["bicchierino", "--config", "/etc/bicchierino/bicchierino.config", "--insecure"]

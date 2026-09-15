@@ -1,0 +1,11 @@
+# Alpine with openssl already in it.
+#
+# The testnet's certs/gen-cert.sh installs openssl itself on first run, which
+# needs the network at RUNTIME — impossible in this stack, where every
+# network is `internal: true`. Resolving the dependency here moves it to
+# build time, where reaching a mirror is fine.
+#
+# The script is not copied in: it arrives on the ./certs volume the testnet
+# already mounts, and writes its output back there.
+FROM alpine:3.20
+RUN apk add --no-cache openssl

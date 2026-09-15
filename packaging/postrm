@@ -1,0 +1,17 @@
+#!/bin/sh
+# postrm — only on purge (not a plain remove, which keeps config/user
+# around for a possible reinstall): drop the dedicated user/group and
+# the log directory. A plain `apt remove` leaves all of this alone on
+# purpose, matching normal Debian conffile/state-retention convention.
+set -e
+
+if [ "$1" = "purge" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    deluser --quiet --system bicchierino >/dev/null 2>&1 || true
+    delgroup --quiet --system bicchierino >/dev/null 2>&1 || true
+    rm -rf /var/log/bicchierino
+fi
+
+exit 0

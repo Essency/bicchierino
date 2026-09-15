@@ -1,0 +1,265 @@
+CC ?= cc
+
+# Warnings and hardening are not overridable via CFLAGS from the
+# environment, same reasoning as shottino's own Makefile: a bare
+# `CFLAGS ?=` would let `make CFLAGS=-O0` silently drop -Wall/-Wextra
+# along with everything else. This binary parses hostile bytes (IRC
+# lines from anyone who can reach a bind, JSON/websocket frames from
+# grappa) so the hardening earns its keep.
+CFLAGS ?= -O2
+WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Wformat=2
+HARDENING := -fstack-protector-strong -D_FORTIFY_SOURCE=2
+CPPFLAGS ?= -D_POSIX_C_SOURCE=200809L
+CFLAGS += $(WARNINGS) $(HARDENING)
+
+# vX.Y.Z+shorthash, entirely git-derived — deliberately no separate
+# VERSION file to keep in sync with the actual tag by hand. The tag
+# match pattern excludes anything that isn't a plain vX.Y.Z release tag
+# (a stray annotated/lightweight tag of some other shape never gets
+# mistaken for a version). Falls back to v0.0.0+unknown when there's no
+# git history at all (a source tarball without .git) — an honest
+# "can't tell" marker, never a stale hardcoded number. Appended to
+# CPPFLAGS via `+=`, not `?=`, so it can never be silently dropped by a
+# caller override the way a bare `CPPFLAGS=` would (same reasoning as
+# WARNINGS/HARDENING above).
+GIT_TAG := $(shell git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --abbrev=0 2>/dev/null || echo v0.0.0)
+GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BICCHIERINO_VERSION := $(GIT_TAG)+$(GIT_HASH)
+CPPFLAGS += -DBICCHIERINO_VERSION='"$(BICCHIERINO_VERSION)"'
+BUILD_DATE := $(shell date -u +'%a %b %d %Y at %H:%M:%S UTC')
+CPPFLAGS += -DBICCHIERINO_BUILD_DATE='"$(BUILD_DATE)"'
+
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+
+LDLIBS := -lssl -lcrypto -lpthread
+
+BIN := bicchierino
+OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_client.o src/ws.o src/json.o src/jsonw.o src/registry.o
+
+# Each suite links ONLY the module under test plus what that module
+# actually needs — not $(OBJS). A test binary that drags in the whole
+# program stops being able to fail for one reason, and connection.c in
+# particular pulls a listener and a thread into a suite that wanted to
+# check a string.
+#
+# TEST_CFLAGS mirrors the reasoning above for CFLAGS: warnings and
+# hardening are appended, never left overridable, so `make check
+# CFLAGS=-O0` can't quietly drop -Wall from the tests alone. -g always,
+# because the first thing anyone does with a red suite is run it under a
+# debugger or a sanitizer.
+TEST_CFLAGS := $(CFLAGS) -g
+
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message
+
+.PHONY: all clean install version check debug
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+# CLAUDE.md §3.2: raw client<->grappa IRC traffic is never logged in a
+# release build — it's compiled out entirely, not a runtime-togglable
+# flag. `make debug` builds a SEPARATE binary (own object files, own
+# name) with that logging compiled in, for local debugging only — never
+# touches the objects/binary `make all` produces.
+DEBUG_OBJS := $(OBJS:.o=.debug.o)
+
+debug: bicchierino-debug
+
+bicchierino-debug: $(DEBUG_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
+
+%.debug.o: %.c
+	$(CC) $(CPPFLAGS) -DBICCHIERINO_LOG_TRAFFIC $(CFLAGS) -c -o $@ $<
+
+install: $(BIN)
+	install -D -m 755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
+
+check: $(TESTS)
+	@fail=0; for t in $(TESTS); do \
+		printf '%s: ' "$$t"; \
+		./$$t || fail=1; \
+	done; \
+	exit $$fail
+
+tests/test_json: tests/test_json.c tests/test.h src/json.c src/json.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_json.c src/json.c
+
+tests/test_ws: tests/test_ws.c tests/test.h src/ws.c src/ws.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_ws.c src/ws.c
+
+tests/test_jsonw: tests/test_jsonw.c tests/test.h src/jsonw.c src/jsonw.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_jsonw.c src/jsonw.c
+
+tests/test_config: tests/test_config.c tests/test.h src/config.c src/config.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_config.c src/config.c
+
+# Compiles http.c INTO the suite: the functions worth testing here
+# (URL/status/Content-Length parsing, the growing buffer) are static, and
+# the alternative — exporting them just to test them — widens the header
+# for no caller's benefit. Needs -lssl/-lcrypto because http.c's other
+# half does TLS, even though none of it is exercised.
+tests/test_http: tests/test_http.c tests/test.h src/http.c src/http.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_http.c -lssl -lcrypto
+
+# Links the real http.c (for conn_read), ws_client.c (the function
+# under test), and ws.c (the ws_reader that ws_client_recv calls).
+# Tests that EAGAIN from conn_read surfaces as WS_NEED_MORE rather
+# than WS_ERROR (#111).
+tests/test_ws_client: tests/test_ws_client.c tests/test.h src/http.c src/http.h src/ws_client.c src/ws_client.h src/ws.c src/ws.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_ws_client.c src/http.c src/ws_client.c src/ws.c -lssl -lcrypto
+
+# ws_stub.c replaces ws_client.c at link time. The REAL ws.c comes along:
+# bridge_recv_buffered forwards straight into that reader, and a stubbed
+# reader would only test the stub.
+tests/test_bridge: tests/test_bridge.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/bridge.c src/bridge.h src/json.c src/jsonw.c src/ws.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_bridge.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c -lssl -lcrypto
+
+# Compiles connection.c into the suite, so send_line — static, and the
+# choke point every render arm passes through — can be driven directly.
+# Needs the modules connection.c calls plus the same libraries the binary
+# links; nothing is stubbed, because the property under test is what the
+# real formatter puts on a real fd.
+tests/test_registry: tests/test_registry.c tests/test.h src/registry.c src/registry.h
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_registry.c src/registry.c -lpthread
+
+tests/test_render: tests/test_render.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_render.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_server_window_row,
+# which is static — the same approach test_http uses for the parsers.
+# Links what connection.c calls, plus the libraries the binary links.
+tests/test_server_window: tests/test_server_window.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_window.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach the static admin handlers: grappa_admin_notice,
+# render_session_list, parse_positive_long, is_safe_path_segment, handle_grappa_admin.
+# Same pattern as test_render and test_server_window.
+tests/test_grappa_admin: tests/test_grappa_admin.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_grappa_admin.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_irc_line and grappa_admin_help (both static).
+# Tests the GRAPPA visible on|off command (#122): flag defaults true, on/off toggle it,
+# invalid args produce a usage error, and the heartbeat payload follows the flag.
+# Uses the real ws_client.c (not ws_stub) because br_connected=false keeps tests
+# off the real bridge path — same pattern as test_grappa_admin.
+tests/test_grappa_visible: tests/test_grappa_visible.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_grappa_visible.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_who (static); ws_stub.c
+# replaces ws_client.c at link time so bridge_push frames are captured
+# for inspection without hitting a real network. Same deps as test_bridge
+# plus everything connection.c calls.
+tests/test_who: tests/test_who.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_who.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_whois_bundle_event (static).
+# Tests the P-0a bahamut fields added in issue #72. Same deps as test_render.
+tests/test_whois: tests/test_whois.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_whois.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_isupport_changed_event (static).
+# Tests that STATUSMSG= in the 005 is derived from PREFIX sigils, not hardcoded (#83).
+tests/test_isupport: tests/test_isupport.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_isupport.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_isupport_changed_event and
+# send_welcome (both static). Tests the PREFIX bootstrap ordering fix (#82):
+# isupport_changed caches instead of sending when welcome_sent is false, and
+# send_welcome emits the live 005 with PREFIX when the cache is populated.
+# Same deps as test_render.
+tests/test_isupport_bootstrap: tests/test_isupport_bootstrap.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_isupport_bootstrap.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach join_server_topic, await_channel_snapshot,
+# join_user_topic, and send_welcome (all static). Tests the $server-topic
+# bootstrap fix (#90): joining a channel-shaped topic before send_welcome
+# lets the isupport_changed push populate the cache, so the first 005 sent to
+# the IRC client includes PREFIX/CHANMODES. ws_stub replaces ws_client.c at
+# link time (same pattern as test_who). Same deps as test_who.
+tests/test_server_topic_bootstrap: tests/test_server_topic_bootstrap.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_server_topic_bootstrap.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_message_event (static).
+# Tests that channel PRIVMSG/JOIN without sender_user/sender_host produce a
+# bare nick prefix, not the fabricated `nick!bicchierino@bicchierino` that
+# caused clients to build wrong ban masks (#97). Same deps as test_server_window.
+tests/test_channel_prefix: tests/test_channel_prefix.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_channel_prefix.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_banlist and the MODE dispatch
+# (both static). Pins the signed-form routing fix (#98): MODE #chan +b must
+# route to the "banlist" verb, not fall through to "mode". ws_stub replaces
+# ws_client.c at link time (same pattern as test_who).
+tests/test_banlist: tests/test_banlist.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_banlist.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach irc_parse_line (static).
+# Tests that irc_parse_line correctly dispatches commands with any number of
+# tokens, including lines over IRC_MAX_PARAMS (handle_raw now forwards the
+# original line verbatim, #101). Same deps as test_render.
+tests/test_parse: tests/test_parse.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_parse.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_message_event (static).
+# Pins the echo-message gate fix (#123): sibling-client DMs must be sent as
+# the real `:me PRIVMSG peer :body` wire shape when cap_echo_message is set,
+# and as the vanilla-client-compatible rewrite otherwise. Same deps as
+# test_channel_prefix.
+tests/test_sibling_dm: tests/test_sibling_dm.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_sibling_dm.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_event / handle_grappa_joined_event
+# (both static). Pins the sibling-client channel join fix (#134): a `joined`
+# event for a channel NOT in this connection's list must produce JOIN + a
+# per-channel topic subscription, and `window_pending` must be a recognized
+# no-op. ws_stub replaces ws_client.c at link time (same pattern as test_who,
+# test_banlist, test_server_topic_bootstrap).
+tests/test_sibling_join: tests/test_sibling_join.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_sibling_join.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_query_windows_list_event
+# (static). Pins the bidirectional diff fix (#120): a shrinking
+# query_windows_list must push phx_leave for absent peers and release their
+# slots, not only queue newly-seen ones. ws_stub replaces ws_client.c at
+# link time so bridge_push frames are captured for inspection (same pattern
+# as test_who, test_banlist).
+tests/test_query_windows: tests/test_query_windows.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_query_windows.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_markread and
+# handle_grappa_read_cursor_set_event (both static). Pins the draft/read-marker
+# bridge (#118): query form returns timestamp=*, SET form with empty ring returns
+# timestamp=*, and a seeded ring hit emits MARKREAD with an ISO8601 timestamp.
+# grappa → IRC direction: cap_read_marker=false silently drops the event; true
+# with a matching ring entry emits the correct MARKREAD line. Same deps as
+# test_sibling_dm.
+tests/test_markread: tests/test_markread.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_markread.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_irc_line, handle_query_open,
+# handle_query_close (all static). Tests the QUERYOPEN/QUERYCLOSE client-to-
+# grappa push (#121): correct grappa verb, correct payload, no-op when bridge
+# disconnected or no argument given. ws_stub replaces ws_client.c at link time
+# so bridge_push frames are captured (same pattern as test_who, test_banlist,
+# test_query_windows).
+tests/test_query_window_cmds: tests/test_query_window_cmds.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_query_window_cmds.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_message_event (static).
+# Pins the echo-message own-send echo fix (#133): a PRIVMSG broadcast whose id
+# matches a pending_self_msg_ids entry must be echoed back when cap_echo_message
+# is set, and suppressed when it is not.  Same deps as test_sibling_dm.
+tests/test_echo_message: tests/test_echo_message.c tests/test.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_echo_message.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+clean:
+	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)
+
+version:
+	@echo $(BICCHIERINO_VERSION)

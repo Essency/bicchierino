@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags — the Makefile's own `git describe`
+          # version derivation needs tag refs a shallow checkout won't
+          # have, and a release build with the WRONG version baked in
+          # is exactly the kind of thing worth failing loudly over, not
+          # shipping quietly.
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Build release binary
+        run: |
+          make clean
+          make CFLAGS="-O2 -Werror"
+
+      - name: Verify the binary's own version matches this release tag
+        run: |
+          v=$(./bicchierino --version)
+          echo "$v"
+          echo "$v" | grep -q "bicchierino ${{ github.ref_name }}+" || \
+            (echo "built version does not start with the triggering tag ${{ github.ref_name }} — refusing to publish a mislabeled release" && exit 1)
+
+      # Read the version straight out of the Makefile's own computation
+      # (the exact value already baked into the binary via
+      # -DBICCHIERINO_VERSION) rather than recomputing it here — one
+      # source of truth, so the .deb's Version field can never drift
+      # from what the binary itself reports via --version. Debian
+      # version syntax doesn't use the "v" prefix git tags do; strip it
+      # here, not in the Makefile (which has its own reasons to keep
+      # the "v" — it matches the tag name directly).
+      - name: Compute package versions
+        id: pkgver
+        run: |
+          DEB_VERSION="$(make version | sed 's/^v//')"
+          SOURCE_VERSION="${GITHUB_REF_NAME#v}"
+          echo "deb_version=$DEB_VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb
+        run: ./packaging/build-deb.sh "${{ steps.pkgver.outputs.deb_version }}"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          mv "bicchierino_${{ steps.pkgver.outputs.deb_version }}_amd64.deb" dist/
+          git archive --format=tar.gz \
+            --prefix="bicchierino-${{ steps.pkgver.outputs.source_version }}/" \
+            -o "dist/bicchierino-${{ steps.pkgver.outputs.source_version }}-source.tar.gz" \
+            "${{ github.ref_name }}"
+
+      # Pinned static binary, same reasoning as semver.yml: one less
+      # third party in the trust chain for something this simple.
+      - name: Install git-cliff
+        run: |
+          GIT_CLIFF_VERSION=2.13.1
+          curl -fsSL "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            -o /tmp/git-cliff.tar.gz
+          tar -xzf /tmp/git-cliff.tar.gz -C /tmp
+          sudo mv "/tmp/git-cliff-${GIT_CLIFF_VERSION}/git-cliff" /usr/local/bin/git-cliff
+
+      # --current: just this tag's commits (HEAD IS the tag that
+      # triggered this workflow), not the whole project history.
+      # --strip header drops git-cliff's own top-level "# Changelog"
+      # title, which would be redundant — GitHub's release page already
+      # shows the version prominently in its own UI chrome.
+      - name: Generate release notes from Conventional Commits
+        run: git-cliff --current --strip header -o RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/bicchierino_${{ steps.pkgver.outputs.deb_version }}_amd64.deb \
+            dist/bicchierino-${{ steps.pkgver.outputs.source_version }}-source.tar.gz \
+            --title "${{ github.ref_name }}" \
+            --notes-file RELEASE_NOTES.md
+        env:
+          GH_TOKEN: ${{ github.token }}
