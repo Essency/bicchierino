@@ -204,6 +204,72 @@ TEST(read_cursor_set_with_cap_and_ring_hit_emits_markread) {
     CHECK(strstr(buf, "MARKREAD #chan timestamp=2025-") != NULL);
 }
 
+/* `read_cursor_set` with cap set, cursor_id NOT in ring (ring empty), and
+ * no http client (simulating REST unavailable) → no MARKREAD emitted.
+ *
+ * This is the production failure mode for #136: the ring is empty on a
+ * fresh connection, the REST fallback is needed, and the old `around=N`
+ * cursor returned [] when N was the latest message in the channel.  With
+ * hc=NULL here we exercise the silent-drop guard.  In production (hc !=
+ * NULL), the `before=N+1` fix causes REST to return the message at N and
+ * MARKREAD IS emitted. */
+TEST(read_cursor_set_ring_miss_no_hc_is_silent) {
+    struct grappa_session sess = make_sess("me", true);
+    /* Ring is empty — no messages seen this session. */
+
+    int tx = open_client();
+    if (tx < 0) return;
+
+    const char *json_str =
+        "{\"kind\":\"read_cursor_set\",\"last_read_message_id\":9999,\"badge_count\":1}";
+    int len = (int)strlen(json_str);
+    char err[64];
+    json_doc *d = json_parse(json_str, (size_t)len, err, sizeof(err));
+    if (!d) { FAIL("parse"); return; }
+
+    /* hc=NULL simulates REST unavailable; ring is empty so best_time=0. */
+    const char *topic = "grappa:user:me/network:testnet/channel:#chan";
+    handle_grappa_read_cursor_set_event(tx, NULL, NULL, &sess, json_root(d), topic);
+    json_free(d);
+
+    char buf[256];
+    drain(tx, buf, sizeof(buf));
+    /* No timestamp available — must NOT emit MARKREAD. */
+    CHECK(buf[0] == '\0');
+}
+
+/* `read_cursor_set` with cap set, cursor_id far outside ring (delta > 1000),
+ * and no http client → emits MARKREAD using the ring's approximate timestamp.
+ *
+ * When the ring has entries but none within 1000 ids of the cursor, and REST
+ * is unavailable, resolve_read_cursor_time falls back to the closest ring
+ * entry's timestamp (best_time).  That is good enough for a read marker and
+ * must not be silently dropped. */
+TEST(read_cursor_set_ring_miss_large_delta_no_hc_emits_approximate_markread) {
+    struct grappa_session sess = make_sess("me", true);
+    /* Ring entry at id=1, far from cursor_id=9999 (delta=9998 > 1000). */
+    remember_chathistory_ring(&sess, 1L, 1735689600000L); /* 2025-01-01T00:00:00Z */
+
+    int tx = open_client();
+    if (tx < 0) return;
+
+    const char *json_str =
+        "{\"kind\":\"read_cursor_set\",\"last_read_message_id\":9999,\"badge_count\":0}";
+    int len = (int)strlen(json_str);
+    char err[64];
+    json_doc *d = json_parse(json_str, (size_t)len, err, sizeof(err));
+    if (!d) { FAIL("parse"); return; }
+
+    const char *topic = "grappa:user:me/network:testnet/channel:#chan";
+    handle_grappa_read_cursor_set_event(tx, NULL, NULL, &sess, json_root(d), topic);
+    json_free(d);
+
+    char buf[512];
+    drain(tx, buf, sizeof(buf));
+    /* Ring fallback timestamp (2025-01-01) must produce a MARKREAD. */
+    CHECK(strstr(buf, "MARKREAD #chan timestamp=2025-") != NULL);
+}
+
 /* `read_cursor_set` with a topic that has no "/channel:" segment → silent. */
 TEST(read_cursor_set_bad_topic_is_silent) {
     struct grappa_session sess = make_sess("me", true);
@@ -239,6 +305,8 @@ int main(void) {
     RUN(markread_invalid_timestamp_returns_fail);
     RUN(read_cursor_set_without_cap_is_silent);
     RUN(read_cursor_set_with_cap_and_ring_hit_emits_markread);
+    RUN(read_cursor_set_ring_miss_no_hc_is_silent);
+    RUN(read_cursor_set_ring_miss_large_delta_no_hc_emits_approximate_markread);
     RUN(read_cursor_set_bad_topic_is_silent);
     return test_report();
 }
