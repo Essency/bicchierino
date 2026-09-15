@@ -4692,14 +4692,27 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
             bool has_id = false;
             json_long_opt(message, "id", &id, &has_id);
             /* Correlated by id: this IS my own optimistic echo, from
-             * THIS connection — the client already showed it when it
-             * was typed, drop the confirmation. NOT correlated: same
-             * identity, but a SIBLING connection sent it (see
+             * THIS connection.  What happens next depends on whether
+             * the client negotiated `echo-message`:
+             *
+             *   - No echo-message: the client already showed the line
+             *     locally when it was typed — drop the confirmation
+             *     (return).  This was the only branch before #133.
+             *
+             *   - echo-message negotiated: the client suppressed its
+             *     own local echo and is waiting for the server to send
+             *     the line back.  We MUST NOT return; fall through so
+             *     the line is delivered.  The id is still consumed from
+             *     the ring so it cannot mis-fire on a future event.
+             *
+             * NOT correlated (consume returns false): same identity,
+             * but a SIBLING connection sent it (see
              * `pending_self_msg_ids`'s own doc on `struct
              * grappa_session`) — genuinely new to THIS connection,
              * must still render, just not necessarily verbatim (see
              * the DM case below). */
-            if (has_id && consume_pending_self_id(sess, id)) return;
+            if (has_id && consume_pending_self_id(sess, id) &&
+                !sess->cap_echo_message) return;
         }
         const char *body = NULL;
         if (!json_str_req(message, "body", &body)) return;
@@ -5836,8 +5849,20 @@ static void handle_grappa_query_windows_list_event(int fd, const char *nick,
     char net_key[32];
     snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
     const json_value *windows = json_get(payload, "windows");
+    if (!windows) return; /* malformed: no "windows" key */
     const json_value *list = json_get(windows, net_key);
-    if (!list || json_type_of(list) != JSON_ARRAY) return;
+    /* An absent network key means no open windows for this network —
+     * grappa sends `{"windows":{}}` when ALL windows are closed, with
+     * no entry for the current network_id.  Bug #135: the old guard
+     * `!list || ...` returned early here, skipping the reverse pass
+     * entirely and leaving stale dm_peer subscriptions until a later
+     * list carrying a non-empty array finally triggered the removal.
+     * Fix: treat a missing key as an empty list.  json_len(NULL) == 0
+     * and json_at(NULL, i) == NULL, so both passes degenerate safely:
+     * the forward pass loops 0 times, and the reverse pass compacts
+     * dm_peer_names against an empty set — correctly releasing all
+     * remaining dm_peer subscriptions. */
+    if (list && json_type_of(list) != JSON_ARRAY) return; /* malformed list */
 
     /* Forward pass: queue newly-seen peers. */
     for (size_t i = 0; i < json_len(list); i++) {
@@ -6411,12 +6436,21 @@ static long resolve_read_cursor_time(struct http_client *hc, const struct config
     /* Exact or very near match in ring — use it directly. */
     if (best_delta >= 0 && best_delta <= 1000) return best_time;
 
-    /* Ring miss or ring empty: REST lookup (skipped if no HTTP client). */
+    /* Ring miss or ring empty: REST lookup (skipped if no HTTP client).
+     *
+     * Use `before=cursor_id+1` (not `around=cursor_id`): grappa's
+     * fetch_around with limit=1 computes before_count=div(1,2)=0 — it
+     * returns only rows with id > cursor_id, which is empty when
+     * cursor_id is the latest message (the common case), leaving
+     * fetched_time=0 and dropping the MARKREAD.  `before=cursor_id+1`
+     * returns rows with id < cursor_id+1 = id <= cursor_id; with
+     * limit=1 and DESC order that is cursor_id itself (or the nearest
+     * existing message below it if cursor_id was deleted). */
     if (!hc || !cfg || !channel || !channel[0]) return best_time;
 
     json_doc *doc = NULL;
     const json_value *root = NULL;
-    if (!chathistory_fetch(hc, cfg, sess, channel, "around", cursor_id, 1, &doc, &root)) {
+    if (!chathistory_fetch(hc, cfg, sess, channel, "before", cursor_id + 1, 1, &doc, &root)) {
         return best_time;
     }
     long fetched_time = best_time;
@@ -6569,20 +6603,99 @@ static void handle_markread(int fd, struct http_client *hc, const struct config 
  * are all the receive-side twin of a dedicated send-side push
  * (`handle_whois` etc's own doc explains why RAW alone can't reach
  * these: the reply needs a PRIMED accumulator on grappa's side that
- * only the dedicated verb sets up). `"joined"` is a
- * recognized, deliberate no-op: it's the SUCCESS counterpart to
- * `join_failed` (`Session.Wire`, `wire.ex: 358-363`), and `handle_join`'s
- * own optimistic echo already told the client it joined — nothing left
- * to say. `"channels_changed"` (`wire.ex:105`, carries literally no
+ * only the dedicated verb sets up). `"joined"` is handled by
+ * `handle_grappa_joined_event`: for channels this connection itself
+ * joined via `handle_join`, the optimistic echo already told the IRC
+ * client and the `joined` event is a confirmed no-op.  For channels
+ * a SIBLING client (e.g. the PWA) joined — not in this connection's
+ * own channel list — the event is the first notification bicchierino
+ * gets that the channel exists; the handler adds it to the session,
+ * subscribes the grappa WS topic, and sends JOIN to the IRC client
+ * (same three steps `handle_join` does after a REST 202, minus the
+ * REST call the sibling already made — issue #134).
+ * `"window_pending"` is a recognized no-op: it means a join is in
+ * flight but not yet confirmed; we wait for the terminal `"joined"`
+ * (or `"join_failed"`) before acting — no IRC state to update yet.
+ * `"channels_changed"` (`wire.ex:105`, carries literally no
  * other field — a bare "go re-fetch GET /channels if you care" signal
  * for a client that polls, which bicchierino doesn't) and
- * `"archive_changed"`/`"window_counts"`/`"query_windows_list"` are all
- * cicchetto-UI concepts (unread badges, DM sidebar tabs) with no
- * IRC-protocol equivalent to render — also deliberate no-ops, not gaps.
+ * `"archive_changed"`/`"window_counts"` are cicchetto-UI concepts
+ * (unread badges, DM sidebar tabs) with no IRC-protocol equivalent to
+ * render — deliberate no-ops.  `"query_windows_list"` IS handled (by
+ * `handle_grappa_query_windows_list_event`) — manages per-network DM
+ * peer topic subscriptions and the client close notification (#121).
  * Everything genuinely unhandled (`bundle_hash`, `server_settings_changed`,
  * `supported_umodes_changed`, `notify_list`, `away_confirmed`, ...) still
  * logs, TODO(next) per WIRE.md §6 — one verb at a time, reading
  * grappa_channel.ex for each, not guessed. */
+
+/* WIRE.md §6 / issue #134: handles the `"joined"` event from the user
+ * topic.  Two cases:
+ *
+ *   A. Channel already in sess->channels[] — this connection's own
+ *      join, confirmed.  `handle_join`'s optimistic echo already told
+ *      the IRC client; nothing more to do.
+ *
+ *   B. Channel NOT in sess->channels[] — a sibling client (e.g. the
+ *      PWA) joined a channel this connection never requested.  We add
+ *      it to our session, subscribe the grappa WS topic (which triggers
+ *      the post-join snapshot: topic/modes/members → existing handlers
+ *      emit 332/333/353/366 to the IRC client), and send JOIN.
+ *
+ * Network filtering: `joined` rides the user topic for ALL networks the
+ * account holds — drop events for networks other than ours before
+ * doing anything (same discipline as `handle_grappa_isupport_changed_event`
+ * and `handle_grappa_umode_changed_event`, except those filter by
+ * numeric `network_id`; `joined` carries the string slug `network`). */
+static void handle_grappa_joined_event(int fd, const char *nick, struct bridge *br,
+                                        struct grappa_session *sess, struct http_client *hc,
+                                        const struct config *cfg, const json_value *payload) {
+    const char *network = NULL;
+    if (!json_str_req(payload, "network", &network)) return;
+    if (strcmp(network, sess->network_slug) != 0) return;
+
+    const char *channel = NULL;
+    if (!json_str_req(payload, "channel", &channel)) return;
+    /* DM "query windows" have the peer's nick as channel — not an IRC
+     * #channel the client should JOIN.  The '#' check is the same guard
+     * handle_join uses for the same reason. */
+    if (channel[0] != '#') return;
+
+    /* Case A: already in our session (our own join, confirmed).  The
+     * optimistic echo in handle_join already told the IRC client; nothing
+     * more to say. */
+    if (find_channel_index(sess, channel) != sess->channel_count) return;
+
+    /* Case B: sibling-originated join — this connection had no idea this
+     * channel existed until now.  Add it, subscribe its grappa topic, and
+     * send JOIN to the IRC client. */
+    if (sess->channel_count >= MAX_CHANNELS) {
+        fprintf(stderr,
+                "bicchierino: sibling joined %s but MAX_CHANNELS reached — ignoring\n", channel);
+        return;
+    }
+
+    size_t idx = sess->channel_count++;
+    snprintf(sess->channels[idx], sizeof(sess->channels[0]), "%s", channel);
+    sess->channel_join_refs[idx] = 0;
+    sess->channel_mode_str[idx][0]    = '\0';
+    sess->channel_mode_params[idx][0] = '\0';
+
+    if (br) {
+        char folded_channel[128];
+        ascii_fold_lower(channel, folded_channel, sizeof(folded_channel));
+        char topic[512];
+        snprintf(topic, sizeof(topic), "grappa:user:%s/network:%s/channel:%s",
+                 sess->subject_name, sess->network_slug, folded_channel);
+        struct bridge_event_ctx ctx = {fd, nick, br, sess, hc, cfg};
+        if (!bridge_join(br, topic, &sess->channel_join_refs[idx], bridge_event_dispatch, &ctx))
+            fprintf(stderr, "bicchierino: sibling join %s: topic join failed\n", topic);
+    }
+
+    /* JOIN echo — same shape as handle_join's own optimistic echo. */
+    send_line(fd, ":%s!bicchierino@bicchierino JOIN :%s", nick, channel);
+    fprintf(stderr, "bicchierino: sibling joined %s — sent JOIN to client\n", channel);
+}
 static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
                                  struct grappa_session *sess, struct http_client *hc,
                                  const struct config *cfg, const char *payload,
@@ -6667,7 +6780,9 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
         handle_grappa_query_windows_list_event(fd, nick, sess, br, inner);
     } else if (strcmp(kind, "read_cursor_set") == 0) {
         handle_grappa_read_cursor_set_event(fd, hc, cfg, sess, inner, topic_str);
-    } else if (strcmp(kind, "joined") == 0 || strcmp(kind, "channels_changed") == 0 ||
+    } else if (strcmp(kind, "joined") == 0) {
+        handle_grappa_joined_event(fd, nick, br, sess, hc, cfg, inner);
+    } else if (strcmp(kind, "window_pending") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
     } else {
