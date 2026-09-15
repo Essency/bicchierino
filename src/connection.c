@@ -5849,8 +5849,20 @@ static void handle_grappa_query_windows_list_event(int fd, const char *nick,
     char net_key[32];
     snprintf(net_key, sizeof(net_key), "%ld", sess->network_id);
     const json_value *windows = json_get(payload, "windows");
+    if (!windows) return; /* malformed: no "windows" key */
     const json_value *list = json_get(windows, net_key);
-    if (!list || json_type_of(list) != JSON_ARRAY) return;
+    /* An absent network key means no open windows for this network —
+     * grappa sends `{"windows":{}}` when ALL windows are closed, with
+     * no entry for the current network_id.  Bug #135: the old guard
+     * `!list || ...` returned early here, skipping the reverse pass
+     * entirely and leaving stale dm_peer subscriptions until a later
+     * list carrying a non-empty array finally triggered the removal.
+     * Fix: treat a missing key as an empty list.  json_len(NULL) == 0
+     * and json_at(NULL, i) == NULL, so both passes degenerate safely:
+     * the forward pass loops 0 times, and the reverse pass compacts
+     * dm_peer_names against an empty set — correctly releasing all
+     * remaining dm_peer subscriptions. */
+    if (list && json_type_of(list) != JSON_ARRAY) return; /* malformed list */
 
     /* Forward pass: queue newly-seen peers. */
     for (size_t i = 0; i < json_len(list); i++) {
@@ -6607,9 +6619,11 @@ static void handle_markread(int fd, struct http_client *hc, const struct config 
  * `"channels_changed"` (`wire.ex:105`, carries literally no
  * other field — a bare "go re-fetch GET /channels if you care" signal
  * for a client that polls, which bicchierino doesn't) and
- * `"archive_changed"`/`"window_counts"`/`"query_windows_list"` are all
- * cicchetto-UI concepts (unread badges, DM sidebar tabs) with no
- * IRC-protocol equivalent to render — also deliberate no-ops, not gaps.
+ * `"archive_changed"`/`"window_counts"` are cicchetto-UI concepts
+ * (unread badges, DM sidebar tabs) with no IRC-protocol equivalent to
+ * render — deliberate no-ops.  `"query_windows_list"` IS handled (by
+ * `handle_grappa_query_windows_list_event`) — manages per-network DM
+ * peer topic subscriptions and the client close notification (#121).
  * Everything genuinely unhandled (`bundle_hash`, `server_settings_changed`,
  * `supported_umodes_changed`, `notify_list`, `away_confirmed`, ...) still
  * logs, TODO(next) per WIRE.md §6 — one verb at a time, reading
