@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message
 
 .PHONY: all clean install version check debug
 
@@ -213,6 +213,15 @@ tests/test_parse: tests/test_parse.c tests/test.h src/connection.c src/registry.
 # test_channel_prefix.
 tests/test_sibling_dm: tests/test_sibling_dm.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_sibling_dm.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_event / handle_grappa_joined_event
+# (both static). Pins the sibling-client channel join fix (#134): a `joined`
+# event for a channel NOT in this connection's list must produce JOIN + a
+# per-channel topic subscription, and `window_pending` must be a recognized
+# no-op. ws_stub replaces ws_client.c at link time (same pattern as test_who,
+# test_banlist, test_server_topic_bootstrap).
+tests/test_sibling_join: tests/test_sibling_join.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_sibling_join.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 # Compiles connection.c in to reach handle_grappa_query_windows_list_event
 # (static). Pins the bidirectional diff fix (#120): a shrinking
