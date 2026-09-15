@@ -6424,12 +6424,21 @@ static long resolve_read_cursor_time(struct http_client *hc, const struct config
     /* Exact or very near match in ring — use it directly. */
     if (best_delta >= 0 && best_delta <= 1000) return best_time;
 
-    /* Ring miss or ring empty: REST lookup (skipped if no HTTP client). */
+    /* Ring miss or ring empty: REST lookup (skipped if no HTTP client).
+     *
+     * Use `before=cursor_id+1` (not `around=cursor_id`): grappa's
+     * fetch_around with limit=1 computes before_count=div(1,2)=0 — it
+     * returns only rows with id > cursor_id, which is empty when
+     * cursor_id is the latest message (the common case), leaving
+     * fetched_time=0 and dropping the MARKREAD.  `before=cursor_id+1`
+     * returns rows with id < cursor_id+1 = id <= cursor_id; with
+     * limit=1 and DESC order that is cursor_id itself (or the nearest
+     * existing message below it if cursor_id was deleted). */
     if (!hc || !cfg || !channel || !channel[0]) return best_time;
 
     json_doc *doc = NULL;
     const json_value *root = NULL;
-    if (!chathistory_fetch(hc, cfg, sess, channel, "around", cursor_id, 1, &doc, &root)) {
+    if (!chathistory_fetch(hc, cfg, sess, channel, "before", cursor_id + 1, 1, &doc, &root)) {
         return best_time;
     }
     long fetched_time = best_time;
