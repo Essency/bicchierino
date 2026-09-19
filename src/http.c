@@ -12,7 +12,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "bridge.h" /* bridge_keepalive_tick — called on EAGAIN during HTTP I/O (#142) */
+/* bridge.h is NOT included here: test_http.c pulls in http.c via
+ * #include "../src/http.c" to reach its statics, but does not link
+ * bridge.c — a direct call to bridge_keepalive_tick would be unresolved
+ * at link time.  The callback pointer in struct http_client (and
+ * struct chunkbuf) avoids that dependency.  (#142) */
 
 #define GRAPPA_URL_TLS_PREFIX "https://"
 /* Plaintext is accepted ONLY towards a loopback host — config.c refuses
@@ -413,11 +417,11 @@ struct chunkbuf {
     int    fd;
     char   buf[HTTP_READ_CHUNK * 4];
     size_t len; /* valid bytes at buf[0..len) */
-    /* Propagated from hc->keepalive_br: if non-NULL, call
-     * bridge_keepalive_tick on EAGAIN so SO_RCVTIMEO becomes a heartbeat
-     * tick rather than a hard failure.  NULL during Phase 1 or when no
-     * bridge exists.  (#142) */
-    struct bridge *keepalive_br;
+    /* Propagated from hc->keepalive_tick/ctx: called on EAGAIN so
+     * SO_RCVTIMEO becomes a heartbeat-tick quantum.  NULL when no
+     * bridge exists (Phase 1 or keepalive not wired up yet).  (#142) */
+    bool (*keepalive_tick)(void *ctx);
+    void *keepalive_ctx;
 };
 
 /* Read one CRLF-terminated line from the buffer into `out` (without the
@@ -442,8 +446,8 @@ static bool chunkbuf_readline(struct chunkbuf *cb, char *out, size_t out_cap) {
         int n = conn_read(cb->ssl, cb->fd, cb->buf + cb->len,
                           sizeof(cb->buf) - cb->len);
         if (n <= 0) {
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && cb->keepalive_br) {
-                bridge_keepalive_tick(cb->keepalive_br);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && cb->keepalive_tick) {
+                cb->keepalive_tick(cb->keepalive_ctx);
                 continue; /* retry within the original HTTP_IO_TIMEOUT_SEC budget */
             }
             return false;
@@ -460,8 +464,8 @@ static bool chunkbuf_read_into(struct chunkbuf *cb, struct growbuf *gb, size_t n
         if (cb->len == 0) {
             int r = conn_read(cb->ssl, cb->fd, cb->buf, sizeof(cb->buf));
             if (r <= 0) {
-                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && cb->keepalive_br) {
-                    bridge_keepalive_tick(cb->keepalive_br);
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && cb->keepalive_tick) {
+                    cb->keepalive_tick(cb->keepalive_ctx);
                     continue;
                 }
                 return false;
@@ -501,11 +505,11 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
         int n = conn_read(hc->ssl, hc->fd, header_buf + header_len,
                           sizeof(header_buf) - 1 - header_len);
         if (n <= 0) {
-            /* EAGAIN: SO_RCVTIMEO fired — tick the keepalive if we have
-             * a bridge and retry within the overall HTTP_IO_TIMEOUT_SEC
+            /* EAGAIN: SO_RCVTIMEO fired — tick the keepalive callback
+             * if set and retry within the overall HTTP_IO_TIMEOUT_SEC
              * budget (#142). */
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && hc->keepalive_br) {
-                bridge_keepalive_tick(hc->keepalive_br);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && hc->keepalive_tick) {
+                hc->keepalive_tick(hc->keepalive_ctx);
                 continue;
             }
             return false;
@@ -548,7 +552,8 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
         memset(&cb, 0, sizeof(cb));
         cb.ssl = hc->ssl;
         cb.fd = hc->fd;
-        cb.keepalive_br = hc->keepalive_br; /* tick the bridge on EAGAIN (#142) */
+        cb.keepalive_tick = hc->keepalive_tick; /* propagate for EAGAIN ticks (#142) */
+        cb.keepalive_ctx  = hc->keepalive_ctx;
         if (already > 0) {
             memcpy(cb.buf, header_buf + headers_end, already);
             cb.len = already;
@@ -598,9 +603,9 @@ static bool http_client_exchange_once(struct http_client *hc, const char *reques
             int n = conn_read(hc->ssl, hc->fd, chunk,
                               want < sizeof(chunk) ? want : sizeof(chunk));
             if (n <= 0) {
-                /* EAGAIN: tick the keepalive and retry (#142). */
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && hc->keepalive_br) {
-                    bridge_keepalive_tick(hc->keepalive_br);
+                /* EAGAIN: tick the keepalive callback and retry (#142). */
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && hc->keepalive_tick) {
+                    hc->keepalive_tick(hc->keepalive_ctx);
                     continue;
                 }
                 free(body.data);

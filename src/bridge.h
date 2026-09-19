@@ -55,7 +55,7 @@ bool bridge_connect(const char *grappa_url, const char *bearer_token, const char
  *
  * Call from every place in the pump loop that can linger past 25 s:
  * bridge_join's own WS_NEED_MORE wait, the dm-peer join burst, and the
- * HTTP I/O readers (via http_client's keepalive_br field).  This is the
+ * HTTP I/O readers (via http_client's keepalive_tick callback).  This is the
  * mechanism that prevents grappa's 60 s idle timeout from closing the
  * websocket while the thread is blocked on something other than poll()
  * (#142). */
