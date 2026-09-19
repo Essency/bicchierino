@@ -4544,10 +4544,13 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
     const char *target = sess->network_nick[0] ? sess->network_nick : "*";
 
     /* Numeric path: meta.numeric (JSON number, 1–999) + meta.raw_params (array
-     * of strings, full param list in wire order).  Reconstruct the real IRC
-     * numeric line so middle params (STATS, TRACE, LIST, HELP, …) are not lost.
-     * raw_params last element is the trailing param (emitted with `:` prefix);
-     * all earlier elements are middle params (space-separated, no `:`). */
+     * of strings, full param list in wire order, TARGET NICK first).
+     * Reconstruct the real IRC numeric line so middle params (STATS, TRACE,
+     * LIST, HELP, …) are not lost.  raw_params[0] is the target; the last
+     * element is the trailing param (emitted with `:` prefix); all elements
+     * in between are middle params (space-separated, no `:`).
+     * Do NOT emit `target` separately — raw_params already carries it at [0]
+     * and printing it here too would duplicate the nick on the wire (#144). */
     long numeric_n = 0;
     const json_value *raw_params = meta ? json_get(meta, "raw_params") : NULL;
     bool has_numeric = meta && json_long(json_get(meta, "numeric"), &numeric_n)
@@ -4558,10 +4561,12 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
         char line[IRC_LINE_MAX];
         size_t pos = 0, rem = sizeof(line);
 
-        int r = snprintf(line + pos, rem, ":%s %03ld %s", prefix, numeric_n, target);
+        /* raw_params is the full param list in wire order, target (nick)
+         * first — do NOT print target separately or it appears twice. */
+        int r = snprintf(line + pos, rem, ":%s %03ld", prefix, numeric_n);
         if (r > 0 && (size_t)r < rem) { pos += (size_t)r; rem -= (size_t)r; }
 
-        /* Middle params — all but the last. */
+        /* Middle params — all but the last (raw_params[0] is the target). */
         for (size_t i = 0; i + 1 < n_p && rem > 1; i++) {
             const char *p = json_string(json_at(raw_params, i));
             if (!p) continue;
