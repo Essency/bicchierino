@@ -1,7 +1,7 @@
 /* test_bridge.c — the Phoenix Channels envelope layer.
  *
- * Two things here already cost live bugs, both recorded in bridge.c's own
- * comments, and both are exactly what this suite pins:
+ * Three things here already cost live bugs, all recorded in bridge.c's
+ * own comments, and all are exactly what this suite pins:
  *
  *   1. A join must not mistake an EARLIER topic's after-join snapshot for
  *      its own reply. Matching on "a phx_reply arrived" instead of "a
@@ -9,6 +9,11 @@
  *   2. A frame that isn't this join's reply must reach `on_event`, not
  *      the free() list. An entire channel's member/topic snapshot went
  *      missing that way, reproducibly.
+ *   3. (#142) While bridge_join is blocked waiting for its reply, the
+ *      Phoenix heartbeat must still fire — otherwise grappa's 60 s idle
+ *      timeout closes the websocket behind the bridge's back.  The stub
+ *      can simulate "no data yet" via WS_NEED_MORE, and ws_stub_sent()
+ *      can verify the heartbeat actually went on the wire.
  *
  * The websocket is stubbed (ws_stub.c), so every case is a decision about
  * bytes, with no peer involved.
@@ -20,6 +25,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Collects whatever bridge_join decided was not its answer. Sized above
  * the 32-frame join cap: the give-up case hands every one of those to the
@@ -298,6 +304,76 @@ TEST(a_topic_that_only_overflows_once_escaped_is_also_refused) {
     bridge_close(&br);
 }
 
+/* ── bridge_keepalive_tick (#142) ────────────────────────────────── */
+
+/* Before the deadline nothing is sent and false is returned. */
+TEST(keepalive_tick_does_nothing_before_deadline) {
+    struct bridge br;
+    fresh(&br); /* bridge_connect arms next_keepalive = now + 25 */
+    CHECK(!bridge_keepalive_tick(&br));
+    CHECK_LONG(ws_stub_sent_count(), 0);
+    bridge_close(&br);
+}
+
+/* Past the deadline, the heartbeat fires and the timer is re-armed. */
+TEST(keepalive_tick_fires_when_overdue) {
+    struct bridge br;
+    fresh(&br);
+    br.next_keepalive = time(NULL) - 1; /* force overdue */
+    CHECK(bridge_keepalive_tick(&br));
+    CHECK_LONG(ws_stub_sent_count(), 1);
+    /* The Phoenix heartbeat envelope: null join_ref, topic "phoenix",
+     * event "heartbeat", payload "{}". */
+    CHECK_STR(ws_stub_sent(0), "[null,\"1\",\"phoenix\",\"heartbeat\",{}]");
+    /* Re-armed: next deadline is in the future. */
+    CHECK(br.next_keepalive > time(NULL));
+    bridge_close(&br);
+}
+
+/* After firing, the timer is re-armed — a second immediate tick does
+ * nothing (not a double-heartbeat). */
+TEST(keepalive_tick_does_not_fire_twice_back_to_back) {
+    struct bridge br;
+    fresh(&br);
+    br.next_keepalive = time(NULL) - 1;
+    CHECK(bridge_keepalive_tick(&br));  /* fires */
+    CHECK(!bridge_keepalive_tick(&br)); /* re-armed, not yet due again */
+    CHECK_LONG(ws_stub_sent_count(), 1);
+    bridge_close(&br);
+}
+
+/* The exact scenario from #142: bridge_join is waiting for its reply
+ * and gets WS_NEED_MORE (simulating SO_RCVTIMEO ticks with no data yet).
+ * A heartbeat must go out on the wire during the wait, not only after
+ * the reply is received. */
+TEST(keepalive_fires_during_a_join_that_yields_need_more_before_replying) {
+    struct bridge br;
+    fresh(&br);
+    /* Force overdue immediately so the first WS_NEED_MORE tick fires it. */
+    br.next_keepalive = time(NULL) - 1;
+
+    /* Simulate: two "no data yet" ticks, then the actual join reply.
+     * bridge_join sends the join frame first (ws_stub_sent[0]), then
+     * enters the receive loop; keepalive fires on the first NEED_MORE
+     * and appends the heartbeat frame (ws_stub_sent[1]). */
+    ws_stub_queue(WS_NEED_MORE, NULL);
+    ws_stub_queue(WS_NEED_MORE, NULL);
+    ws_stub_queue(WS_TEXT, "[\"1\",\"1\",\"rooms:1\",\"phx_reply\",{\"status\":\"ok\"}]");
+
+    unsigned long ref = 0;
+    CHECK(bridge_join(&br, "rooms:1", &ref, NULL, NULL));
+    CHECK_LONG(ref, 1);
+
+    /* At least two frames went out: the phx_join envelope and the
+     * heartbeat that fired while waiting.  The join MUST be first (it
+     * is sent before the receive loop starts). */
+    CHECK(ws_stub_sent_count() >= 2);
+    CHECK_STR(ws_stub_sent(0), "[\"1\",\"1\",\"rooms:1\",\"phx_join\",{}]");
+    CHECK(ws_stub_sent(1) != NULL && strstr(ws_stub_sent(1), "heartbeat") != NULL);
+
+    bridge_close(&br);
+}
+
 /* ── bridge_push ─────────────────────────────────────────────────── */
 
 TEST(a_push_on_a_joined_topic_carries_its_join_ref) {
@@ -388,6 +464,10 @@ int main(void) {
     RUN(a_topic_that_does_not_fit_is_refused_not_shortened);
     RUN(the_longest_topic_connection_c_can_build_still_joins);
     RUN(a_topic_that_only_overflows_once_escaped_is_also_refused);
+    RUN(keepalive_tick_does_nothing_before_deadline);
+    RUN(keepalive_tick_fires_when_overdue);
+    RUN(keepalive_tick_does_not_fire_twice_back_to_back);
+    RUN(keepalive_fires_during_a_join_that_yields_need_more_before_replying);
     RUN(a_push_on_a_joined_topic_carries_its_join_ref);
     RUN(a_push_with_no_join_ref_encodes_null_not_zero);
     RUN(a_push_escapes_its_topic_and_event);

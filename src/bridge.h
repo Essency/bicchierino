@@ -10,6 +10,7 @@
 #define BICCHIERINO_BRIDGE_H
 
 #include <stdbool.h>
+#include <time.h>
 
 #include "ws_client.h"
 
@@ -35,11 +36,30 @@ struct bridge {
     struct ws_client wsc;
     unsigned long ws_ref; /* monotonic — every outbound frame gets the next one */
     char subject[128];    /* cached, for building "grappa:user:{subject}/..." topics */
+    /* Wall-clock deadline for the next Phoenix keepalive heartbeat.  Set
+     * by bridge_keepalive_arm (called once from bridge_connect), advanced
+     * by bridge_keepalive_tick every time it fires.  0 = not yet armed. */
+    time_t next_keepalive;
 };
 
-/* ws_client_connect + stash `subject` for building topic strings later. */
+/* ws_client_connect + stash `subject` for building topic strings later.
+ * Also arms the keepalive timer (next_keepalive = now + 25 s). */
 bool bridge_connect(const char *grappa_url, const char *bearer_token, const char *subject,
                      struct bridge *br);
+
+/* If time(NULL) >= br->next_keepalive, send the Phoenix heartbeat push
+ * on topic "phoenix" (the raw WS keepalive — the visibility re-push at
+ * the same cadence is connection.c's concern, not bridge.c's) and
+ * re-arm to now + 25 s.  Returns true if a heartbeat was sent, false if
+ * the deadline has not yet passed or the push failed.
+ *
+ * Call from every place in the pump loop that can linger past 25 s:
+ * bridge_join's own WS_NEED_MORE wait, the dm-peer join burst, and the
+ * HTTP I/O readers (via http_client's keepalive_tick callback).  This is the
+ * mechanism that prevents grappa's 60 s idle timeout from closing the
+ * websocket while the thread is blocked on something other than poll()
+ * (#142). */
+bool bridge_keepalive_tick(struct bridge *br);
 
 /* Callback for a frame `bridge_join` reads while waiting for ITS OWN
  * reply that turns out to belong to someone else — an in-flight
