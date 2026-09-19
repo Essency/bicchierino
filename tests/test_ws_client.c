@@ -206,16 +206,20 @@ static void serve_ws_upgrade(int connfd) {
     _exit(0);
 }
 
-/* Confirm that ws_client_connect clears both SO_RCVTIMEO and SO_SNDTIMEO
- * once the HTTP → WebSocket upgrade has completed (#112).
+/* Confirm that ws_client_connect sets SO_RCVTIMEO to WS_RECV_TIMEOUT_SEC (5 s)
+ * and SO_SNDTIMEO to 0 once the HTTP → WebSocket upgrade has completed.
  *
- * transport_connect (http.c) arms a 30 s I/O timeout for the HTTP
- * exchange.  Without the fix, that timeout persists on the WebSocket
- * socket for the bridge's lifetime: any 30 s gap in the stream fires
- * EAGAIN on conn_read, which — even with the #111 fix in place —
- * causes spurious WS_NEED_MORE wakeups from the bridge.c bootstrap
- * loop (bridge.c §74-79, no poll() gate, unbounded by anything but
- * this timeout).
+ * History:
+ *  #112: transport_connect (http.c) arms a 30 s SO_RCVTIMEO for the HTTP
+ *        exchange.  Without a fix that timeout would persist for the bridge's
+ *        lifetime, causing spurious WS_NEED_MORE wakeups.  ws_client_connect
+ *        now explicitly reprograms both timeouts after the upgrade.
+ *
+ *  #142: A 5 s SO_RCVTIMEO on the WS fd is required (not 0 = block-forever)
+ *        so that bridge_join's WS_NEED_MORE spin loop can call
+ *        bridge_keepalive_tick() at most every 5 s and avoid grappa's 60 s
+ *        idle-timeout tearing down the websocket while bridge_join blocks.
+ *        SO_SNDTIMEO remains 0 (writes are best-effort, no bounded wait).
  *
  * Uses an http:// URL to a loopback listener (the plaintext-loopback
  * deployment path, which avoids the need for a TLS cert while still
@@ -254,13 +258,14 @@ TEST(ws_client_connect_clears_io_timeout_after_upgrade) {
     CHECK(ok);
 
     if (ok) {
-        /* After a successful upgrade both timeouts must be zero —
-         * the kernel's representation of "no timeout / block forever".
-         * Without the fix, both read back HTTP_IO_TIMEOUT_SEC (30 s). */
+        /* After a successful upgrade:
+         *  - SO_RCVTIMEO = WS_RECV_TIMEOUT_SEC (5 s): lets bridge_join's
+         *    WS_NEED_MORE loop tick the Phoenix keepalive every ≤5 s (#142).
+         *  - SO_SNDTIMEO = 0 (block-forever): sends are not bounded. */
         long rcv = -1, snd = -1;
         CHECK(timeout_secs(wsc.fd, SO_RCVTIMEO, &rcv));
         CHECK(timeout_secs(wsc.fd, SO_SNDTIMEO, &snd));
-        CHECK_LONG(rcv, 0);
+        CHECK_LONG(rcv, 5);
         CHECK_LONG(snd, 0);
         ws_client_close(&wsc);
     }

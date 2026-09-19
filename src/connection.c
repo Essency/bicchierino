@@ -4544,10 +4544,13 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
     const char *target = sess->network_nick[0] ? sess->network_nick : "*";
 
     /* Numeric path: meta.numeric (JSON number, 1–999) + meta.raw_params (array
-     * of strings, full param list in wire order).  Reconstruct the real IRC
-     * numeric line so middle params (STATS, TRACE, LIST, HELP, …) are not lost.
-     * raw_params last element is the trailing param (emitted with `:` prefix);
-     * all earlier elements are middle params (space-separated, no `:`). */
+     * of strings, full param list in wire order, TARGET NICK first).
+     * Reconstruct the real IRC numeric line so middle params (STATS, TRACE,
+     * LIST, HELP, …) are not lost.  raw_params[0] is the target; the last
+     * element is the trailing param (emitted with `:` prefix); all elements
+     * in between are middle params (space-separated, no `:`).
+     * Do NOT emit `target` separately — raw_params already carries it at [0]
+     * and printing it here too would duplicate the nick on the wire (#144). */
     long numeric_n = 0;
     const json_value *raw_params = meta ? json_get(meta, "raw_params") : NULL;
     bool has_numeric = meta && json_long(json_get(meta, "numeric"), &numeric_n)
@@ -4558,10 +4561,12 @@ static void handle_grappa_server_window_row(int fd, const struct grappa_session 
         char line[IRC_LINE_MAX];
         size_t pos = 0, rem = sizeof(line);
 
-        int r = snprintf(line + pos, rem, ":%s %03ld %s", prefix, numeric_n, target);
+        /* raw_params is the full param list in wire order, target (nick)
+         * first — do NOT print target separately or it appears twice. */
+        int r = snprintf(line + pos, rem, ":%s %03ld", prefix, numeric_n);
         if (r > 0 && (size_t)r < rem) { pos += (size_t)r; rem -= (size_t)r; }
 
-        /* Middle params — all but the last. */
+        /* Middle params — all but the last (raw_params[0] is the target). */
         for (size_t i = 0; i + 1 < n_p && rem > 1; i++) {
             const char *p = json_string(json_at(raw_params, i));
             if (!p) continue;
@@ -6792,6 +6797,14 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     json_free(doc);
 }
 
+/* Thin adapter so http_client's void * keepalive callback can call
+ * bridge_keepalive_tick without either http.c needing to include bridge.h
+ * (which would add a link dependency that breaks test_http) or a
+ * function-pointer cast (undefined behaviour + pedantic warning).  #142. */
+static bool http_keepalive_tick_bridge(void *ctx) {
+    return bridge_keepalive_tick((struct bridge *)ctx);
+}
+
 void *connection_run(void *arg) {
     struct connection_args *args = arg;
     int fd = args->client_fd;
@@ -6970,6 +6983,17 @@ void *connection_run(void *arg) {
          * Identical value at this exact point. */
         br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
         if (br_connected) {
+            /* Wire the http_client into the bridge's keepalive tick so
+             * HTTP I/O readers can send a heartbeat on EAGAIN during a
+             * slow grappa response — without this, a 30+30s HTTP stall
+             * starves the Phoenix heartbeat and grappa closes the
+             * websocket on its 60s idle timeout (#142).
+             *
+             * The callback uses void * context so http.c needs no link
+             * dependency on bridge.c (test_http.c includes http.c
+             * directly and does not link bridge.c). */
+            hc.keepalive_tick = http_keepalive_tick_bridge;
+            hc.keepalive_ctx  = &br;
             join_user_topic(fd, sess.network_nick, &br, &sess, &hc, cfg);
             join_server_topic(fd, sess.network_nick, &br, &sess, &hc, cfg);
             await_channel_snapshot(fd, sess.network_nick, &br, &sess, &hc, cfg);
@@ -7059,7 +7083,8 @@ void *connection_run(void *arg) {
     pfds[0].fd = fd;
     pfds[0].events = POLLIN;
     pfds[1].events = POLLIN;
-    time_t next_heartbeat = time(NULL) + 25;
+    /* next_heartbeat is now br.next_keepalive, armed by bridge_connect
+     * and re-armed by bridge_keepalive_tick (#142). */
     time_t last_client_seen = time(NULL);
     bool client_ping_sent = false;
     time_t client_ping_deadline = 0;
@@ -7073,9 +7098,12 @@ void *connection_run(void *arg) {
             break;
         }
 
-        if (br_connected && time(NULL) >= next_heartbeat) {
-            if (!bridge_push(&br, "phoenix", 0, "heartbeat", "{}"))
-                fprintf(stderr, "bicchierino: heartbeat push failed\n");
+        /* bridge_keepalive_tick sends the Phoenix heartbeat if the 25s
+         * deadline has passed and re-arms it.  The visibility re-push at
+         * the same cadence is this loop's concern (not bridge.c's): it
+         * requires session state (user_join_ref, visible, subject_name)
+         * that the bridge layer does not own.  #142. */
+        if (br_connected && bridge_keepalive_tick(&br)) {
             if (sess.user_join_ref) {
                 char user_topic[160];
                 snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess.subject_name);
@@ -7084,7 +7112,6 @@ void *connection_run(void *arg) {
                          sess.visible ? "true" : "false");
                 bridge_push(&br, user_topic, sess.user_join_ref, "visibility", vis_payload);
             }
-            next_heartbeat = time(NULL) + 25;
         }
 
         /* DM-listener rejoin after a self nick_change — deferred here

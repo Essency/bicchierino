@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "json.h"
 #include "jsonw.h"
@@ -11,6 +12,21 @@ bool bridge_connect(const char *grappa_url, const char *bearer_token, const char
     memset(br, 0, sizeof(*br));
     if (!ws_client_connect(grappa_url, bearer_token, &br->wsc)) return false;
     snprintf(br->subject, sizeof(br->subject), "%s", subject);
+    br->next_keepalive = time(NULL) + 25;
+    return true;
+}
+
+bool bridge_keepalive_tick(struct bridge *br) {
+    if (!br->next_keepalive || time(NULL) < br->next_keepalive) return false;
+    if (!bridge_push(br, "phoenix", 0, "heartbeat", "{}")) {
+        /* Push failed — the bridge is likely dead.  Don't re-arm: the
+         * next keepalive_tick call would fail again immediately and the
+         * caller will discover the closed bridge through its own read
+         * path anyway. */
+        fprintf(stderr, "bicchierino: keepalive push failed\n");
+        return false;
+    }
+    br->next_keepalive = time(NULL) + 25;
     return true;
 }
 
@@ -65,17 +81,40 @@ bool bridge_join(struct bridge *br, const char *topic, unsigned long *join_ref_o
      * unresponsive server still fails instead of blocking forever —
      * comfortably above the handful of snapshot pushes a real join
      * produces. */
+    /* Wall-clock deadline: a server that sends no frames at all (not even
+     * the join reply) must still terminate in bounded time.  Without
+     * this, the inner WS_NEED_MORE loop could spin indefinitely on
+     * keepalive ticks alone if SO_RCVTIMEO fires but no reply ever
+     * arrives.  30 s is generous relative to the frame-cap's own role
+     * (stopping a chatty server that never replies); the two caps are
+     * complementary, not redundant.  #142. */
+    time_t deadline = time(NULL) + 30;
+
     for (int attempts = 0; attempts < 32; attempts++) {
         /* Loop on WS_NEED_MORE: this call is still purely sequential (no
          * poll() yet), so blocking until a complete frame lands is
          * correct here, unlike the eventual steady-state read loop
-         * where WS_NEED_MORE goes back to poll(). */
+         * where WS_NEED_MORE goes back to poll().
+         *
+         * With SO_RCVTIMEO set to 5 s on the WS fd (ws_client_connect
+         * arms it instead of clearing it to zero — #142), each tick of
+         * this inner loop takes at most 5 s, allowing bridge_keepalive_tick
+         * to fire and keep the Phoenix socket alive even while this join
+         * is blocking. */
         char *payload = NULL;
         size_t payload_len = 0;
         ws_result r;
         for (;;) {
             r = ws_client_recv(&br->wsc, &payload, &payload_len);
             if (r != WS_NEED_MORE) break;
+            bridge_keepalive_tick(br);
+            if (time(NULL) >= deadline) {
+                fprintf(stderr,
+                        "bicchierino: join %s: timed out after 30 s waiting for reply\n",
+                        topic);
+                free(payload);
+                return false;
+            }
         }
         if (r != WS_TEXT) {
             fprintf(stderr, "bicchierino: join %s: websocket closed or errored (result=%d)\n",

@@ -34,6 +34,19 @@ struct http_client {
     int fd;
     bool connected;
     char host[256];
+    /* When non-NULL, keepalive_tick(keepalive_ctx) is called on EAGAIN
+     * inside every blocking HTTP read, turning SO_RCVTIMEO into a
+     * heartbeat-tick quantum rather than a hard failure threshold.  Set
+     * by connection.c immediately after bridge_connect, via a thin wrapper
+     * that passes &br as the context.  NULL during Phase 1 (before the
+     * bridge exists).  (#142)
+     *
+     * A callback rather than a direct struct bridge * avoids a link-time
+     * dependency: test_http.c #includes src/http.c to reach its statics,
+     * but does not link src/bridge.c — a direct call would leave
+     * bridge_keepalive_tick unresolved at link time. */
+    bool (*keepalive_tick)(void *ctx);
+    void *keepalive_ctx;
 };
 
 /* Zeroes `hc` — not yet connected. Connecting is lazy, on the first

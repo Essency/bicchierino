@@ -190,19 +190,26 @@ bool ws_client_connect(const char *grappa_url, const char *bearer_token, struct 
 
     ws_reader_init(&out->reader);
 
-    /* Clear the HTTP-phase I/O timeout — it must not persist into the
-     * long-lived WebSocket phase, where silence is the normal state.
-     * grappa's own ping cadence is documented at 30-60 s (connection.c
-     * §ping), which straddles the 30 s HTTP_IO_TIMEOUT_SEC deadline rather
-     * than staying safely inside it.  A zero timeval is the kernel's
-     * "block forever" (i.e. no timeout) — the Phase 2 poll()-gated read
-     * loop supplies its own timing and must not be disrupted by a stale
-     * SO_RCVTIMEO left over from the HTTP exchange.
-     * Mirrors the identical clear connection.c performs on the IRC client
-     * fd after registration (connection.c "SO_RCVTIMEO left over from
-     * Phase 1"). */
+    /* Arm a short SO_RCVTIMEO on the WS fd instead of clearing it to
+     * zero (which means "block forever").  The Phase 2 poll()-gated read
+     * loop already handles WS_NEED_MORE correctly — it goes back to
+     * poll() on any EAGAIN, so a 5 s timeout there is harmless.  For
+     * bridge_join's own sequential inner loop (which is NOT poll()-gated),
+     * the timeout is the tick boundary: ws_client_recv returns WS_NEED_MORE
+     * every 5 s, giving bridge_join the opportunity to call
+     * bridge_keepalive_tick and keep the Phoenix socket alive while
+     * waiting for the join reply (#142).
+     *
+     * SO_SNDTIMEO is cleared: writes are prompt in practice and a stalled
+     * send is better reported immediately than hidden behind a tick loop.
+     * Note: the old comment said "grappa's own ping cadence is 30-60 s,
+     * which straddles HTTP_IO_TIMEOUT_SEC" — that was the argument for
+     * clearing to zero, but it assumed the poll()-gated loop would be
+     * broken by a short timeout.  It is not; only the bridge_join inner
+     * loop is affected, and that is exactly what we want. */
+    struct timeval wsc_recv_tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(out->fd, SOL_SOCKET, SO_RCVTIMEO, &wsc_recv_tv, sizeof(wsc_recv_tv));
     struct timeval no_tv = {0, 0};
-    setsockopt(out->fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
     setsockopt(out->fd, SOL_SOCKET, SO_SNDTIMEO, &no_tv, sizeof(no_tv));
 
     /* Bytes past the header terminator are already websocket frames —

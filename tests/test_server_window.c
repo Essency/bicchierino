@@ -274,27 +274,34 @@ TEST(sender_kind_server_works_for_dotted_hostname) {
  * The NOTICE path must survive unchanged for bare notices (no numeric) and
  * for old-grappa rows that carry numeric but no raw_params. */
 
+/* NOTE: raw_params is the FULL parameter list in wire order, target nick
+ * first (element 0).  Every test below must include the client nick ("me",
+ * matching sess.network_nick) as raw_params[0].  Tests written WITHOUT the
+ * target in position 0 would not catch the duplicate-target bug (#144):
+ * the line builder MUST derive the target from raw_params alone and must
+ * NOT emit it separately, or it appears twice. */
+
 /* RPL_STATSLINKINFO (211): six middle params + trailing.  This is the
  * primary regression — every column was previously dropped, leaving only
- * the last field ("Open_since Idle TS"). */
+ * the last field ("Open_since Idle TS").
+ * raw_params[0] = "me" (target), raw_params[1..6] = link columns. */
 TEST(numeric_211_emits_full_params) {
     char buf[1024];
     const char *params[] = {
-        "leaf4.azzurra.chat", "0", "12345", "67890", "11111", "22222", "Open_since Idle TS"
+        "me", "leaf4.azzurra.chat", "0", "12345", "67890", "11111", "22222", "Open_since Idle TS"
     };
-    render_row_with_numeric("hub.azzurra.chat", 211, params, 7, "Open_since Idle TS",
+    render_row_with_numeric("hub.azzurra.chat", 211, params, 8, "Open_since Idle TS",
                             buf, sizeof(buf));
     CHECK_STR(buf, ":hub.azzurra.chat 211 me leaf4.azzurra.chat 0 12345 67890 11111 22222"
                    " :Open_since Idle TS\r\n");
 }
 
-/* RPL_STATSUPTIME (242): trailing-only, all payload in body.  The pre-fix
- * NOTICE path forwarded this correctly; the numeric path must preserve it
- * and now also emit the real numeric code instead of NOTICE. */
+/* RPL_STATSUPTIME (242): target + trailing, no other middle params.
+ * raw_params = ["me", "Server Up 3 days 12:34:56"]. */
 TEST(numeric_242_trailing_only_regression_guard) {
     char buf[1024];
-    const char *params[] = { "Server Up 3 days 12:34:56" };
-    render_row_with_numeric("hub.azzurra.chat", 242, params, 1, "Server Up 3 days 12:34:56",
+    const char *params[] = { "me", "Server Up 3 days 12:34:56" };
+    render_row_with_numeric("hub.azzurra.chat", 242, params, 2, "Server Up 3 days 12:34:56",
                             buf, sizeof(buf));
     /* Must be a 242, not a NOTICE; body text must be present. */
     CHECK_STR(buf, ":hub.azzurra.chat 242 me :Server Up 3 days 12:34:56\r\n");
@@ -303,22 +310,23 @@ TEST(numeric_242_trailing_only_regression_guard) {
 /* RPL_STATSOLINE (243): payload entirely in middle params, empty trailing.
  * Pre-fix: body="" → NOTICE with empty body → "no line arrives" from the
  * client's perspective (the NOTICE was sent but useless).  Post-fix: real
- * 243 with O-line data. */
+ * 243 with O-line data.
+ * raw_params[0] = "me" (target), raw_params[1..5] = O-line fields, [6] = "". */
 TEST(numeric_243_empty_trailing_middle_params_present) {
     char buf[1024];
-    const char *params[] = { "O", "*", "192.0.2.1", "testoper", "NetAdmin", "" };
-    render_row_with_numeric("hub.azzurra.chat", 243, params, 6, "",
+    const char *params[] = { "me", "O", "*", "192.0.2.1", "testoper", "NetAdmin", "" };
+    render_row_with_numeric("hub.azzurra.chat", 243, params, 7, "",
                             buf, sizeof(buf));
     /* All five middle params must be present; trailing is empty but present. */
     CHECK_STR(buf, ":hub.azzurra.chat 243 me O * 192.0.2.1 testoper NetAdmin :\r\n");
 }
 
-/* Single-trailing numeric (219 RPL_ENDOFSTATS): regression guard that the
- * simplest case (one element in raw_params = just the trailing) is correct. */
+/* Single-trailing numeric (219 RPL_ENDOFSTATS): target + trailing only.
+ * raw_params = ["me", "End of /STATS report."]. */
 TEST(numeric_219_end_of_stats) {
     char buf[1024];
-    const char *params[] = { "End of /STATS report." };
-    render_row_with_numeric("hub.azzurra.chat", 219, params, 1, "End of /STATS report.",
+    const char *params[] = { "me", "End of /STATS report." };
+    render_row_with_numeric("hub.azzurra.chat", 219, params, 2, "End of /STATS report.",
                             buf, sizeof(buf));
     CHECK_STR(buf, ":hub.azzurra.chat 219 me :End of /STATS report.\r\n");
 }
@@ -332,24 +340,48 @@ TEST(numeric_219_end_of_stats) {
  *
  *   :<server> 303 <nick> :
  *
- * grappa persists this as raw_params: [""] — a single-element array whose
- * only element is the empty trailing param.  The pre-fix NOTICE path rendered
- * this as "NOTICE me :" (still wrong: a NOTICE, not a numeric, and body=""
- * means row_text() returns "", which some callers treat as absent).  The
- * numeric path must emit the real 303 with the empty trailing present.
+ * grappa persists this as raw_params: ["me", ""] — target first, then the
+ * empty trailing param.  The pre-fix NOTICE path rendered this as
+ * "NOTICE me :" (wrong: a NOTICE, not a numeric, and body="" means
+ * row_text() returns "", which some callers treat as absent).  The numeric
+ * path must emit the real 303 with the empty trailing present.
  *
  * This is the complement of the 243 case (empty trailing WITH middle params).
- * Here there are NO middle params at all — n_p = 1, the middle-param loop
- * does not execute, and only the empty trailing is emitted.  Verifying this
- * case catches any future regression where empty-trailing handling is broken
- * specifically for the no-middle-param shape. */
+ * Here there are NO middle params between target and trailing — n_p = 2,
+ * the middle-param loop executes only for i=0 (the target itself), and
+ * the empty string is the trailing.  Verifying this case catches any future
+ * regression where empty-trailing handling is broken specifically for the
+ * target-plus-empty-trailing shape. */
 TEST(numeric_303_ison_empty_list) {
     char buf[1024];
-    const char *params[] = { "" };
-    render_row_with_numeric("hub.azzurra.chat", 303, params, 1, "",
+    const char *params[] = { "me", "" };
+    render_row_with_numeric("hub.azzurra.chat", 303, params, 2, "",
                             buf, sizeof(buf));
     /* Must be a 303, not a NOTICE; trailing must be present (colon only). */
     CHECK_STR(buf, ":hub.azzurra.chat 303 me :\r\n");
+}
+
+/* RPL_LIST (322) — the exact shape reported broken in #144.
+ *
+ * Wire: :<server> 322 <target> <channel> <usercount> :<topic>
+ * grappa stores raw_params in wire order: [<target>, <channel>, <count>, <topic>].
+ *
+ * The bug: the line builder printed <target> separately AND appended
+ * raw_params[0] (also <target>), producing:
+ *
+ *   :<server> 322 me me #channel 5 :Some topic   ← WRONG (double nick)
+ *
+ * instead of:
+ *
+ *   :<server> 322 me #channel 5 :Some topic      ← correct
+ *
+ * This test would have caught #144 before it was merged. */
+TEST(numeric_322_list_does_not_duplicate_target) {
+    char buf[1024];
+    const char *params[] = { "me", "#test", "42", "Some topic" };
+    render_row_with_numeric("hub.azzurra.chat", 322, params, 4, "Some topic",
+                            buf, sizeof(buf));
+    CHECK_STR(buf, ":hub.azzurra.chat 322 me #test 42 :Some topic\r\n");
 }
 
 /* Numeric with no raw_params (old grappa that pre-dates grappa #424):
@@ -417,6 +449,7 @@ int main(void) {
     RUN(numeric_243_empty_trailing_middle_params_present);
     RUN(numeric_219_end_of_stats);
     RUN(numeric_303_ison_empty_list);
+    RUN(numeric_322_list_does_not_duplicate_target);
     RUN(numeric_without_raw_params_falls_back_to_notice);
     RUN(bare_notice_without_numeric_stays_notice);
     return test_report();
