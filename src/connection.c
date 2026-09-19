@@ -6970,6 +6970,12 @@ void *connection_run(void *arg) {
          * Identical value at this exact point. */
         br_connected = bridge_connect(cfg->grappa_url, sess.token, sess.subject_name, &br);
         if (br_connected) {
+            /* Wire the http_client into the bridge so HTTP I/O readers can
+             * tick the keepalive while blocked on a slow grappa response —
+             * without this, a 30+30s HTTP stall starves the Phoenix
+             * heartbeat and grappa closes the websocket on its 60s idle
+             * timeout (#142). */
+            hc.keepalive_br = &br;
             join_user_topic(fd, sess.network_nick, &br, &sess, &hc, cfg);
             join_server_topic(fd, sess.network_nick, &br, &sess, &hc, cfg);
             await_channel_snapshot(fd, sess.network_nick, &br, &sess, &hc, cfg);
@@ -7059,7 +7065,8 @@ void *connection_run(void *arg) {
     pfds[0].fd = fd;
     pfds[0].events = POLLIN;
     pfds[1].events = POLLIN;
-    time_t next_heartbeat = time(NULL) + 25;
+    /* next_heartbeat is now br.next_keepalive, armed by bridge_connect
+     * and re-armed by bridge_keepalive_tick (#142). */
     time_t last_client_seen = time(NULL);
     bool client_ping_sent = false;
     time_t client_ping_deadline = 0;
@@ -7073,9 +7080,12 @@ void *connection_run(void *arg) {
             break;
         }
 
-        if (br_connected && time(NULL) >= next_heartbeat) {
-            if (!bridge_push(&br, "phoenix", 0, "heartbeat", "{}"))
-                fprintf(stderr, "bicchierino: heartbeat push failed\n");
+        /* bridge_keepalive_tick sends the Phoenix heartbeat if the 25s
+         * deadline has passed and re-arms it.  The visibility re-push at
+         * the same cadence is this loop's concern (not bridge.c's): it
+         * requires session state (user_join_ref, visible, subject_name)
+         * that the bridge layer does not own.  #142. */
+        if (br_connected && bridge_keepalive_tick(&br)) {
             if (sess.user_join_ref) {
                 char user_topic[160];
                 snprintf(user_topic, sizeof(user_topic), "grappa:user:%s", sess.subject_name);
@@ -7084,7 +7094,6 @@ void *connection_run(void *arg) {
                          sess.visible ? "true" : "false");
                 bridge_push(&br, user_topic, sess.user_join_ref, "visibility", vis_payload);
             }
-            next_heartbeat = time(NULL) + 25;
         }
 
         /* DM-listener rejoin after a self nick_change — deferred here

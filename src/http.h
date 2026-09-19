@@ -28,12 +28,23 @@ struct http_response {
     size_t body_len;
 };
 
+/* Forward declaration: bridge.h → ws_client.h → this file (ws_client.c
+ * includes http.h), so a full #include would be circular.  Only a pointer
+ * is stored here; the implementation includes bridge.h directly. */
+struct bridge;
+
 struct http_client {
     SSL_CTX *ctx; /* NULL when the connection is plaintext loopback */
     SSL *ssl;     /* likewise — see conn_read/conn_write below */
     int fd;
     bool connected;
     char host[256];
+    /* When non-NULL, bridge_keepalive_tick() is called on EAGAIN inside
+     * every blocking HTTP read, turning SO_RCVTIMEO into a heartbeat-tick
+     * quantum rather than a hard failure threshold.  Set by connection.c
+     * immediately after bridge_connect; NULL during Phase 1 (before the
+     * bridge exists).  (#142) */
+    struct bridge *keepalive_br;
 };
 
 /* Zeroes `hc` — not yet connected. Connecting is lazy, on the first
