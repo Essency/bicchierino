@@ -29,8 +29,9 @@ WebSocket pushes.
 ## Design
 
 - **Stateless per connection.** No state survives a disconnect. Every
-  reconnect is a fresh REST login, a fresh set of channel joins, and (once
-  supported) a fresh history replay — never a resumed session.
+  reconnect is a fresh REST login, a fresh set of channel joins, and a
+  fresh history replay read from grappa's scrollback — never a resumed
+  session. See "Backlog" below for what a client gets.
 - **One thread per connection, zero shared state.** No locks needed
   anywhere except around the optional log file. The blocking REST login
   only stalls the thread handling that one connection; every other client
@@ -44,16 +45,37 @@ WebSocket pushes.
   are both refused at startup for any other address.
 - **IRCv3-aware.** Full `CAP` negotiation (`cap-3.2`); `server-time` and
   `message-tags` are fully implemented — every relayed event carries a
-  real `@time=` tag once a client negotiates both. `draft/chathistory`
-  is deliberately not advertised yet: grappa's scrollback REST cursor is
-  always an integer message id, never a timestamp, which blocks the
-  timestamp-based selectors a real client is likely to send on
-  reconnect. The exact blocker and the options considered to unblock it
-  are documented in `src/connection.c`'s `handle_cap_command` comment.
+  real `@time=` tag once a client negotiates both. `batch`,
+  `draft/chathistory`, `echo-message` and `draft/read-marker` are
+  advertised too.
 
 Full design rationale lives in [`ARCHITECTURE.md`](ARCHITECTURE.md). The
 grappa wire-protocol contract this bridge relies on — read from grappa's
 own source, not guessed — is documented in [`WIRE.md`](WIRE.md).
+
+## Backlog
+
+What a client sees of the channel's past depends on whether it
+negotiated `draft/chathistory`:
+
+- **Without it** (irssi, WeeChat, HexChat, ...): right after each JOIN —
+  the channels presented at registration, a channel you join, or one a
+  sibling client joined — bicchierino replays the newest **50** messages
+  of that channel, oldest first. Negotiate `server-time` and
+  `message-tags` to see them with their original timestamps; without them
+  the client stamps them with the time they arrived.
+- **With it**: nothing is replayed on JOIN — the client asks for exactly
+  the history it is missing. `CHATHISTORY` `LATEST`, `BEFORE`, `AFTER`,
+  `AROUND` and `BETWEEN` are answered from grappa's scrollback, with both
+  `msgid=` and `timestamp=` references; `TARGETS` answers empty. A reply
+  holds at most `CHATHISTORY=100` messages (advertised in `005`).
+
+Both replay chat lines only — `PRIVMSG`, `NOTICE` and CTCP `ACTION`; joins,
+parts, quits and mode changes are not replayed. grappa's scrollback is
+addressed by message id, so a `timestamp=` reference is placed by reading
+the channel's history backwards from the newest line, up to 2000 lines
+deep; a timestamp older than that is answered from the oldest line read,
+and bicchierino logs that it did so.
 
 ## Building
 
