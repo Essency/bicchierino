@@ -5260,6 +5260,28 @@ enum chathistory_pick {
     CH_PICK_AROUND, /* around: N centred on the anchor */
 };
 
+/* Which rows of one fetched page a reply sends. `desc`: grappa ordered
+ * the page newest first (before/around and their _time twins, and the
+ * cursor-less latest page) rather than oldest first (after, after_time).
+ * `anchor`: AROUND's centre — an id, or an epoch-ms instant when
+ * `anchor_is_time`, the side "before" being inclusive as grappa's own
+ * split is. `have_range`: the closed id range [`lo_id`, `hi_id`].
+ * `have_time_range`: `server_time` strictly after `after_ms` and, when
+ * `before_ms` is set, strictly before it — the bounds a `timestamp=`
+ * reference sets on a page grappa did not cut at that instant itself
+ * (LATEST's latest page, BETWEEN's far end). */
+struct chathistory_select {
+    bool desc;
+    enum chathistory_pick pick;
+    long limit;
+    long anchor;
+    bool anchor_is_time;
+    bool have_range;
+    long lo_id, hi_id;
+    bool have_time_range;
+    long after_ms, before_ms;
+};
+
 /* True when `render_chathistory_message` would send this row. Kept in
  * step with that function's own kind/field checks, so the selection pass
  * below can count sendable rows without sending anything. */
@@ -5290,39 +5312,43 @@ static bool chathistory_row_sendable(const json_value *m) {
  * before it, or the ones centred on it. A reply shorter than `limit` now
  * means the page ran out of messages, never that skipped rows were counted.
  *
- * `desc` says how grappa ordered the page (before/around/the absent-cursor
- * page come newest first, after comes oldest first). `have_range` narrows
- * to the closed id range [`lo_id`, `hi_id`] (BETWEEN's client-side
- * filter). `anchor_id` is the AROUND anchor; ignored otherwise. */
+ * `sel` says how grappa ordered the page and which rows of it qualify —
+ * `struct chathistory_select`'s own doc. */
 static void chathistory_deliver(int fd, const struct grappa_session *sess, const char *batch_ref,
-                                const char *target, const json_value *root, bool desc,
-                                enum chathistory_pick pick, long limit, long anchor_id,
-                                bool have_range, long lo_id, long hi_id) {
+                                const char *target, const json_value *root,
+                                const struct chathistory_select *sel) {
     size_t count = json_len(root);
     if (count > CHATHISTORY_FETCH_LIMIT) count = CHATHISTORY_FETCH_LIMIT;
 
     /* Pass 1: the sendable rows, as page indices in oldest-first order. */
     size_t idx[CHATHISTORY_FETCH_LIMIT];
     size_t n = 0;
-    size_t split = 0; /* AROUND: how many sendable rows have id <= anchor_id */
+    size_t split = 0; /* AROUND: how many sendable rows sit at or before the anchor */
     for (size_t k = 0; k < count; k++) {
-        size_t i = desc ? count - 1 - k : k;
+        size_t i = sel->desc ? count - 1 - k : k;
         const json_value *m = json_at(root, i);
         long id = 0;
         bool have_id = json_long_req(m, "id", &id);
-        if (have_range && (!have_id || id < lo_id || id > hi_id)) continue;
+        long st = 0;
+        bool have_st = json_long_req(m, "server_time", &st);
+        if (sel->have_range && (!have_id || id < sel->lo_id || id > sel->hi_id)) continue;
+        if (sel->have_time_range &&
+            (!have_st || st <= sel->after_ms || (sel->before_ms && st >= sel->before_ms)))
+            continue;
         if (!chathistory_row_sendable(m)) continue;
-        if (pick == CH_PICK_AROUND && have_id && id <= anchor_id) split = n + 1;
+        if (sel->pick == CH_PICK_AROUND &&
+            (sel->anchor_is_time ? have_st && st <= sel->anchor : have_id && id <= sel->anchor))
+            split = n + 1;
         idx[n++] = i;
     }
 
     /* Pass 2: the window [first, first + take) out of those. */
-    size_t want = (size_t)limit;
+    size_t want = (size_t)sel->limit;
     size_t first = 0;
     size_t take = n < want ? n : want;
-    if (pick == CH_PICK_NEWEST) {
+    if (sel->pick == CH_PICK_NEWEST) {
         first = n - take;
-    } else if (pick == CH_PICK_AROUND) {
+    } else if (sel->pick == CH_PICK_AROUND) {
         /* Same split grappa's own `?around=` uses: floor(limit/2) at or
          * before the anchor, the rest after it — rebalanced when one side
          * runs short, so a reply is only short when the page is. */
@@ -5362,20 +5388,12 @@ static long grappa_protocol_version(struct http_client *hc, const struct config 
     return sess->grappa_protocol;
 }
 
-/* Resolves a CHATHISTORY `timestamp=` to a grappa `messages.id`: the id
- * of the newest row of `target` whose `server_time` is before `t_ms`
- * (`strict`) or at/before it (`!strict`).
- *
- * A grappa at protocol_version >= GRAPPA_PROTOCOL_TIME_CURSORS answers
- * that in one read: `before_time=T&limit=1` is the newest row strictly
- * before T, and `before_time=T+1` the newest at or before it (epoch ms,
- * and ids advance with server_time, so the newest by time is the
- * newest by id). The gate is not an optimisation: an older grappa
- * IGNORES the parameter and silently answers the most recent page, so
- * sending it unasked would anchor every request at "now".
- *
- * An older grappa's scrollback REST only takes id cursors, so the
- * fallback walks `GET .../messages` backwards from the newest row, CHATHISTORY_FETCH_LIMIT
+/* Resolves a CHATHISTORY `timestamp=` to a grappa `messages.id`, for a
+ * grappa without time cursors (below GRAPPA_PROTOCOL_TIME_CURSORS, or a
+ * BETWEEN mixing a msgid with a timestamp): the id of the newest row of
+ * `target` whose `server_time` is before `t_ms` (`strict`) or at/before
+ * it (`!strict`). Its scrollback REST only takes id cursors, so this
+ * walks `GET .../messages` backwards from the newest row, CHATHISTORY_FETCH_LIMIT
  * rows a page, until it meets a row of `target` whose `server_time` is
  * before `t_ms` (`strict`) or at/before it (`!strict`), and answers that
  * row's id. Rows of every kind count — this places a point in time, it
@@ -5388,6 +5406,12 @@ static long grappa_protocol_version(struct http_client *hc, const struct config 
  * anchor is then newer than the requested instant. Returns false only
  * when grappa could not be read.
  *
+ * Known limit: an id stands for a point in time only while the server's
+ * clock moves forward. After a backward clock step a later row carries an
+ * earlier `server_time`, and the id anchor can drop or repeat rows near
+ * the instant; a grappa with time cursors is asked by time instead
+ * (`handle_chathistory`) and has no such gap.
+ *
  * Replaced the per-connection ring the selector used before: the ring
  * held only what THIS connection had seen live, so on a fresh connection
  * — exactly when a client sends `LATEST <target> timestamp=<last seen>`
@@ -5396,19 +5420,6 @@ static long grappa_protocol_version(struct http_client *hc, const struct config 
 static bool chathistory_walk_to_time(struct http_client *hc, const struct config *cfg,
                                      struct grappa_session *sess, const char *target,
                                      long t_ms, bool strict, long *out_id) {
-    if (grappa_protocol_version(hc, cfg, sess) >= GRAPPA_PROTOCOL_TIME_CURSORS) {
-        json_doc *doc = NULL;
-        const json_value *root = NULL;
-        if (!chathistory_fetch(hc, cfg, sess, target, "before_time", strict ? t_ms : t_ms + 1, 1,
-                               &doc, &root))
-            return false;
-        long id = 0;
-        if (json_len(root) == 0 || !json_long_req(json_at(root, 0), "id", &id)) id = 0;
-        *out_id = id;
-        json_free(doc);
-        return true;
-    }
-
     long cursor = 0; /* 0 = first page, the newest rows */
     for (int page = 0; page < CHATHISTORY_WALK_MAX_PAGES; page++) {
         json_doc *doc = NULL;
@@ -5444,6 +5455,12 @@ static bool chathistory_walk_to_time(struct http_client *hc, const struct config
             target, CHATHISTORY_WALK_MAX_PAGES * CHATHISTORY_FETCH_LIMIT, cursor);
     *out_id = cursor - 1;
     return true;
+}
+
+/* A `timestamp=<ISO8601>` reference's instant, in epoch ms. False for any
+ * other token (`msgid=`, `*`) and for an unparseable timestamp. */
+static bool parse_timestamp_ref(const char *token, long *out_ms) {
+    return strncmp(token, "timestamp=", 10) == 0 && parse_iso8601_utc_ms(token + 10, out_ms);
 }
 
 /* One CHATHISTORY message reference, resolved. `msgid=<id>` is exact
@@ -5499,8 +5516,9 @@ static void replay_on_join(int fd, struct http_client *hc, const struct config *
     const json_value *root = NULL;
     if (!chathistory_fetch(hc, cfg, sess, channel, NULL, 0, CHATHISTORY_FETCH_LIMIT, &doc, &root))
         return;
-    chathistory_deliver(fd, sess, NULL, channel, root, true, CH_PICK_NEWEST, JOIN_REPLAY_LINES, 0,
-                        false, 0, 0);
+    struct chathistory_select sel = {.desc = true, .pick = CH_PICK_NEWEST,
+                                     .limit = JOIN_REPLAY_LINES};
+    chathistory_deliver(fd, sess, NULL, channel, root, &sel);
     json_free(doc);
 }
 
@@ -5561,25 +5579,62 @@ static void handle_chathistory(int fd, struct http_client *hc, const struct conf
 
     const char *cursor_kind = NULL; /* NULL = absent-cursor "latest page" */
     long cursor_id = 0;
-    enum chathistory_pick pick = CH_PICK_OLDEST;
-    bool have_range = false;
-    long range_lo = 0; /* inclusive */
-    long range_hi = 0; /* inclusive */
+    struct chathistory_select sel = {.pick = CH_PICK_OLDEST, .limit = limit};
     long id = 0;
     bool is_time = false;
     enum chathistory_ref ref = CH_REF_OK;
+    long t1 = 0, t2 = 0;
 
-    if (strcasecmp(sub, "LATEST") == 0) {
-        pick = CH_PICK_NEWEST;
+    bool is_latest = strcasecmp(sub, "LATEST") == 0;
+    bool timed = parse_timestamp_ref(msg->params[2], &t1) &&
+                 (!is_between || parse_timestamp_ref(msg->params[3], &t2)) &&
+                 grappa_protocol_version(hc, cfg, sess) >= GRAPPA_PROTOCOL_TIME_CURSORS;
+
+    if (timed) {
+        /* A grappa with time cursors is asked BY TIME, so the rows are
+         * the ones whose server_time is past the instant even when the
+         * server's clock once stepped back — an id anchor cannot promise
+         * that (`chathistory_walk_to_time`'s known limit). The gate is
+         * mandatory: an older grappa ignores the parameter and answers
+         * its newest page. */
+        if (is_latest) {
+            sel.pick = CH_PICK_NEWEST; /* latest page, past the instant */
+            sel.have_time_range = true;
+            sel.after_ms = t1;
+        } else if (strcasecmp(sub, "BEFORE") == 0) {
+            cursor_kind = "before_time";
+            cursor_id = t1;
+            sel.pick = CH_PICK_NEWEST;
+        } else if (strcasecmp(sub, "AFTER") == 0) {
+            cursor_kind = "after_time";
+            cursor_id = t1;
+        } else if (strcasecmp(sub, "AROUND") == 0) {
+            cursor_kind = "around_time";
+            cursor_id = t1;
+            sel.pick = CH_PICK_AROUND;
+            sel.anchor = t1;
+            sel.anchor_is_time = true;
+        } else if (is_between) {
+            cursor_kind = "after_time";
+            cursor_id = t1 < t2 ? t1 : t2;
+            sel.have_time_range = true;
+            sel.after_ms = cursor_id;
+            sel.before_ms = t1 < t2 ? t2 : t1;
+        } else {
+            send_chathistory_fail(fd, "UNKNOWN_COMMAND", sub, "Unknown CHATHISTORY subcommand");
+            return;
+        }
+    } else if (is_latest) {
+        sel.pick = CH_PICK_NEWEST;
         if (strcmp(msg->params[2], "*") != 0) {
             /* The newest `limit` messages AFTER the reference: the latest
              * page, filtered to ids past it. A timestamp anchors at the
              * last row at or before it. */
             ref = resolve_chathistory_ref(hc, cfg, sess, target, msg->params[2], false, &id,
                                           &is_time);
-            have_range = true;
-            range_lo = id + 1;
-            range_hi = LONG_MAX;
+            sel.have_range = true;
+            sel.lo_id = id + 1;
+            sel.hi_id = LONG_MAX;
         }
     } else if (strcasecmp(sub, "BEFORE") == 0) {
         /* A timestamp anchors at the last row strictly before it; `before`
@@ -5588,7 +5643,7 @@ static void handle_chathistory(int fd, struct http_client *hc, const struct conf
         if (ref == CH_REF_OK && is_time && id == 0) ref = CH_REF_BAD; /* nothing older */
         cursor_kind = "before";
         cursor_id = is_time ? id + 1 : id;
-        pick = CH_PICK_NEWEST;
+        sel.pick = CH_PICK_NEWEST;
     } else if (strcasecmp(sub, "AFTER") == 0) {
         ref = resolve_chathistory_ref(hc, cfg, sess, target, msg->params[2], false, &id, &is_time);
         cursor_kind = "after";
@@ -5597,7 +5652,8 @@ static void handle_chathistory(int fd, struct http_client *hc, const struct conf
         ref = resolve_chathistory_ref(hc, cfg, sess, target, msg->params[2], false, &id, &is_time);
         cursor_kind = "around";
         cursor_id = id;
-        pick = CH_PICK_AROUND;
+        sel.pick = CH_PICK_AROUND;
+        sel.anchor = id;
     } else if (is_between) {
         /* Either order is legal. Each bound resolves as a lower one (the
          * row the range starts after), the lower token is the one that
@@ -5622,9 +5678,9 @@ static void handle_chathistory(int fd, struct http_client *hc, const struct conf
         }
         cursor_kind = "after";
         cursor_id = a;
-        have_range = true;
-        range_lo = a;
-        range_hi = b;
+        sel.have_range = true;
+        sel.lo_id = a;
+        sel.hi_id = b;
     } else {
         send_chathistory_fail(fd, "UNKNOWN_COMMAND", sub, "Unknown CHATHISTORY subcommand");
         return;
@@ -5652,15 +5708,14 @@ static void handle_chathistory(int fd, struct http_client *hc, const struct conf
         return;
     }
 
-    bool desc = cursor_kind == NULL || strcmp(cursor_kind, "before") == 0 ||
-                strcmp(cursor_kind, "around") == 0;
+    sel.desc = cursor_kind == NULL || strncmp(cursor_kind, "before", 6) == 0 ||
+               strncmp(cursor_kind, "around", 6) == 0;
 
     bool batched = sess->cap_batch;
     char batch_ref[24] = "";
     if (batched) chathistory_batch_open(fd, sess, target, batch_ref, sizeof(batch_ref));
 
-    chathistory_deliver(fd, sess, batched ? batch_ref : NULL, target, root, desc, pick, limit,
-                        cursor_id, have_range, range_lo, range_hi);
+    chathistory_deliver(fd, sess, batched ? batch_ref : NULL, target, root, &sel);
 
     if (batched) chathistory_batch_close(fd, batch_ref);
     json_free(doc);

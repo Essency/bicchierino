@@ -7,10 +7,12 @@
  *       budget (`BEFORE msgid=<newest+1> 3` answered 2 lines).
  *   (b) `timestamp=` selectors resolve against grappa, not the
  *       per-connection ring — on a fresh connection the ring was empty and
- *       every timestamp selector answered an empty batch. One read through
- *       grappa's time cursor at protocol_version >= 40, and NEVER below
- *       it (an older grappa ignores the parameter and answers the newest
- *       page); a backwards walk of the id-cursor REST otherwise.
+ *       every timestamp selector answered an empty batch. At grappa
+ *       protocol_version >= 40 the rows are asked BY TIME (before_time/
+ *       after_time/around_time), which also holds across a backward clock
+ *       step; NEVER below 40 (an older grappa ignores the parameter and
+ *       answers its newest page), where a backwards walk of the id-cursor
+ *       REST places the instant instead.
  *   (c) a client that did not negotiate draft/chathistory gets the newest
  *       JOIN_REPLAY_LINES messages after a JOIN; one that did gets none.
  *
@@ -366,35 +368,101 @@ TEST(unreadable_config_falls_back_to_the_walk) {
     CHECK(sent(20) && sent(21));
 }
 
-TEST(new_grappa_resolves_before_with_one_time_cursor_read) {
+/* A row whose server_time is given, not derived from its id — how a page
+ * looks after the server's clock stepped back. */
+static void page_row_at(long id, long server_time) {
+    page_len += (size_t)snprintf(page + page_len, sizeof(page) - page_len,
+                                 "%s{\"id\":%ld,\"network\":\"testnet\",\"channel\":\"#c\","
+                                 "\"server_time\":%ld,\"kind\":\"privmsg\",\"sender\":\"peer\","
+                                 "\"body\":\"c-%ld\",\"meta\":{}}",
+                                 page_len > 1 ? "," : "", id, server_time, id);
+}
+
+static void chathistory_on(struct grappa_session *sess, const char *line) {
+    struct irc_message msg;
+    CHECK(irc_parse_line(line, &msg));
+    int tx, rx;
+    if (!open_pair(&tx, &rx)) return;
+    handle_chathistory(tx, &hc, &cfg, sess, &msg);
+    collect(tx, rx);
+}
+
+TEST(new_grappa_before_is_asked_by_time) {
     setup();
     grappa_at(40);
     char ts[64], line[128], want[128];
     iso_ms(row_time(20), ts, sizeof(ts));
     snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 10", ts);
-    http_stub_queue(200, page_desc(19, 19)); /* newest row strictly before T */
     http_stub_queue(200, page_desc(19, 17));
     chathistory(line);
-    CHECK(http_stub_request_count() == 3);
-    snprintf(want, sizeof(want), "%s?before_time=%ld&limit=1", MSGS, row_time(20));
+    CHECK(http_stub_request_count() == 2);
+    snprintf(want, sizeof(want), "%s?before_time=%ld&limit=200", MSGS, row_time(20));
     CHECK_STR(http_stub_request(1), want);
-    CHECK_STR(http_stub_request(2), MSGS "?before=20&limit=200");
-    CHECK(sent(19) && sent(17) && !sent(20));
+    CHECK(sent(19) && sent(17) && sent_before(17, 19));
 }
 
-TEST(new_grappa_resolves_after_inclusive_of_the_instant) {
+TEST(new_grappa_after_is_asked_by_time) {
     setup();
     grappa_at(40);
     char ts[64], line[128], want[128];
     iso_ms(row_time(19), ts, sizeof(ts));
     snprintf(line, sizeof(line), "CHATHISTORY AFTER #c timestamp=%s 10", ts);
-    http_stub_queue(200, page_desc(19, 19)); /* newest row at or before T */
     http_stub_queue(200, page_asc(20, 21));
     chathistory(line);
-    snprintf(want, sizeof(want), "%s?before_time=%ld&limit=1", MSGS, row_time(19) + 1);
+    CHECK(http_stub_request_count() == 2);
+    snprintf(want, sizeof(want), "%s?after_time=%ld&limit=200", MSGS, row_time(19));
     CHECK_STR(http_stub_request(1), want);
-    CHECK_STR(http_stub_request(2), MSGS "?after=19&limit=200");
-    CHECK(sent(20) && sent(21) && !sent(19));
+    CHECK(sent(20) && sent(21));
+}
+
+/* The case an id anchor gets wrong: the clock stepped back between rows
+ * 11 and 12, so 12 is newer by id and older by time. LATEST past t=100
+ * must answer 11 (t=105) and 13 (t=101) — never 12 (t=96). */
+TEST(new_grappa_latest_by_time_survives_a_clock_step_back) {
+    setup();
+    grappa_at(40);
+    char ts[64], line[128];
+    iso_ms(T_BASE + 100, ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY LATEST #c timestamp=%s 10", ts);
+    page_begin();
+    page_row_at(13, T_BASE + 101);
+    page_row_at(12, T_BASE + 96);
+    page_row_at(11, T_BASE + 105);
+    page_row_at(10, T_BASE + 100);
+    http_stub_queue(200, page_end());
+    chathistory(line);
+    CHECK_STR(http_stub_request(1), MSGS "?limit=200");
+    CHECK(sent(11) && sent(13));
+    CHECK(!sent(12) && !sent(10));
+}
+
+TEST(new_grappa_around_splits_by_time) {
+    setup();
+    grappa_at(40);
+    char ts[64], line[128], want[128];
+    iso_ms(row_time(20), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY AROUND #c timestamp=%s 4", ts);
+    http_stub_queue(200, page_desc(30, 10));
+    chathistory(line);
+    snprintf(want, sizeof(want), "%s?around_time=%ld&limit=200", MSGS, row_time(20));
+    CHECK_STR(http_stub_request(1), want);
+    CHECK(count_lines("PRIVMSG #c") == 4);
+    CHECK(sent(19) && sent(20) && sent(21) && sent(22)); /* T itself on the "before" side */
+}
+
+TEST(new_grappa_between_cuts_the_far_end_by_time) {
+    setup();
+    grappa_at(40);
+    char lo[64], hi[64], line[192], want[128];
+    iso_ms(row_time(12), lo, sizeof(lo));
+    iso_ms(row_time(15), hi, sizeof(hi));
+    /* Upper bound first: either order is legal. */
+    snprintf(line, sizeof(line), "CHATHISTORY BETWEEN #c timestamp=%s timestamp=%s 10", hi, lo);
+    http_stub_queue(200, page_asc(13, 30));
+    chathistory(line);
+    snprintf(want, sizeof(want), "%s?after_time=%ld&limit=200", MSGS, row_time(12));
+    CHECK_STR(http_stub_request(1), want);
+    CHECK(sent(13) && sent(14) && !sent(15) && !sent(16));
 }
 
 TEST(new_grappa_with_nothing_before_the_instant) {
@@ -410,16 +478,25 @@ TEST(new_grappa_with_nothing_before_the_instant) {
     CHECK(count_lines("BATCH +") == 1 && count_lines("BATCH -") == 1);
 }
 
+TEST(msgid_requests_never_ask_for_the_version) {
+    setup();
+    http_stub_queue(200, page_desc(22, 17));
+    chathistory("CHATHISTORY BEFORE #c msgid=23 3");
+    CHECK(http_stub_request_count() == 1);
+    CHECK(strstr(http_stub_request(0), "/api/config") == NULL);
+}
+
 TEST(protocol_version_is_read_once_per_connection) {
     setup();
     struct grappa_session sess = make_sess(true);
+    char ts[64], line[128];
+    iso_ms(row_time(20), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 2", ts);
     grappa_at(40);
-    http_stub_queue(200, page_desc(19, 19));
-    http_stub_queue(200, page_desc(19, 19));
-    long id = 0;
-    CHECK(chathistory_walk_to_time(&hc, &cfg, &sess, "#c", row_time(20), true, &id));
-    CHECK(chathistory_walk_to_time(&hc, &cfg, &sess, "#c", row_time(20), true, &id));
-    CHECK(id == 19);
+    http_stub_queue(200, page_desc(19, 17));
+    http_stub_queue(200, page_desc(19, 17));
+    chathistory_on(&sess, line);
+    chathistory_on(&sess, line);
     CHECK(http_stub_request_count() == 3);
     CHECK_STR(http_stub_request(0), CONFIG_PATH);
     CHECK(strstr(http_stub_request(2), "before_time=") != NULL);
@@ -471,9 +548,13 @@ int main(void) {
     RUN(grappa_unreachable_during_walk_is_a_fail_not_a_guess);
     RUN(old_grappa_is_never_sent_a_time_cursor);
     RUN(unreadable_config_falls_back_to_the_walk);
-    RUN(new_grappa_resolves_before_with_one_time_cursor_read);
-    RUN(new_grappa_resolves_after_inclusive_of_the_instant);
+    RUN(new_grappa_before_is_asked_by_time);
+    RUN(new_grappa_after_is_asked_by_time);
+    RUN(new_grappa_latest_by_time_survives_a_clock_step_back);
+    RUN(new_grappa_around_splits_by_time);
+    RUN(new_grappa_between_cuts_the_far_end_by_time);
     RUN(new_grappa_with_nothing_before_the_instant);
+    RUN(msgid_requests_never_ask_for_the_version);
     RUN(protocol_version_is_read_once_per_connection);
     RUN(join_replays_newest_fifty_to_a_client_without_the_cap);
     RUN(join_replays_nothing_to_a_client_with_the_cap);
