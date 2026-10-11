@@ -56,8 +56,11 @@ TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/
 
 all: $(BIN)
 
+# $(LDFLAGS) is the caller's, on the two link lines: distribution build
+# tools pass their linker hardening there (Arch's makepkg: -z relro -z now),
+# and a link line that drops it ships a binary without full RELRO.
 $(BIN): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
@@ -72,7 +75,7 @@ DEBUG_OBJS := $(OBJS:.o=.debug.o)
 debug: bicchierino-debug
 
 bicchierino-debug: $(DEBUG_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
 
 %.debug.o: %.c
 	$(CC) $(CPPFLAGS) -DBICCHIERINO_LOG_TRAFFIC $(CFLAGS) -c -o $@ $<

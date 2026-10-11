@@ -1,0 +1,21 @@
+pkgbase = bicchierino
+	pkgdesc = Stateless IRC-facade bridge to the grappa IRC bouncer
+	pkgver = 0.4.2
+	pkgrel = 1
+	url = https://github.com/Essency/bicchierino
+	install = bicchierino.install
+	arch = x86_64
+	license = MIT
+	makedepends = git
+	depends = glibc
+	depends = openssl
+	depends = ca-certificates
+	backup = etc/bicchierino/bicchierino.config
+	source = bicchierino::git+https://github.com/Essency/bicchierino.git#tag=v0.4.2
+	source = bicchierino.sysusers
+	source = bicchierino.tmpfiles
+	sha256sums = SKIP
+	sha256sums = 2ecebdc9346fbcc3e4877636a079a173601b4e85585b756a6a9a8811a208711d
+	sha256sums = b20d1b90f138706e12b87e286c6b4667d55c5a3da6f785e5aa5e47e35c2d3232
+
+pkgname = bicchierino

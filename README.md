@@ -84,6 +84,28 @@ never connect), and logs to the systemd journal
 [`packaging/`](packaging/) for the unit file and `postinst`/`postrm`
 scripts, or `packaging/build-deb.sh` to build one yourself.
 
+### Arch Linux: install as a systemd service
+
+Each release also ships a prebuilt `x86_64` package (`<version>` is the
+release without its leading `v`, e.g. `0.4.3`):
+
+```sh
+sudo pacman -U https://github.com/Essency/bicchierino/releases/download/v<version>/bicchierino-<version>-1-x86_64.pkg.tar.zst
+sudo $EDITOR /etc/bicchierino/bicchierino.config   # set a real grappa-url
+sudo systemctl enable --now bicchierino
+```
+
+Or build it from source with makepkg — the recipe builds the release tag
+named by `pkgver` in [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD):
+
+```sh
+git clone https://github.com/Essency/bicchierino.git
+cd bicchierino/packaging/arch && makepkg -si
+```
+
+Same posture as the `.deb`: a dedicated `bicchierino` system user (from
+`sysusers.d`), no auto-start, logs to the journal.
+
 ## Configuring
 
 See [`example.config`](example.config) for the full directive format. A
