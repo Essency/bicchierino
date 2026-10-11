@@ -69,7 +69,8 @@ make
 ### Debian/Ubuntu: install as a systemd service
 
 Each [release](https://github.com/Essency/bicchierino/releases) ships a
-`.deb` with a hardened systemd unit alongside the binary tarball:
+`.deb` for `amd64` and one for `arm64`, with a hardened systemd unit,
+alongside the source tarball:
 
 ```sh
 sudo dpkg -i bicchierino_*.deb
