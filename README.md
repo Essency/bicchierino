@@ -71,11 +71,13 @@ negotiated `draft/chathistory`:
   holds at most `CHATHISTORY=100` messages (advertised in `005`).
 
 Both replay chat lines only — `PRIVMSG`, `NOTICE` and CTCP `ACTION`; joins,
-parts, quits and mode changes are not replayed. grappa's scrollback is
-addressed by message id, so a `timestamp=` reference is placed by reading
-the channel's history backwards from the newest line, up to 2000 lines
-deep; a timestamp older than that is answered from the oldest line read,
-and bicchierino logs that it did so.
+parts, quits and mode changes are not replayed. A `timestamp=` reference
+is placed with one query on a grappa that takes time cursors in its
+scrollback API (wire `protocol_version` 40 and later, read from
+`/api/config`). An older grappa addresses its scrollback by message id
+only, so there the channel's history is read backwards from the newest
+line, up to 2000 lines deep; a timestamp older than that is answered from
+the oldest line read, and bicchierino logs that it did so.
 
 ## Building
 

@@ -5,9 +5,12 @@
  *   (a) `limit` counts lines SENT. A grappa page carries joins, parts and
  *       quits that are never replayed; they used to eat the client's
  *       budget (`BEFORE msgid=<newest+1> 3` answered 2 lines).
- *   (b) `timestamp=` selectors resolve by walking grappa's REST backwards,
- *       not from the per-connection ring — on a fresh connection the ring
- *       was empty and every timestamp selector answered an empty batch.
+ *   (b) `timestamp=` selectors resolve against grappa, not the
+ *       per-connection ring — on a fresh connection the ring was empty and
+ *       every timestamp selector answered an empty batch. One read through
+ *       grappa's time cursor at protocol_version >= 40, and NEVER below
+ *       it (an older grappa ignores the parameter and answers the newest
+ *       page); a backwards walk of the id-cursor REST otherwise.
  *   (c) a client that did not negotiate draft/chathistory gets the newest
  *       JOIN_REPLAY_LINES messages after a JOIN; one that did gets none.
  *
@@ -148,6 +151,20 @@ static bool sent_before(long a, long b) {
     return pa && pb && pa < pb;
 }
 
+/* What `GET /api/config` answers — the first request of any timestamp
+ * resolution, which picks the walk (< 40) or the time cursor (>= 40). */
+static void grappa_at(int protocol_version) {
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"version\":\"1.0.0\",\"server\":\"grappa\",\"protocol_version\":%d,"
+             "\"min_protocol_version\":1}",
+             protocol_version);
+    http_stub_queue(200, body);
+}
+
+#define CONFIG_PATH "/api/config"
+#define MSGS "/networks/testnet/channels/%23c/messages"
+
 static void setup(void) {
     http_stub_reset();
     memset(&cfg, 0, sizeof(cfg));
@@ -212,45 +229,49 @@ TEST(around_msgid_centres_on_anchor_past_presence) {
 
 TEST(after_timestamp_on_fresh_connection_is_millisecond_exact) {
     setup();
+    grappa_at(39);
     char ts[64], line[128];
     iso_ms(row_time(19), ts, sizeof(ts)); /* the @time= of a line the client holds */
     snprintf(line, sizeof(line), "CHATHISTORY AFTER #c timestamp=%s 10", ts);
     http_stub_queue(200, page_desc(21, 17)); /* the walk's first page */
     http_stub_queue(200, page_asc(20, 21));  /* the reply page */
     chathistory(line);
-    CHECK(http_stub_request_count() == 2);
-    CHECK_STR(http_stub_request(0), "/networks/testnet/channels/%23c/messages?limit=200");
-    CHECK_STR(http_stub_request(1), "/networks/testnet/channels/%23c/messages?after=19&limit=200");
+    CHECK(http_stub_request_count() == 3);
+    CHECK_STR(http_stub_request(1), "/networks/testnet/channels/%23c/messages?limit=200");
+    CHECK_STR(http_stub_request(2), "/networks/testnet/channels/%23c/messages?after=19&limit=200");
     CHECK(sent(20) && sent(21) && !sent(19));
 }
 
 TEST(before_timestamp_is_strict) {
     setup();
+    grappa_at(39);
     char ts[64], line[128];
     iso_ms(row_time(20), ts, sizeof(ts));
     snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 10", ts);
     http_stub_queue(200, page_desc(21, 17));
     http_stub_queue(200, page_desc(19, 17));
     chathistory(line);
-    CHECK_STR(http_stub_request(1), "/networks/testnet/channels/%23c/messages?before=20&limit=200");
+    CHECK_STR(http_stub_request(2), "/networks/testnet/channels/%23c/messages?before=20&limit=200");
     CHECK(sent(19) && sent(17) && !sent(20));
 }
 
 TEST(latest_timestamp_answers_newest_past_the_point) {
     setup();
+    grappa_at(39);
     char ts[64], line[128];
     iso_ms(row_time(10), ts, sizeof(ts));
     snprintf(line, sizeof(line), "CHATHISTORY LATEST #c timestamp=%s 3", ts);
     http_stub_queue(200, page_desc(30, 1)); /* walk */
     http_stub_queue(200, page_desc(30, 1)); /* reply: the latest page */
     chathistory(line);
-    CHECK_STR(http_stub_request(1), "/networks/testnet/channels/%23c/messages?limit=200");
+    CHECK_STR(http_stub_request(2), "/networks/testnet/channels/%23c/messages?limit=200");
     CHECK(count_lines("PRIVMSG #c") == 3);
     CHECK(sent(28) && sent(29) && sent(30)); /* the NEWEST three, not 11..13 */
 }
 
 TEST(walk_pages_back_until_it_passes_the_point) {
     setup();
+    grappa_at(39);
     char ts[64], line[128];
     iso_ms(row_time(700), ts, sizeof(ts));
     snprintf(line, sizeof(line), "CHATHISTORY AFTER #c timestamp=%s 2", ts);
@@ -258,14 +279,15 @@ TEST(walk_pages_back_until_it_passes_the_point) {
     http_stub_queue(200, page_desc(800, 601));
     http_stub_queue(200, page_asc(701, 702));
     chathistory(line);
-    CHECK(http_stub_request_count() == 3);
-    CHECK_STR(http_stub_request(1), "/networks/testnet/channels/%23c/messages?before=801&limit=200");
-    CHECK_STR(http_stub_request(2), "/networks/testnet/channels/%23c/messages?after=700&limit=200");
+    CHECK(http_stub_request_count() == 4);
+    CHECK_STR(http_stub_request(2), "/networks/testnet/channels/%23c/messages?before=801&limit=200");
+    CHECK_STR(http_stub_request(3), "/networks/testnet/channels/%23c/messages?after=700&limit=200");
     CHECK(sent(701) && sent(702));
 }
 
 TEST(walk_reaching_the_start_of_history) {
     setup();
+    grappa_at(39);
     char ts[64], line[128];
     iso_ms(row_time(1), ts, sizeof(ts));
     /* AFTER a point older than everything stored: all of it. */
@@ -273,21 +295,23 @@ TEST(walk_reaching_the_start_of_history) {
     http_stub_queue(200, page_desc(9, 5));
     http_stub_queue(200, page_asc(5, 9));
     chathistory(line);
-    CHECK_STR(http_stub_request(1), "/networks/testnet/channels/%23c/messages?after=0&limit=200");
+    CHECK_STR(http_stub_request(2), "/networks/testnet/channels/%23c/messages?after=0&limit=200");
     CHECK(sent(5) && sent(9));
 
     /* BEFORE that same point: nothing, answered without a second request. */
     setup();
+    grappa_at(39);
     snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 10", ts);
     http_stub_queue(200, page_desc(9, 5));
     chathistory(line);
-    CHECK(http_stub_request_count() == 1);
+    CHECK(http_stub_request_count() == 2);
     CHECK(count_lines("PRIVMSG") == 0);
     CHECK(count_lines("BATCH +") == 1 && count_lines("BATCH -") == 1);
 }
 
 TEST(walk_stops_at_its_declared_ceiling) {
     setup();
+    grappa_at(39);
     char ts[64], line[128];
     iso_ms(row_time(1), ts, sizeof(ts));
     snprintf(line, sizeof(line), "CHATHISTORY AFTER #c timestamp=%s 1", ts);
@@ -297,11 +321,11 @@ TEST(walk_stops_at_its_declared_ceiling) {
     long oldest = hi + 1;
     http_stub_queue(200, page_asc(oldest, oldest + 5));
     chathistory(line);
-    CHECK(http_stub_request_count() == CHATHISTORY_WALK_MAX_PAGES + 1);
+    CHECK(http_stub_request_count() == CHATHISTORY_WALK_MAX_PAGES + 2);
     char want[128];
     snprintf(want, sizeof(want), "/networks/testnet/channels/%%23c/messages?after=%ld&limit=200",
              oldest - 1);
-    CHECK_STR(http_stub_request(CHATHISTORY_WALK_MAX_PAGES), want);
+    CHECK_STR(http_stub_request(CHATHISTORY_WALK_MAX_PAGES + 1), want);
 }
 
 TEST(grappa_unreachable_during_walk_is_a_fail_not_a_guess) {
@@ -312,6 +336,93 @@ TEST(grappa_unreachable_during_walk_is_a_fail_not_a_guess) {
     chathistory(line); /* nothing queued: every request fails */
     CHECK(strstr(out, "FAIL CHATHISTORY MESSAGE_ERROR AFTER") != NULL);
     CHECK(count_lines("BATCH") == 0);
+}
+
+TEST(old_grappa_is_never_sent_a_time_cursor) {
+    setup();
+    grappa_at(39);
+    char ts[64], line[128];
+    iso_ms(row_time(19), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 10", ts);
+    http_stub_queue(200, page_desc(21, 17));
+    http_stub_queue(200, page_desc(18, 17));
+    chathistory(line);
+    CHECK_STR(http_stub_request(0), CONFIG_PATH);
+    for (size_t i = 0; i < http_stub_request_count(); i++)
+        CHECK(strstr(http_stub_request(i), "_time=") == NULL);
+}
+
+TEST(unreadable_config_falls_back_to_the_walk) {
+    setup();
+    http_stub_queue(404, "<html>not here</html>");
+    char ts[64], line[128];
+    iso_ms(row_time(19), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY AFTER #c timestamp=%s 10", ts);
+    http_stub_queue(200, page_desc(21, 17));
+    http_stub_queue(200, page_asc(20, 21));
+    chathistory(line);
+    CHECK_STR(http_stub_request(1), MSGS "?limit=200");
+    CHECK_STR(http_stub_request(2), MSGS "?after=19&limit=200");
+    CHECK(sent(20) && sent(21));
+}
+
+TEST(new_grappa_resolves_before_with_one_time_cursor_read) {
+    setup();
+    grappa_at(40);
+    char ts[64], line[128], want[128];
+    iso_ms(row_time(20), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 10", ts);
+    http_stub_queue(200, page_desc(19, 19)); /* newest row strictly before T */
+    http_stub_queue(200, page_desc(19, 17));
+    chathistory(line);
+    CHECK(http_stub_request_count() == 3);
+    snprintf(want, sizeof(want), "%s?before_time=%ld&limit=1", MSGS, row_time(20));
+    CHECK_STR(http_stub_request(1), want);
+    CHECK_STR(http_stub_request(2), MSGS "?before=20&limit=200");
+    CHECK(sent(19) && sent(17) && !sent(20));
+}
+
+TEST(new_grappa_resolves_after_inclusive_of_the_instant) {
+    setup();
+    grappa_at(40);
+    char ts[64], line[128], want[128];
+    iso_ms(row_time(19), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY AFTER #c timestamp=%s 10", ts);
+    http_stub_queue(200, page_desc(19, 19)); /* newest row at or before T */
+    http_stub_queue(200, page_asc(20, 21));
+    chathistory(line);
+    snprintf(want, sizeof(want), "%s?before_time=%ld&limit=1", MSGS, row_time(19) + 1);
+    CHECK_STR(http_stub_request(1), want);
+    CHECK_STR(http_stub_request(2), MSGS "?after=19&limit=200");
+    CHECK(sent(20) && sent(21) && !sent(19));
+}
+
+TEST(new_grappa_with_nothing_before_the_instant) {
+    setup();
+    grappa_at(40);
+    char ts[64], line[128];
+    iso_ms(row_time(1), ts, sizeof(ts));
+    snprintf(line, sizeof(line), "CHATHISTORY BEFORE #c timestamp=%s 10", ts);
+    http_stub_queue(200, "[]");
+    chathistory(line);
+    CHECK(http_stub_request_count() == 2);
+    CHECK(count_lines("PRIVMSG") == 0);
+    CHECK(count_lines("BATCH +") == 1 && count_lines("BATCH -") == 1);
+}
+
+TEST(protocol_version_is_read_once_per_connection) {
+    setup();
+    struct grappa_session sess = make_sess(true);
+    grappa_at(40);
+    http_stub_queue(200, page_desc(19, 19));
+    http_stub_queue(200, page_desc(19, 19));
+    long id = 0;
+    CHECK(chathistory_walk_to_time(&hc, &cfg, &sess, "#c", row_time(20), true, &id));
+    CHECK(chathistory_walk_to_time(&hc, &cfg, &sess, "#c", row_time(20), true, &id));
+    CHECK(id == 19);
+    CHECK(http_stub_request_count() == 3);
+    CHECK_STR(http_stub_request(0), CONFIG_PATH);
+    CHECK(strstr(http_stub_request(2), "before_time=") != NULL);
 }
 
 /* ── (c) backlog replay after a JOIN ─────────────────────────────────── */
@@ -358,6 +469,12 @@ int main(void) {
     RUN(walk_reaching_the_start_of_history);
     RUN(walk_stops_at_its_declared_ceiling);
     RUN(grappa_unreachable_during_walk_is_a_fail_not_a_guess);
+    RUN(old_grappa_is_never_sent_a_time_cursor);
+    RUN(unreadable_config_falls_back_to_the_walk);
+    RUN(new_grappa_resolves_before_with_one_time_cursor_read);
+    RUN(new_grappa_resolves_after_inclusive_of_the_instant);
+    RUN(new_grappa_with_nothing_before_the_instant);
+    RUN(protocol_version_is_read_once_per_connection);
     RUN(join_replays_newest_fifty_to_a_client_without_the_cap);
     RUN(join_replays_nothing_to_a_client_with_the_cap);
     http_stub_reset();

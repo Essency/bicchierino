@@ -77,6 +77,10 @@
                                        * backwards from the newest, so 2000
                                        * rows of the target's history —
                                        * `chathistory_walk_to_time`'s doc. */
+#define GRAPPA_PROTOCOL_TIME_CURSORS 40 /* first grappa protocol_version whose
+                                         * scrollback REST takes
+                                         * before_time/after_time/around_time
+                                         * (epoch ms) — `chathistory_walk_to_time`. */
 #define JOIN_REPLAY_LINES 50 /* backlog lines replayed after a JOIN to a client
                               * that did NOT negotiate draft/chathistory —
                               * `replay_on_join`'s own doc. */
@@ -462,6 +466,11 @@ struct grappa_session {
     bool network_resolved;
     char channels[MAX_CHANNELS][128];
     size_t channel_count;
+
+    /* grappa's wire `protocol_version` (`GET /api/config`), read the first
+     * time something needs it — `grappa_protocol_version`'s own doc. 0 =
+     * not read yet, -1 = could not be read. */
+    long grappa_protocol;
 
     /* Copied from `struct registration`'s own cap_* flags once Phase 1
      * completes — CAP negotiation is a Phase-1-only wire exchange, but
@@ -5329,9 +5338,44 @@ static void chathistory_deliver(int fd, const struct grappa_session *sess, const
         render_chathistory_message(fd, sess, batch_ref, target, json_at(root, idx[k]));
 }
 
-/* Resolves a CHATHISTORY `timestamp=` to a grappa `messages.id`, for a
- * grappa whose scrollback REST only takes id cursors: walks
- * `GET .../messages` backwards from the newest row, CHATHISTORY_FETCH_LIMIT
+/* grappa's wire `protocol_version`, from the unauthenticated
+ * `GET /api/config`, read once per connection and only when a feature
+ * needs to know it. -1 when it cannot be read (unreachable, not JSON, no
+ * such field): every caller treats that as "an old grappa" and takes the
+ * path that works on all of them. */
+static long grappa_protocol_version(struct http_client *hc, const struct config *cfg,
+                                    struct grappa_session *sess) {
+    if (sess->grappa_protocol != 0) return sess->grappa_protocol;
+    sess->grappa_protocol = -1;
+    struct http_response resp;
+    if (!http_client_request(hc, cfg->grappa_url, "GET", "/api/config", NULL, NULL, &resp))
+        return -1;
+    if (resp.status == 200) {
+        char err[128];
+        json_doc *doc = json_parse(resp.body, resp.body_len, err, sizeof(err));
+        long v = 0;
+        if (doc && json_long_req(json_root(doc), "protocol_version", &v) && v > 0)
+            sess->grappa_protocol = v;
+        json_free(doc);
+    }
+    http_response_free(&resp);
+    return sess->grappa_protocol;
+}
+
+/* Resolves a CHATHISTORY `timestamp=` to a grappa `messages.id`: the id
+ * of the newest row of `target` whose `server_time` is before `t_ms`
+ * (`strict`) or at/before it (`!strict`).
+ *
+ * A grappa at protocol_version >= GRAPPA_PROTOCOL_TIME_CURSORS answers
+ * that in one read: `before_time=T&limit=1` is the newest row strictly
+ * before T, and `before_time=T+1` the newest at or before it (epoch ms,
+ * and ids advance with server_time, so the newest by time is the
+ * newest by id). The gate is not an optimisation: an older grappa
+ * IGNORES the parameter and silently answers the most recent page, so
+ * sending it unasked would anchor every request at "now".
+ *
+ * An older grappa's scrollback REST only takes id cursors, so the
+ * fallback walks `GET .../messages` backwards from the newest row, CHATHISTORY_FETCH_LIMIT
  * rows a page, until it meets a row of `target` whose `server_time` is
  * before `t_ms` (`strict`) or at/before it (`!strict`), and answers that
  * row's id. Rows of every kind count — this places a point in time, it
@@ -5350,8 +5394,21 @@ static void chathistory_deliver(int fd, const struct grappa_session *sess, const
  * to catch up — it was empty and every timestamp selector answered an
  * empty batch (measured against a live grappa). */
 static bool chathistory_walk_to_time(struct http_client *hc, const struct config *cfg,
-                                     const struct grappa_session *sess, const char *target,
+                                     struct grappa_session *sess, const char *target,
                                      long t_ms, bool strict, long *out_id) {
+    if (grappa_protocol_version(hc, cfg, sess) >= GRAPPA_PROTOCOL_TIME_CURSORS) {
+        json_doc *doc = NULL;
+        const json_value *root = NULL;
+        if (!chathistory_fetch(hc, cfg, sess, target, "before_time", strict ? t_ms : t_ms + 1, 1,
+                               &doc, &root))
+            return false;
+        long id = 0;
+        if (json_len(root) == 0 || !json_long_req(json_at(root, 0), "id", &id)) id = 0;
+        *out_id = id;
+        json_free(doc);
+        return true;
+    }
+
     long cursor = 0; /* 0 = first page, the newest rows */
     for (int page = 0; page < CHATHISTORY_WALK_MAX_PAGES; page++) {
         json_doc *doc = NULL;
@@ -5397,7 +5454,7 @@ enum chathistory_ref { CH_REF_OK, CH_REF_BAD, CH_REF_UNREACHABLE };
 
 static enum chathistory_ref resolve_chathistory_ref(struct http_client *hc,
                                                     const struct config *cfg,
-                                                    const struct grappa_session *sess,
+                                                    struct grappa_session *sess,
                                                     const char *target, const char *token,
                                                     bool strict, long *out_id, bool *is_time) {
     *is_time = false;
