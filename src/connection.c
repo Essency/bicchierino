@@ -4942,7 +4942,10 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
             size_t idx = find_channel_index(sess, channel);
             if (idx != sess->channel_count) {
                 if (br) {
-                    char topic[512];
+                    /* topic = "grappa:user:<subject>/network:<slug>/channel:<chan>"
+                     * subject_name[128] + network_slug[64] + folded_channel[512]
+                     * + fixed text (31) = up to 735 bytes — use 800. */
+                    char topic[800];
                     snprintf(topic, sizeof(topic), "grappa:user:%s/network:%s/channel:%s",
                              sess->subject_name, sess->network_slug, folded_channel);
                     bridge_push(br, topic, sess->channel_join_refs[idx], "phx_leave", "{}");
