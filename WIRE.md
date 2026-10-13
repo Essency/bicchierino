@@ -211,10 +211,17 @@ message (yours or anyone else's, echoed back via the PubSub broadcast
 arrives as a WS event on whichever topic is subscribed (§3), never
 fetched.
 
-The other HTTP exception, unchanged: optional `CHATHISTORY` backfill
-(shottino's `--ircd-archive`) — a REST query issued when a client scrolls
-back past what the live session has already seen. Infrequent and
-user-triggered, not part of the steady-state message path.
+The other HTTP exception: history reads, `GET .../messages` — a
+`CHATHISTORY` request (shottino's `--ircd-archive`), the backlog replayed
+after a JOIN to a client that did not negotiate `draft/chathistory`, and
+for a `timestamp=` reference, either the rows asked by time
+(`?before_time=` / `?after_time=` / `?around_time=`, epoch ms) on a grappa
+at `protocol_version` >= 40, or below it a backwards walk of `?before=<id>`
+pages that places the instant (README "Backlog"). That version comes from
+the unauthenticated `GET /api/config`, read once per connection, the first
+time a timestamp is asked for; the gate is mandatory, because a grappa
+below 40 ignores the `*_time` parameters and answers its newest page. One read per request or JOIN, not part of the steady-state
+message path.
 
 ### Message wire shape — `Grappa.Scrollback.Wire`
 

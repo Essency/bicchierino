@@ -1,0 +1,57 @@
+# Maintainer: Essency <noreply@users.noreply.github.com>
+#
+# Arch package for bicchierino, built from source by makepkg.
+#
+# The source is the git tag, not the release tarball: the Makefile derives
+# the version the binary reports (--version, 002, 004) from `git describe`,
+# and a tarball has no .git, so it would build a binary claiming
+# v0.0.0+unknown. pkgver names the release this recipe builds; the release
+# workflow sets it from the tag it was triggered by, and builds from that
+# tag's own checkout. The sysusers/tmpfiles files ship next to this recipe,
+# not from the tag, so the recipe also builds a release cut before it.
+
+pkgname=bicchierino
+pkgver=0.4.2
+pkgrel=1
+pkgdesc="Stateless IRC-facade bridge to the grappa IRC bouncer"
+arch=('x86_64')
+url="https://github.com/Essency/bicchierino"
+license=('MIT')
+depends=('glibc' 'openssl' 'ca-certificates')
+makedepends=('git')
+backup=('etc/bicchierino/bicchierino.config')
+install="${pkgname}.install"
+source=("${pkgname}::git+${url}.git#tag=v${pkgver}"
+        "${pkgname}.sysusers"
+        "${pkgname}.tmpfiles")
+sha256sums=('SKIP'
+            '2ecebdc9346fbcc3e4877636a079a173601b4e85585b756a6a9a8811a208711d'
+            'b20d1b90f138706e12b87e286c6b4667d55c5a3da6f785e5aa5e47e35c2d3232')
+
+build() {
+	cd "${srcdir}/${pkgname}"
+	make
+}
+
+check() {
+	cd "${srcdir}/${pkgname}"
+	make check
+}
+
+package() {
+	cd "${srcdir}/${pkgname}"
+	make DESTDIR="${pkgdir}" PREFIX=/usr install
+	install -Dm644 packaging/bicchierino.service \
+		"${pkgdir}/usr/lib/systemd/system/bicchierino.service"
+	install -Dm640 packaging/bicchierino.config \
+		"${pkgdir}/etc/bicchierino/bicchierino.config"
+	install -Dm644 "${srcdir}/${pkgname}.sysusers" \
+		"${pkgdir}/usr/lib/sysusers.d/${pkgname}.conf"
+	install -Dm644 "${srcdir}/${pkgname}.tmpfiles" \
+		"${pkgdir}/usr/lib/tmpfiles.d/${pkgname}.conf"
+	install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+	install -Dm644 example.config "${pkgdir}/usr/share/doc/${pkgname}/example.config"
+	install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	install -Dm644 THIRD_PARTY_LICENSES \
+		"${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES"
+}

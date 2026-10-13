@@ -1,0 +1,9 @@
+# The unit's ReadWritePaths= names this directory, and systemd refuses to
+# start a unit whose ReadWritePaths= does not exist — so it is created
+# here even though the shipped config logs to the journal, not a file.
+d /var/log/bicchierino 0750 bicchierino bicchierino -
+
+# The config ships root:root in the package (the group does not exist at
+# build time); hand it to the service's group, as the .deb's postinst does,
+# or the unit — running as bicchierino — cannot read its own config.
+z /etc/bicchierino/bicchierino.config 0640 root bicchierino -
