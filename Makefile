@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message tests/test_chathistory
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message tests/test_self_kick tests/test_chathistory
 
 .PHONY: all clean install version check debug
 
@@ -260,6 +260,14 @@ tests/test_query_window_cmds: tests/test_query_window_cmds.c tests/test.h tests/
 # is set, and suppressed when it is not.  Same deps as test_sibling_dm.
 tests/test_echo_message: tests/test_echo_message.c tests/test.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_echo_message.c src/bridge.c src/http.c src/ws_client.c src/ws.c src/json.c src/jsonw.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_message_event (static).
+# Pins the self-kick channel-tracking fix (#150): a kick event whose target is
+# our own nick must remove the channel from sess->channels[] and push phx_leave,
+# so a subsequent JOIN is not silently dropped. ws_stub captures bridge_push
+# frames for inspection (same pattern as test_sibling_join, test_banlist).
+tests/test_self_kick: tests/test_self_kick.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_self_kick.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 # Compiles connection.c in to reach handle_chathistory and replay_on_join
 # (both static). http_stub.c replaces http.c at link time — the way ws_stub.c
