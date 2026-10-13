@@ -204,7 +204,8 @@ TEST(members_seeded_without_pending_renders_normally) {
 
 /* 4) Case-insensitive pending-mark matching: a client that sends NAMES
  *    with the channel in a different case from what grappa echoes back
- *    must still suppress members_seeded. */
+ *    (IRC channel names are case-insensitive) must still suppress
+ *    members_seeded. */
 TEST(members_seeded_suppressed_case_insensitive) {
     ws_stub_reset();
     struct grappa_session sess = make_sess("mynick");
@@ -236,4 +237,12 @@ TEST(members_seeded_suppressed_case_insensitive) {
     CHECK(strstr(out, " 366 ") == NULL);
 
     bridge_close(&br);
+}
+
+int main(void) {
+    RUN(members_seeded_suppressed_when_names_pending);
+    RUN(names_reply_renders_once_and_clears_pending);
+    RUN(members_seeded_without_pending_renders_normally);
+    RUN(members_seeded_suppressed_case_insensitive);
+    return test_report();
 }
