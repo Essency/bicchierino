@@ -680,6 +680,27 @@ struct grappa_session {
      * Initialised explicitly to true in connection_run — `{0}` zero-fills
      * the struct which would silently default this to false. */
     bool visible;
+
+    /* Channels with a pending explicit /NAMES request (#147).
+     *
+     * grappa emits two events when a client-requested NAMES lands:
+     * `members_seeded` always fires (its normal JOIN-time-seed path) AND
+     * `names_reply` fires for the explicit request.  Both previously called
+     * `render_names_353_366`, so the client received two identical 353/366
+     * pairs a few milliseconds apart.
+     *
+     * Fix: `handle_names` records the channel here when the push goes out.
+     * `handle_grappa_members_seeded_event` checks — if the channel is
+     * listed it skips rendering and returns immediately, because
+     * `handle_grappa_names_reply_event` will answer instead.
+     * `handle_grappa_names_reply_event` renders normally and then removes
+     * the channel from this list.
+     *
+     * JOIN-time seeds (no entry here) still render via `members_seeded`
+     * exactly as before — the only path that changes is an explicit request
+     * where both events arrive together. */
+    char pending_names_channels[PENDING_SELF_CH_CAP][PENDING_SELF_CH_SZ];
+    size_t pending_names_count;
 };
 
 /* Current wall-clock time as unix milliseconds — the fallback
@@ -2604,8 +2625,22 @@ static void handle_names(struct bridge *br, bool br_connected, struct grappa_ses
         char payload[700];
         snprintf(payload, sizeof(payload), "{\"network_id\":%ld,\"channel\":\"%s\"}",
                  sess->network_id, esc_channel);
-        if (!push_on_user_topic(br, sess, "names", payload))
+        if (!push_on_user_topic(br, sess, "names", payload)) {
             fprintf(stderr, "bicchierino: NAMES %s: push failed\n", channel);
+            continue;
+        }
+        /* Mark channel as names-pending (#147): members_seeded will skip
+         * rendering so names_reply can answer the client exactly once. */
+        bool already = false;
+        for (size_t k = 0; k < sess->pending_names_count; k++) {
+            if (strcasecmp(sess->pending_names_channels[k], channel) == 0) {
+                already = true;
+                break;
+            }
+        }
+        if (!already && sess->pending_names_count < PENDING_SELF_CH_CAP)
+            snprintf(sess->pending_names_channels[sess->pending_names_count++],
+                     sizeof(sess->pending_names_channels[0]), "%s", channel);
     }
 }
 
@@ -5923,11 +5958,18 @@ static void render_names_353_366(int fd, const char *nick, const char *channel,
 }
 
 static void handle_grappa_members_seeded_event(int fd, const char *nick,
+                                                struct grappa_session *sess,
                                                 const json_value *payload) {
     const char *channel = NULL;
     if (!json_str_req(payload, "channel", &channel)) return;
     const json_value *members = json_get(payload, "members");
     if (!members || json_type_of(members) != JSON_ARRAY) return;
+    /* #147: if an explicit /NAMES request is pending for this channel,
+     * names_reply will render the 353/366 pair — skip it here to avoid
+     * sending the client two identical replies. */
+    for (size_t k = 0; k < sess->pending_names_count; k++) {
+        if (strcasecmp(sess->pending_names_channels[k], channel) == 0) return;
+    }
     render_names_353_366(fd, nick, channel, members);
 }
 
@@ -6332,12 +6374,27 @@ static void handle_grappa_query_windows_list_event(int fd, const char *nick,
  * it renders through the identical 353/366 pair via
  * `render_names_353_366`. */
 static void handle_grappa_names_reply_event(int fd, const char *nick,
+                                             struct grappa_session *sess,
                                              const json_value *payload) {
     const char *channel = NULL;
     if (!json_str_req(payload, "channel", &channel)) return;
     const json_value *members = json_get(payload, "members");
     if (!members || json_type_of(members) != JSON_ARRAY) return;
     render_names_353_366(fd, nick, channel, members);
+    /* #147: clear the pending-names mark so members_seeded resumes
+     * rendering for any subsequent non-requested seeds on this channel. */
+    for (size_t k = 0; k < sess->pending_names_count; k++) {
+        if (strcasecmp(sess->pending_names_channels[k], channel) == 0) {
+            /* Compact: shift the tail left by one. */
+            size_t tail = sess->pending_names_count - 1 - k;
+            if (tail > 0)
+                memmove(sess->pending_names_channels[k],
+                        sess->pending_names_channels[k + 1],
+                        tail * sizeof(sess->pending_names_channels[0]));
+            sess->pending_names_count--;
+            break;
+        }
+    }
 }
 
 /* WIRE.md §3/§6: `who_reply` payload is `{kind, network, target, users:
@@ -7124,13 +7181,13 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
     } else if (strcmp(kind, "channel_modes_changed") == 0) {
         handle_grappa_channel_modes_changed_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "members_seeded") == 0) {
-        handle_grappa_members_seeded_event(fd, nick, inner);
+        handle_grappa_members_seeded_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "isupport_changed") == 0) {
         handle_grappa_isupport_changed_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "join_failed") == 0) {
         handle_grappa_join_failed_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "names_reply") == 0) {
-        handle_grappa_names_reply_event(fd, nick, inner);
+        handle_grappa_names_reply_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "who_reply") == 0) {
         handle_grappa_who_reply_event(fd, nick, inner);
     } else if (strcmp(kind, "whois_bundle") == 0) {
