@@ -1,0 +1,4 @@
+# The dedicated system user the unit runs as. No home directory: the
+# bridge keeps no state on disk (see README "Design"), so there is
+# nothing for one to hold. Same user the .deb's postinst creates.
+u bicchierino - "bicchierino IRC-facade bridge" - /usr/bin/nologin
