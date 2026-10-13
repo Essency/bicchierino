@@ -50,14 +50,17 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message tests/test_names
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message tests/test_names tests/test_chathistory
 
 .PHONY: all clean install version check debug
 
 all: $(BIN)
 
+# $(LDFLAGS) is the caller's, on the two link lines: distribution build
+# tools pass their linker hardening there (Arch's makepkg: -z relro -z now),
+# and a link line that drops it ships a binary without full RELRO.
 $(BIN): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
@@ -72,7 +75,7 @@ DEBUG_OBJS := $(OBJS:.o=.debug.o)
 debug: bicchierino-debug
 
 bicchierino-debug: $(DEBUG_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(DEBUG_OBJS) $(LDLIBS)
 
 %.debug.o: %.c
 	$(CC) $(CPPFLAGS) -DBICCHIERINO_LOG_TRAFFIC $(CFLAGS) -c -o $@ $<
@@ -267,6 +270,15 @@ tests/test_echo_message: tests/test_echo_message.c tests/test.h src/connection.c
 # test_banlist, test_sibling_join).
 tests/test_names: tests/test_names.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_names.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_chathistory and replay_on_join
+# (both static). http_stub.c replaces http.c at link time — the way ws_stub.c
+# replaces ws_client.c — so the suite queues the REST pages grappa would
+# answer and asserts both the lines sent to the client and the paths asked
+# of grappa: `limit` counted on sent lines, timestamp selectors resolved by
+# walking the REST backwards, the JOIN backlog replay.
+tests/test_chathistory: tests/test_chathistory.c tests/test.h tests/http_stub.c tests/http_stub.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_chathistory.c tests/http_stub.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)

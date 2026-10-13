@@ -5,10 +5,20 @@ on:
     tags: ['v*.*.*']
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  # One .deb per architecture, each built natively — the arm64 one on
+  # GitHub's arm64 runner, not cross-compiled, so the binary inside is the
+  # one that runner's own toolchain and libssl produced, same as amd64.
+  deb:
+    name: build .deb (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,25 +52,105 @@ jobs:
       # version syntax doesn't use the "v" prefix git tags do; strip it
       # here, not in the Makefile (which has its own reasons to keep
       # the "v" — it matches the tag name directly).
-      - name: Compute package versions
-        id: pkgver
+      - name: Build .deb
         run: |
           DEB_VERSION="$(make version | sed 's/^v//')"
-          SOURCE_VERSION="${GITHUB_REF_NAME#v}"
-          echo "deb_version=$DEB_VERSION" >> "$GITHUB_OUTPUT"
-          echo "source_version=$SOURCE_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Build .deb
-        run: ./packaging/build-deb.sh "${{ steps.pkgver.outputs.deb_version }}"
-
-      - name: Package
-        run: |
+          ./packaging/build-deb.sh "$DEB_VERSION" "${{ matrix.arch }}"
           mkdir -p dist
-          mv "bicchierino_${{ steps.pkgver.outputs.deb_version }}_amd64.deb" dist/
+          mv bicchierino_*_${{ matrix.arch }}.deb dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # The Arch package, built by makepkg from packaging/arch/PKGBUILD the
+  # same way a user's `makepkg -si` builds it — except that pkgver and the
+  # source are pointed at THIS tag's checkout, so the asset is the tree
+  # this workflow was triggered by, not whatever the committed pkgver names.
+  # x86_64 only: Arch Linux proper has no other architecture.
+  arch:
+    name: build Arch package (x86_64)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install the Arch build toolchain
+        run: pacman -Syu --noconfirm --needed base-devel git namcap
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # makepkg refuses to run as root, and the container runs as root.
+      - name: Create an unprivileged build user
+        run: |
+          useradd -m builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      # pkgver may not contain a hyphen (makepkg rejects it), so a
+      # pre-release tag's suffix is joined on: v1.2.3-rc1 -> 1.2.3rc1,
+      # which pacman's vercmp orders BEFORE 1.2.3, as a pre-release should.
+      - name: Point the recipe at this tag, then makepkg (check() runs the unit suites)
+        working-directory: packaging/arch
+        run: |
+          pkgver="$(echo "${GITHUB_REF_NAME#v}" | tr -d -- -)"
+          sed -i \
+            -e "s/^pkgver=.*/pkgver=${pkgver}/" \
+            -e "s|git+\${url}.git#tag=v\${pkgver}|git+file://${GITHUB_WORKSPACE}#tag=${GITHUB_REF_NAME}|" \
+            PKGBUILD
+          grep -E '^(pkgver|source)=' PKGBUILD
+          sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -u builder makepkg -sf --noconfirm
+
+      - name: namcap (advisory)
+        working-directory: packaging/arch
+        run: sudo -u builder namcap PKGBUILD bicchierino-[0-9]*.pkg.tar.zst || true
+
+      - name: Install it and check the binary reports this tag
+        working-directory: packaging/arch
+        run: |
+          pacman -U --noconfirm bicchierino-[0-9]*.pkg.tar.zst
+          v=$(bicchierino --version)
+          echo "$v"
+          echo "$v" | grep -q "bicchierino ${GITHUB_REF_NAME}+" || \
+            (echo "packaged binary does not report ${GITHUB_REF_NAME}" && exit 1)
+          getent passwd bicchierino
+          test -d /var/log/bicchierino
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-x86_64
+          path: packaging/arch/bicchierino-[0-9]*.pkg.tar.zst
+          if-no-files-found: error
+
+  # Publishes only when every package built: a release is public the
+  # moment it exists, and one missing an architecture would read as
+  # "not supported" rather than "the build broke".
+  release:
+    needs: [deb, arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Source tarball
+        run: |
+          SOURCE_VERSION="${GITHUB_REF_NAME#v}"
           git archive --format=tar.gz \
-            --prefix="bicchierino-${{ steps.pkgver.outputs.source_version }}/" \
-            -o "dist/bicchierino-${{ steps.pkgver.outputs.source_version }}-source.tar.gz" \
+            --prefix="bicchierino-${SOURCE_VERSION}/" \
+            -o "dist/bicchierino-${SOURCE_VERSION}-source.tar.gz" \
             "${{ github.ref_name }}"
+          ls -l dist
 
       # Pinned static binary, same reasoning as semver.yml: one less
       # third party in the trust chain for something this simple.
@@ -80,12 +170,14 @@ jobs:
       - name: Generate release notes from Conventional Commits
         run: git-cliff --current --strip header -o RELEASE_NOTES.md
 
+      # A tag with a hyphen (v1.2.3-rc1) is a semver pre-release, and is
+      # published as one.
       - name: Create GitHub release
         run: |
-          gh release create "${{ github.ref_name }}" \
-            dist/bicchierino_${{ steps.pkgver.outputs.deb_version }}_amd64.deb \
-            dist/bicchierino-${{ steps.pkgver.outputs.source_version }}-source.tar.gz \
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "${{ github.ref_name }}" dist/* \
             --title "${{ github.ref_name }}" \
-            --notes-file RELEASE_NOTES.md
+            --notes-file RELEASE_NOTES.md $prerelease
         env:
           GH_TOKEN: ${{ github.token }}

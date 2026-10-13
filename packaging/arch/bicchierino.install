@@ -1,0 +1,18 @@
+# pacman scriptlet. The user and the log directory come from sysusers.d /
+# tmpfiles.d, applied by pacman's own systemd hooks; what is left here is
+# the message, plus the same "do not auto-start" posture as the .deb: the
+# shipped config's grappa-url is a placeholder that can never connect, so
+# enabling the unit at install would only buy a restart loop.
+
+post_install() {
+	cat <<'MSG'
+bicchierino installed but not started: /etc/bicchierino/bicchierino.config
+still has a placeholder grappa-url. Edit it, then:
+  sudo systemctl enable --now bicchierino
+MSG
+}
+
+post_upgrade() {
+	echo "bicchierino upgraded. Restart a running service to pick up the new binary:"
+	echo "  sudo systemctl try-restart bicchierino"
+}
