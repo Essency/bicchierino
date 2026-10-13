@@ -4996,6 +4996,29 @@ static void handle_grappa_message_event(int fd, struct bridge *br, struct grappa
                               target, reason);
         else
             send_tagged_line(fd, sess, server_time_ms, ":%s KICK %s %s", prefix, channel, target);
+        /* Self-kick: remove the channel from sess->channels[] and leave its
+         * WS topic so a later JOIN is not silently dropped — issue #150.
+         * `folded_own_nick` and `folded_channel` are already in scope above.
+         * Same remove+phx_leave pattern as handle_part; no pending_self_part
+         * tracking needed because the kick was not client-initiated (there is
+         * no optimistic PART echo to suppress here). */
+        char folded_target[64];
+        ascii_fold_lower(target, folded_target, sizeof(folded_target));
+        if (folded_own_nick[0] && strcmp(folded_target, folded_own_nick) == 0) {
+            size_t idx = find_channel_index(sess, channel);
+            if (idx != sess->channel_count) {
+                if (br) {
+                    /* topic = "grappa:user:<subject>/network:<slug>/channel:<chan>"
+                     * subject_name[128] + network_slug[64] + folded_channel[512]
+                     * + fixed text (31) = up to 735 bytes — use 800. */
+                    char topic[800];
+                    snprintf(topic, sizeof(topic), "grappa:user:%s/network:%s/channel:%s",
+                             sess->subject_name, sess->network_slug, folded_channel);
+                    bridge_push(br, topic, sess->channel_join_refs[idx], "phx_leave", "{}");
+                }
+                remove_channel_at(sess, idx);
+            }
+        }
         return;
     }
 
