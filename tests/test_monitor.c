@@ -15,8 +15,9 @@
  * Test structure: compile connection.c in directly (same approach as
  * test_isupport, test_sibling_join, test_banlist — all reach static
  * functions that way).  A socketpair captures IRC output; http_stub.c
- * provides a minimal http_client_request stub that can be scripted to
- * return a given status and body for each MONITOR REST call.
+ * provides a minimal http_client_request stub (used by MONITOR +/-/C REST
+ * calls); ws_stub.c replaces ws_client.c at link time (bridge functions
+ * used by connection.c, not exercised in these tests but needed for linking).
  */
 #include "test.h"
 #include "http_stub.h"
@@ -50,6 +51,18 @@ static void drain(int tx, char *out, size_t cap) {
     out[total] = '\0';
     close(rx);
     rx = -1;
+}
+
+/* Build an irc_message with up to two params.  irc_message uses fixed char
+ * arrays (char command[32], char params[15][512]) — same approach as
+ * test_markread.c's make_msg; assignment with '=' is not valid for arrays. */
+static struct irc_message make_msg(const char *cmd, const char *p0, const char *p1) {
+    struct irc_message msg;
+    memset(&msg, 0, sizeof(msg));
+    snprintf(msg.command, sizeof(msg.command), "%s", cmd);
+    if (p0) { snprintf(msg.params[0], sizeof(msg.params[0]), "%s", p0); msg.param_count = 1; }
+    if (p1) { snprintf(msg.params[1], sizeof(msg.params[1]), "%s", p1); msg.param_count = 2; }
+    return msg;
 }
 
 /* Minimal session with network_id=1, nick="mynick". */
@@ -92,13 +105,7 @@ TEST(ison_returns_online_nick) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "ISON";
-    const char *params[] = {"TrackMe"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    struct irc_message msg = make_msg("ISON", "TrackMe", NULL);
     handle_ison(tx, "mynick", &sess, &msg);
 
     char out[512];
@@ -120,13 +127,7 @@ TEST(ison_omits_offline_nick) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "ISON";
-    const char *params[] = {"Offline"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    struct irc_message msg = make_msg("ISON", "Offline", NULL);
     handle_ison(tx, "mynick", &sess, &msg);
 
     char out[512];
@@ -137,7 +138,8 @@ TEST(ison_omits_offline_nick) {
     CHECK(strstr(out, "Offline") == NULL);
 }
 
-/* ISON with multiple nicks — only online ones appear in 303. */
+/* ISON with multiple space-separated nicks in a trailing param — only online
+ * ones appear in 303.  WeeChat uses this form: `ISON :nick1 nick2 nick3`. */
 TEST(ison_mixed_online_offline) {
     struct grappa_session sess = make_sess();
 
@@ -152,13 +154,9 @@ TEST(ison_mixed_online_offline) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "ISON";
-    const char *params[] = {":Online1 Offline1 Online2"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    /* Trailing-param form (colon stripped by irc_parse_line before we get here,
+     * but the space-separated content is still a single param). */
+    struct irc_message msg = make_msg("ISON", "Online1 Offline1 Online2", NULL);
     handle_ison(tx, "mynick", &sess, &msg);
 
     char out[512];
@@ -180,19 +178,13 @@ TEST(ison_case_insensitive) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "ISON";
-    const char *params[] = {"trackme"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    struct irc_message msg = make_msg("ISON", "trackme", NULL);
     handle_ison(tx, "mynick", &sess, &msg);
 
     char out[512];
     drain(tx, out, sizeof(out));
 
-    /* 303 returned with the DISPLAY form (not the folded form) */
+    /* 303 returned with the DISPLAY form (TrackMe, not the folded form) */
     CHECK(strstr(out, "303") != NULL);
     CHECK(strstr(out, "TrackMe") != NULL);
 }
@@ -469,13 +461,7 @@ TEST(monitor_s_sends_status) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "MONITOR";
-    const char *params[] = {"S"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    struct irc_message msg = make_msg("MONITOR", "S", NULL);
     handle_monitor(tx, &hc, &cfg, "mynick", &sess, &msg);
 
     char out[512];
@@ -506,13 +492,7 @@ TEST(monitor_l_sends_list) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "MONITOR";
-    const char *params[] = {"L"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    struct irc_message msg = make_msg("MONITOR", "L", NULL);
     handle_monitor(tx, &hc, &cfg, "mynick", &sess, &msg);
 
     char out[512];
@@ -538,13 +518,7 @@ TEST(monitor_l_empty_sends_only_733) {
     int tx = open_client();
     if (tx < 0) return;
 
-    struct irc_message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.command = "MONITOR";
-    const char *params[] = {"L"};
-    msg.params = params;
-    msg.param_count = 1;
-
+    struct irc_message msg = make_msg("MONITOR", "L", NULL);
     handle_monitor(tx, &hc, &cfg, "mynick", &sess, &msg);
 
     char out[256];
