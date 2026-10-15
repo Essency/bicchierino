@@ -2743,7 +2743,10 @@ static void handle_monitor(int fd, struct http_client *hc, const struct config *
                      * segments and bahamut nicks never contain `[`/`]` in
                      * practice (confirmed: bahamut rejects them).  Send
                      * verbatim — if grappa returns 404 we just log and move on. */
-                    char path[256];
+                    /* path must hold "/networks/<long>/notify/<nick>"; tok
+                     * comes from a tmp[IRC_LINE_MAX] buffer so reserve
+                     * IRC_LINE_MAX bytes for it plus the fixed prefix. */
+                    char path[IRC_LINE_MAX + 64];
                     snprintf(path, sizeof(path), "/networks/%ld/notify/%s",
                              sess->network_id, tok);
                     struct http_response resp = {0};
