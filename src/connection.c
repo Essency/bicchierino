@@ -2527,6 +2527,15 @@ static void handle_oper(struct bridge *br, bool br_connected, struct grappa_sess
         fprintf(stderr, "bicchierino: OPER %s: push failed\n", name);
 }
 
+/* Forward declarations: find_monitor_idx and send_monitor_numeric are
+ * defined later in the file (near the grappa event handlers that also use
+ * them) but called from handle_ison / handle_monitor which are placed
+ * earlier (near the other irc-line handlers).  Declare them here so the
+ * compiler sees the signatures before the calls. */
+static size_t find_monitor_idx(const struct grappa_session *sess, const char *nick);
+static void   send_monitor_numeric(int fd, const char *own_nick,
+                                   const struct grappa_session *sess, size_t idx);
+
 /* ISON command (#157): answer from grappa's presence map instead of
  * forwarding upstream.  The upstream would give a real answer via a 303
  * reply, but grappa's EventRouter drops 303s that arrive without an
