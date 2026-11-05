@@ -7076,6 +7076,79 @@ static void handle_markread(int fd, struct http_client *hc, const struct config 
  * doing anything (same discipline as `handle_grappa_isupport_changed_event`
  * and `handle_grappa_umode_changed_event`, except those filter by
  * numeric `network_id`; `joined` carries the string slug `network`). */
+
+/* WIRE.md §6 / issue #155: `own_nick_changed` push, payload
+ * `{"kind": "own_nick_changed", "network_id": <id>, "nick": "<new>"}`.
+ *
+ * grappa broadcasts this on the user topic whenever the upstream session's
+ * own nick changes (reconnect with a different nick, 433-fallback, reclaim
+ * completing, deliberate /nick).  On multi-network accounts the user topic
+ * delivers one event per network — filtered by `network_id` before acting.
+ *
+ * In the common case (user is in channels) a per-channel `nick_change`
+ * message arrives first (grappa's `apply_effects` runs before
+ * `on_own_nick_change/2`, so channel events are on the wire first) and
+ * `handle_grappa_message_event` has already sent the NICK line and updated
+ * `sess->network_nick`.  The guard `new_nick == sess->network_nick` turns
+ * this into a no-op for that arrival order.
+ *
+ * In the reconnect case — the bug this fixes — the upstream session drops
+ * and comes back on a different nick while the client has no channels
+ * (they were all dropped during disconnect).  No `nick_change` messages
+ * exist, so `own_nick_changed` is the only signal.  Without a handler it
+ * fell through to "not yet handled" and the client's nick stayed stale. */
+static void handle_grappa_own_nick_changed_event(int fd, struct bridge *br,
+                                                  struct grappa_session *sess,
+                                                  const json_value *payload) {
+    /* Drop events for networks other than ours (same defensive filter as
+     * `handle_grappa_isupport_changed_event`; events that carry no
+     * network_id field pass through unchanged for forward-compat). */
+    long event_network_id = 0;
+    bool has_network_id   = false;
+    json_long_opt(payload, "network_id", &event_network_id, &has_network_id);
+    if (has_network_id && event_network_id != sess->network_id) return;
+
+    const char *new_nick = json_string(json_get(payload, "nick"));
+    if (!new_nick || !new_nick[0]) return;
+
+    /* No-op when `sess->network_nick` already matches — a channel-level
+     * `nick_change` message arrived first and already sent the NICK line
+     * and updated the nick.  This guard is what makes the second-to-arrive
+     * signal a no-op for the common case. */
+    if (strcmp(sess->network_nick, new_nick) == 0) return;
+
+    /* Send NICK to the client.  The prefix uses `bicchierino@bicchierino`
+     * as the user@host placeholder — the real user@host is not on the
+     * `own_nick_changed` wire (the same placeholder JOIN/PART/sibling-DM
+     * paths use).  `server_time_ms = 0` → `send_tagged_line` falls back
+     * to `now_unix_ms()`, the best approximation available without a wire
+     * timestamp. */
+    char old_nick[64];
+    snprintf(old_nick, sizeof(old_nick), "%s", sess->network_nick);
+    send_tagged_line(fd, sess, 0,
+                     ":%s!bicchierino@bicchierino NICK :%s", old_nick, new_nick);
+
+    /* Leave the DM-listener topic that was keyed by the old folded nick
+     * (WIRE.md §5) — same cleanup the `nick_change` self-path performs.
+     * The matching re-join under the new nick is deferred to the Phase 2
+     * main loop via `dm_needs_rejoin` (see `nick_change`'s is_self path
+     * and `struct grappa_session`'s own doc for why a nested bridge_join
+     * here is unsafe). */
+    if (br && sess->dm_joined) {
+        char folded_old[64];
+        ascii_fold_lower(old_nick, folded_old, sizeof(folded_old));
+        char old_dm_topic[512];
+        snprintf(old_dm_topic, sizeof(old_dm_topic),
+                 "grappa:user:%s/network:%s/channel:%s",
+                 sess->subject_name, sess->network_slug, folded_old);
+        bridge_push(br, old_dm_topic, sess->dm_join_ref, "phx_leave", "{}");
+        sess->dm_joined      = false;
+        sess->dm_needs_rejoin = true;
+    }
+
+    snprintf(sess->network_nick, sizeof(sess->network_nick), "%s", new_nick);
+}
+
 static void handle_grappa_joined_event(int fd, const char *nick, struct bridge *br,
                                         struct grappa_session *sess, struct http_client *hc,
                                         const struct config *cfg, const json_value *payload) {
@@ -7212,6 +7285,8 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
         handle_grappa_read_cursor_set_event(fd, hc, cfg, sess, inner, topic_str);
     } else if (strcmp(kind, "joined") == 0) {
         handle_grappa_joined_event(fd, nick, br, sess, hc, cfg, inner);
+    } else if (strcmp(kind, "own_nick_changed") == 0) {
+        handle_grappa_own_nick_changed_event(fd, br, sess, inner);
     } else if (strcmp(kind, "window_pending") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
