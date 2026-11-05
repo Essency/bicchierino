@@ -50,7 +50,7 @@ OBJS := src/main.o src/config.o src/connection.o src/http.o src/bridge.o src/ws_
 # debugger or a sanitizer.
 TEST_CFLAGS := $(CFLAGS) -g
 
-TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message tests/test_names tests/test_self_kick tests/test_chathistory
+TESTS := tests/test_json tests/test_ws tests/test_jsonw tests/test_config tests/test_http tests/test_ws_client tests/test_bridge tests/test_render tests/test_server_window tests/test_registry tests/test_grappa_admin tests/test_grappa_visible tests/test_who tests/test_whois tests/test_isupport tests/test_isupport_bootstrap tests/test_server_topic_bootstrap tests/test_channel_prefix tests/test_banlist tests/test_parse tests/test_sibling_dm tests/test_sibling_join tests/test_query_windows tests/test_query_window_cmds tests/test_markread tests/test_echo_message tests/test_names tests/test_self_kick tests/test_chathistory tests/test_own_nick_changed
 
 .PHONY: all clean install version check debug
 
@@ -287,6 +287,15 @@ tests/test_self_kick: tests/test_self_kick.c tests/test.h tests/ws_stub.c tests/
 # walking the REST backwards, the JOIN backlog replay.
 tests/test_chathistory: tests/test_chathistory.c tests/test.h tests/http_stub.c tests/http_stub.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
 	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_chathistory.c tests/http_stub.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c -lssl -lcrypto -lpthread
+
+# Compiles connection.c in to reach handle_grappa_event /
+# handle_grappa_own_nick_changed_event (both static).  Pins the #155 fix:
+# an `own_nick_changed` event with a nick differing from sess->network_nick
+# must send NICK + update the session; same nick as current → no-op; wrong
+# network_id → filtered; dm_joined → phx_leave on the old DM topic.
+# ws_stub replaces ws_client.c at link time (same pattern as test_sibling_join).
+tests/test_own_nick_changed: tests/test_own_nick_changed.c tests/test.h tests/ws_stub.c tests/ws_stub.h src/connection.c src/registry.c
+	$(CC) $(CPPFLAGS) $(TEST_CFLAGS) -o $@ tests/test_own_nick_changed.c tests/ws_stub.c src/bridge.c src/json.c src/jsonw.c src/ws.c src/config.c src/registry.c src/http.c -lssl -lcrypto -lpthread
 
 clean:
 	rm -f $(BIN) bicchierino-debug src/*.o src/*.debug.o $(TESTS)
