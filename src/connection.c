@@ -32,6 +32,11 @@
 #define MAX_DM_PEERS 64  /* one per person ever DMed on this network — same
                            * "hostile-response backstop, not a real ceiling"
                            * posture as MAX_CHANNELS */
+#define MONITOR_MAX 64   /* must match grappa's Grappa.Notify.max_entries/0
+                           * (`@max_entries 64`), which is the upstream cap
+                           * grappa enforces when adding nicks via the REST
+                           * notify controller.  Advertised in 005 as
+                           * `MONITOR=64`. */
 /* Capacity and per-entry size for `pending_self_join_channels` /
  * `pending_self_part_channels` on `struct grappa_session`. Sized the same
  * way as `pending_self_msg_ids` (16): a comma-separated JOIN/PART can name
@@ -701,6 +706,22 @@ struct grappa_session {
      * where both events arrive together. */
     char pending_names_channels[PENDING_SELF_CH_CAP][PENDING_SELF_CH_SZ];
     size_t pending_names_count;
+
+    /* MONITOR/ISON presence state: local copy of grappa's notify list + live
+     * presence map, seeded from `notify_list` and `presence_snapshot` events,
+     * updated by `presence_changed`.  Served back to clients as 730/731
+     * (MONITOR) and 303 (ISON) instead of forwarding upstream (issue #157).
+     * Array is capped at MONITOR_MAX which matches grappa's own max_entries
+     * (Grappa.Notify module, `@max_entries 64`).
+     *
+     * `monitor_nicks[]` stores the nick in display form as grappa supplied
+     * it; `monitor_online[]` is true when grappa's last presence report said
+     * the nick is online, false for offline or no report yet.  The two arrays
+     * are always indexed in parallel; valid entries occupy indices 0 …
+     * monitor_count-1. */
+    char monitor_nicks[MONITOR_MAX][64];
+    bool monitor_online[MONITOR_MAX];
+    size_t monitor_count;
 };
 
 /* Current wall-clock time as unix milliseconds — the fallback
@@ -1349,14 +1370,17 @@ static void send_welcome(int fd, const char *nick, struct grappa_session *sess) 
          * reaches the client after the correct prefix set is already in place. */
         send_line(fd,
                   ":%s 005 %s CHANTYPES=# PREFIX=(%s)%s CHANMODES=%s CASEMAPPING=ascii "
-                  "STATUSMSG=%s CHATHISTORY=%d :are supported by this server",
+                  "STATUSMSG=%s CHATHISTORY=%d MONITOR=%d :are supported by this server",
                   IRCD_SERVER, nick,
                   sess->cached_prefix_letters, sess->cached_prefix_sigils,
-                  sess->cached_chanmodes, sess->cached_prefix_sigils, CHATHISTORY_MAX_LIMIT);
+                  sess->cached_chanmodes, sess->cached_prefix_sigils,
+                  CHATHISTORY_MAX_LIMIT, MONITOR_MAX);
         sess->isupport_005_sent = true;
     } else {
-        send_line(fd, ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii CHATHISTORY=%d :are supported by this server",
-                  IRCD_SERVER, nick, CHATHISTORY_MAX_LIMIT);
+        send_line(fd,
+                  ":%s 005 %s CHANTYPES=# CASEMAPPING=ascii CHATHISTORY=%d MONITOR=%d "
+                  ":are supported by this server",
+                  IRCD_SERVER, nick, CHATHISTORY_MAX_LIMIT, MONITOR_MAX);
     }
     send_line(fd, ":%s 375 %s :- %s message of the day -", IRCD_SERVER, nick, IRCD_SERVER);
     send_line(fd, ":%s 372 %s :- bicchierino is bridging this connection to grappa.", IRCD_SERVER,
@@ -1516,6 +1540,14 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
                                  struct grappa_session *sess, struct http_client *hc,
                                  const struct config *cfg, const char *payload,
                                  size_t payload_len);
+/* MONITOR/ISON client command handlers (issue #157) — defined after the
+ * grappa event handlers they share state with; forward-declared here so
+ * handle_irc_line can call them before the full definitions appear. */
+static void handle_ison(int fd, const char *own_nick, const struct grappa_session *sess,
+                         const struct irc_message *msg);
+static void handle_monitor(int fd, struct http_client *hc, const struct config *cfg,
+                            const char *own_nick, struct grappa_session *sess,
+                            const struct irc_message *msg);
 
 struct bridge_event_ctx {
     int fd;
@@ -4474,6 +4506,24 @@ static bool handle_irc_line(int fd, struct http_client *hc, struct bridge *br, b
         handle_markread(fd, hc, cfg, sess, msg);
         return false;
     }
+    /* ISON: answered from local presence state (issue #157).  grappa's
+     * EventRouter drops 303 replies that arrive outside a sweep, so
+     * forwarding via handle_raw leaves the client with silence.  The local
+     * state is kept in sync by `presence_changed` and `presence_snapshot`
+     * events, so answering here is equivalent to asking grappa for the same
+     * information — just without the round-trip and without the dropped reply. */
+    if (strcmp(msg->command, "ISON") == 0) {
+        handle_ison(fd, sess->network_nick, sess, msg);
+        return false;
+    }
+    /* MONITOR: intercepted and served locally (issue #157).  Mutations
+     * (+/-/C) go via grappa's REST notify API, which arms/disarms
+     * MONITOR/WATCH upstream and broadcasts `notify_list` / `presence_changed`
+     * events back so the local state stays in sync. */
+    if (strcmp(msg->command, "MONITOR") == 0) {
+        handle_monitor(fd, hc, cfg, sess->network_nick, sess, msg);
+        return false;
+    }
 
     /* Catch-all: anything else — a bare `/quote` line, services
      * commands, ... — goes out via grappa's own RAW escape hatch
@@ -6093,8 +6143,8 @@ static void handle_grappa_isupport_changed_event(int fd, const char *nick,
      * to a subset of PREFIX would need an explicit wire field here. */
     send_line(fd,
               ":%s 005 %s CHANTYPES=# PREFIX=(%s)%s CHANMODES=%s CASEMAPPING=ascii "
-              "STATUSMSG=%s :are supported by this server",
-              IRCD_SERVER, nick, letters, sigils, chanmodes, sigils);
+              "STATUSMSG=%s MONITOR=%d :are supported by this server",
+              IRCD_SERVER, nick, letters, sigils, chanmodes, sigils, MONITOR_MAX);
     sess->isupport_005_sent = true;
 }
 
@@ -7053,8 +7103,10 @@ static void handle_markread(int fd, struct http_client *hc, const struct config 
  * render — deliberate no-ops.  `"query_windows_list"` IS handled (by
  * `handle_grappa_query_windows_list_event`) — manages per-network DM
  * peer topic subscriptions and the client close notification (#121).
+ * `"notify_list"`, `"presence_snapshot"`, and `"presence_changed"` are
+ * handled by the MONITOR/ISON presence helpers (issue #157).
  * Everything genuinely unhandled (`bundle_hash`, `server_settings_changed`,
- * `supported_umodes_changed`, `notify_list`, `away_confirmed`, ...) still
+ * `supported_umodes_changed`, `away_confirmed`, ...) still
  * logs, TODO(next) per WIRE.md §6 — one verb at a time, reading
  * grappa_channel.ex for each, not guessed. */
 
@@ -7071,7 +7123,474 @@ static void handle_markread(int fd, struct http_client *hc, const struct config 
  *      the post-join snapshot: topic/modes/members → existing handlers
  *      emit 332/333/353/366 to the IRC client), and send JOIN.
  *
- * Network filtering: `joined` rides the user topic for ALL networks the
+/* ── MONITOR/ISON presence helpers (issue #157) ──────────────────────────
+ *
+ * grappa tracks a notify/watch list per (subject, network) and broadcasts
+ * three presence event kinds on the user topic:
+ *
+ *   `notify_list`        — full current list of watched nicks, one array
+ *                          per network keyed by its integer id.  Sent as
+ *                          the after-join snapshot and on every list
+ *                          mutation.  Rebuilds `monitor_nicks[]`.
+ *
+ *   `presence_snapshot`  — full online/offline map for one network, sent
+ *                          as the after-join snapshot so a (re)attaching
+ *                          client starts with correct dots.  Seeds
+ *                          `monitor_online[]` from the snapshot then emits
+ *                          730/731 to the IRC client.
+ *
+ *   `presence_changed`   — one online↔offline transition.  Updates
+ *                          `monitor_online[]` and emits 730/731.
+ *
+ * Client-side commands intercepted here rather than forwarded via
+ * `handle_raw` (which would reach grappa's `EventRouter`, whose 303 drop
+ * is deliberate for grappa's own sweep, but is wrong for a proxied ISON):
+ *
+ *   ISON <nicks…>        — answered from `monitor_online[]`; 303 reply.
+ *   MONITOR + <nicks>    — adds nicks via grappa REST, emits 730/731.
+ *   MONITOR - <nicks>    — removes nicks via grappa REST.
+ *   MONITOR L            — lists `monitor_nicks[]` as 732/733.
+ *   MONITOR C            — clears list via grappa REST.
+ *   MONITOR S            — emits 730/731 for all current nicks.
+ *
+ * Wire numerics (from solanum/unrealircd — both agree):
+ *   730 RPL_MONONLINE    — :<server> 730 <nick> :<n1>!*@*[,<n2>!*@*,…]
+ *   731 RPL_MONOFFLINE   — :<server> 731 <nick> :<n1>[,<n2>,…]
+ *   732 RPL_MONLIST      — :<server> 732 <nick> :<n1>[,<n2>,…]
+ *   733 RPL_ENDOFMONLIST — :<server> 733 <nick> :End of MONITOR list
+ *   734 ERR_MONLISTFULL  — :<server> 734 <nick> <limit> <nicks> :Monitor list is full.
+ *
+ * user@host in 730 RPL_MONONLINE: grappa's presence event carries only
+ * the nick name, not the user@host the target was seen with.  `*@*` is
+ * used as a placeholder — honest (no fabricated host that would poison a
+ * client's banmask) and functional (WeeChat and irssi both accept it and
+ * correctly mark the nick online).
+ */
+
+/* Find the index of `nick` in `sess->monitor_nicks[]` using
+ * case-insensitive ASCII comparison.  Returns monitor_count if not found. */
+static size_t monitor_find(const struct grappa_session *sess, const char *nick) {
+    for (size_t i = 0; i < sess->monitor_count; i++)
+        if (strcasecmp(sess->monitor_nicks[i], nick) == 0)
+            return i;
+    return sess->monitor_count;
+}
+
+/* Emit 730 (online) or 731 (offline) for one nick to the client.
+ * `online` selects the numeric; `nick` is in display form. */
+static void send_monitor_presence(int fd, const char *own_nick, const char *nick, bool online) {
+    if (online)
+        send_line(fd, ":%s 730 %s :%s!*@*", IRCD_SERVER, own_nick, nick);
+    else
+        send_line(fd, ":%s 731 %s :%s", IRCD_SERVER, own_nick, nick);
+}
+
+/* REST: POST /networks/:slug/notify {"nicks":["nick"]} — adds ONE nick to
+ * grappa's notify list, which arms MONITOR/WATCH upstream and starts
+ * delivering `presence_changed` events for it. */
+static bool notify_add_rest(struct http_client *hc, const struct config *cfg,
+                             const struct grappa_session *sess, const char *nick) {
+    char encoded_slug[192];
+    url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
+    char path[256];
+    snprintf(path, sizeof(path), "/networks/%s/notify", encoded_slug);
+
+    char esc_nick[160];
+    if (!json_escape_into(nick, esc_nick, sizeof(esc_nick))) {
+        fprintf(stderr, "bicchierino: MONITOR +%s: nick too long to escape\n", nick);
+        return false;
+    }
+    char body[256];
+    snprintf(body, sizeof(body), "{\"nicks\":[\"%s\"]}", esc_nick);
+
+    struct http_response resp;
+    if (!http_client_request(hc, cfg->grappa_url, "POST", path, sess->token, body, &resp)) {
+        fprintf(stderr, "bicchierino: MONITOR +%s: grappa not reachable\n", nick);
+        return false;
+    }
+    bool ok = resp.status == 200 || resp.status == 201;
+    if (!ok)
+        fprintf(stderr, "bicchierino: MONITOR +%s: HTTP %d\n", nick, resp.status);
+    http_response_free(&resp);
+    return ok;
+}
+
+/* REST: DELETE /networks/:slug/notify/:nick — removes ONE nick from
+ * grappa's notify list, disarming MONITOR/WATCH upstream. */
+static bool notify_remove_rest(struct http_client *hc, const struct config *cfg,
+                                const struct grappa_session *sess, const char *nick) {
+    char encoded_slug[192];
+    url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
+    char encoded_nick[192];
+    url_encode(nick, encoded_nick, sizeof(encoded_nick));
+    char path[512];
+    snprintf(path, sizeof(path), "/networks/%s/notify/%s", encoded_slug, encoded_nick);
+
+    struct http_response resp;
+    if (!http_client_request(hc, cfg->grappa_url, "DELETE", path, sess->token, NULL, &resp)) {
+        fprintf(stderr, "bicchierino: MONITOR -%s: grappa not reachable\n", nick);
+        return false;
+    }
+    bool ok = resp.status == 200 || resp.status == 204;
+    if (!ok)
+        fprintf(stderr, "bicchierino: MONITOR -%s: HTTP %d\n", nick, resp.status);
+    http_response_free(&resp);
+    return ok;
+}
+
+/* REST: DELETE /networks/:slug/notify — clears the entire notify list for
+ * this network, disarming all MONITOR/WATCH entries upstream. */
+static bool notify_clear_rest(struct http_client *hc, const struct config *cfg,
+                               const struct grappa_session *sess) {
+    char encoded_slug[192];
+    url_encode(sess->network_slug, encoded_slug, sizeof(encoded_slug));
+    char path[256];
+    snprintf(path, sizeof(path), "/networks/%s/notify", encoded_slug);
+
+    struct http_response resp;
+    if (!http_client_request(hc, cfg->grappa_url, "DELETE", path, sess->token, NULL, &resp)) {
+        fprintf(stderr, "bicchierino: MONITOR C: grappa not reachable\n");
+        return false;
+    }
+    bool ok = resp.status == 200 || resp.status == 204;
+    if (!ok)
+        fprintf(stderr, "bicchierino: MONITOR C: HTTP %d\n", resp.status);
+    http_response_free(&resp);
+    return ok;
+}
+
+/* WIRE.md §6 / issue #157: `notify_list` event from the user topic.
+ * Payload: `{kind, networks: {<network_id_str>: [{nick, network_id,
+ * added_at}, …], …}}`.  Rebuilds `monitor_nicks[]` from the entry set
+ * for this connection's network.  Does NOT touch `monitor_online[]` —
+ * presence state comes from `presence_snapshot` / `presence_changed`
+ * and is preserved across list refreshes (a nick that was online stays
+ * online in the local map until grappa says otherwise).
+ *
+ * On a multi-network account the event carries ALL networks; we only
+ * consume the array keyed by our own `network_id`. */
+static void handle_grappa_notify_list_event(struct grappa_session *sess,
+                                             const json_value *payload) {
+    const json_value *networks = json_get(payload, "networks");
+    if (!networks || json_type_of(networks) != JSON_OBJECT) return;
+
+    /* JSON object keys are always strings; integer network_id becomes its
+     * decimal string representation when serialised by Jason (Elixir). */
+    char key[32];
+    snprintf(key, sizeof(key), "%ld", sess->network_id);
+    const json_value *entries = json_get(networks, key);
+    if (!entries || json_type_of(entries) != JSON_ARRAY) {
+        /* No entry for this network — list is empty; clear our state. */
+        sess->monitor_count = 0;
+        return;
+    }
+
+    size_t count = json_len(entries);
+    if (count > MONITOR_MAX) count = MONITOR_MAX; /* safety cap */
+
+    /* Rebuild the nick list while preserving any existing presence state:
+     * carry forward online/offline values for nicks that remain in the
+     * new list, default to offline for newly-added ones (presence_changed
+     * will correct them once grappa probes). */
+    char new_nicks[MONITOR_MAX][64];
+    bool new_online[MONITOR_MAX];
+    size_t new_count = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        const json_value *entry = json_at(entries, i);
+        if (!entry) continue;
+        const char *nick = NULL;
+        if (!json_str_req(entry, "nick", &nick)) continue;
+        if (!nick || nick[0] == '\0') continue;
+
+        snprintf(new_nicks[new_count], sizeof(new_nicks[0]), "%s", nick);
+        /* Carry forward online state if this nick was already tracked. */
+        size_t old_idx = monitor_find(sess, nick);
+        new_online[new_count] = (old_idx < sess->monitor_count)
+                                 ? sess->monitor_online[old_idx]
+                                 : false;
+        new_count++;
+    }
+
+    /* Copy rebuilt arrays back into the session. */
+    sess->monitor_count = new_count;
+    for (size_t i = 0; i < new_count; i++) {
+        snprintf(sess->monitor_nicks[i], sizeof(sess->monitor_nicks[0]),
+                 "%s", new_nicks[i]);
+        sess->monitor_online[i] = new_online[i];
+    }
+}
+
+/* WIRE.md §6 / issue #157: `presence_snapshot` event.
+ * Payload: `{kind, network_id: int, nicks: {<folded_nick>: "online"|
+ * "offline"|"unknown", …}}`.  Seeds `monitor_online[]` from the full
+ * snapshot and emits 730/731 to the IRC client for every tracked nick
+ * whose status is known. */
+static void handle_grappa_presence_snapshot_event(int fd, const char *own_nick,
+                                                   struct grappa_session *sess,
+                                                   const json_value *payload) {
+    long event_net_id = 0;
+    bool has_net = false;
+    json_long_opt(payload, "network_id", &event_net_id, &has_net);
+    if (has_net && event_net_id != sess->network_id) return;
+
+    const json_value *nicks_map = json_get(payload, "nicks");
+    if (!nicks_map || json_type_of(nicks_map) != JSON_OBJECT) return;
+
+    /* For every nick in monitor_nicks[], look up its status in the snapshot
+     * and emit the appropriate numeric. */
+    for (size_t i = 0; i < sess->monitor_count; i++) {
+        /* The snapshot keys are ASCII-folded; build the folded form. */
+        char folded[64];
+        ascii_fold_lower(sess->monitor_nicks[i], folded, sizeof(folded));
+        const json_value *status_val = json_get(nicks_map, folded);
+        const char *status_str = json_string(status_val);
+        if (!status_str) {
+            /* Nick not in snapshot: no upstream report yet, stays offline. */
+            sess->monitor_online[i] = false;
+            send_monitor_presence(fd, own_nick, sess->monitor_nicks[i], false);
+            continue;
+        }
+        bool online = (strcmp(status_str, "online") == 0);
+        sess->monitor_online[i] = online;
+        send_monitor_presence(fd, own_nick, sess->monitor_nicks[i], online);
+    }
+}
+
+/* WIRE.md §6 / issue #157: `presence_changed` event.
+ * Payload: `{kind, network_id: int, nick: string, presence: "online"|
+ * "offline", initial: bool, source: "monitor"|"watch"|"ison", ts: string}`.
+ * Updates one nick's online/offline state and emits 730/731 to the
+ * IRC client.  Filtered by network_id; `initial: true` events (the
+ * baseline snapshot that fires when grappa first arms the nick) are
+ * treated the same as live transitions — the client needs the state
+ * regardless of whether it is "initial" or a real transition. */
+static void handle_grappa_presence_changed_event(int fd, const char *own_nick,
+                                                  struct grappa_session *sess,
+                                                  const json_value *payload) {
+    long event_net_id = 0;
+    bool has_net = false;
+    json_long_opt(payload, "network_id", &event_net_id, &has_net);
+    if (has_net && event_net_id != sess->network_id) return;
+
+    const char *nick = NULL;
+    if (!json_str_req(payload, "nick", &nick)) return;
+    const char *presence_str = NULL;
+    if (!json_str_req(payload, "presence", &presence_str)) return;
+    bool online = (strcmp(presence_str, "online") == 0);
+
+    /* Update local state if this nick is in our monitor list. */
+    size_t idx = monitor_find(sess, nick);
+    if (idx < sess->monitor_count)
+        sess->monitor_online[idx] = online;
+
+    /* Always emit to the client — even if the nick is not in our local
+     * list (e.g. another client added it; we got the event because we
+     * share the same grappa account) — so the IRC client's own MONITOR
+     * state stays in sync. */
+    send_monitor_presence(fd, own_nick, nick, online);
+}
+
+/* Client command: ISON <nick1> [<nick2> …] — answered from local
+ * presence state.  Format: params[0] is the first nick; some clients
+ * pack all nicks in one param separated by spaces, others send separate
+ * params.  We handle both by re-joining all params with spaces and
+ * tokenising. */
+static void handle_ison(int fd, const char *own_nick, const struct grappa_session *sess,
+                         const struct irc_message *msg) {
+    if (msg->param_count == 0) {
+        /* No nicks: empty 303. */
+        send_line(fd, ":%s 303 %s :", IRCD_SERVER, own_nick);
+        return;
+    }
+
+    /* Build the online-nicks reply, comma-less space-separated as RFC
+     * 1459 specifies for 303. */
+    char reply[512];
+    size_t reply_len = 0;
+
+    for (int p = 0; p < msg->param_count; p++) {
+        /* Split the param on spaces (some clients pack them in one param). */
+        char param_copy[256];
+        snprintf(param_copy, sizeof(param_copy), "%s", msg->params[p]);
+        char *tok = param_copy;
+        char *sp;
+        while ((sp = strtok_r(tok, " ", &tok)) != NULL) {
+            if (sp[0] == '\0') continue;
+            size_t idx = monitor_find(sess, sp);
+            if (idx < sess->monitor_count && sess->monitor_online[idx]) {
+                /* Nick is online in our presence state — include in reply. */
+                size_t nick_len = strlen(sess->monitor_nicks[idx]);
+                if (reply_len + nick_len + 2 < sizeof(reply)) {
+                    if (reply_len > 0) reply[reply_len++] = ' ';
+                    memcpy(reply + reply_len, sess->monitor_nicks[idx], nick_len);
+                    reply_len += nick_len;
+                }
+            }
+        }
+    }
+    reply[reply_len] = '\0';
+
+    send_line(fd, ":%s 303 %s :%s", IRCD_SERVER, own_nick, reply);
+}
+
+/* Client command: MONITOR <subcmd> [<targets>]
+ *
+ * + <nicks>  — add nicks to the notify list (REST POST, then emits 730/731)
+ * - <nicks>  — remove nicks from the notify list (REST DELETE)
+ * L          — list monitored nicks (732 / 733)
+ * C          — clear the entire list (REST DELETE all)
+ * S          — emit current status as 730/731 for all nicks
+ *
+ * The `grappa:user` topic delivers `presence_snapshot` and `presence_changed`
+ * events that keep the local state in sync; MONITOR + / - merely mutate the
+ * DB list and start/stop the upstream WATCH/MONITOR arming. */
+/* Shared helper: emit 732/733 for the current monitor_nicks[] list. */
+static void monitor_send_list(int fd, const char *own_nick,
+                               const struct grappa_session *sess) {
+    if (sess->monitor_count == 0) {
+        send_line(fd, ":%s 733 %s :End of MONITOR list", IRCD_SERVER, own_nick);
+        return;
+    }
+    /* Emit 732 lines; multiple nicks per line, comma-separated.
+     * Keep each line well under the 512-byte IRC limit. */
+    char buf[400];
+    size_t buf_len = 0;
+    for (size_t i = 0; i < sess->monitor_count; i++) {
+        const char *n = sess->monitor_nicks[i];
+        size_t nlen = strlen(n);
+        if (buf_len + (buf_len ? 1 : 0) + nlen + 1 >= sizeof(buf)) {
+            buf[buf_len] = '\0';
+            send_line(fd, ":%s 732 %s :%s", IRCD_SERVER, own_nick, buf);
+            buf_len = 0;
+        }
+        if (buf_len > 0) buf[buf_len++] = ',';
+        memcpy(buf + buf_len, n, nlen);
+        buf_len += nlen;
+    }
+    if (buf_len > 0) {
+        buf[buf_len] = '\0';
+        send_line(fd, ":%s 732 %s :%s", IRCD_SERVER, own_nick, buf);
+    }
+    send_line(fd, ":%s 733 %s :End of MONITOR list", IRCD_SERVER, own_nick);
+}
+
+static void handle_monitor(int fd, struct http_client *hc, const struct config *cfg,
+                            const char *own_nick, struct grappa_session *sess,
+                            const struct irc_message *msg) {
+    /* No subcommand or bare "MONITOR" — treat as list. */
+    if (msg->param_count == 0) {
+        monitor_send_list(fd, own_nick, sess);
+        return;
+    }
+
+    const char *subcmd = msg->params[0];
+
+    if (subcmd[0] == '+') {
+        /* MONITOR + <nick1>[,<nick2>,…] */
+        const char *targets = msg->param_count >= 2 ? msg->params[1] : NULL;
+        if (!targets || targets[0] == '\0') {
+            send_line(fd, ":%s 461 %s MONITOR :Not enough parameters", IRCD_SERVER, own_nick);
+            return;
+        }
+        char targets_copy[512];
+        snprintf(targets_copy, sizeof(targets_copy), "%s", targets);
+        char *tok = targets_copy;
+        char *sp;
+        while ((sp = strtok_r(tok, ",", &tok)) != NULL) {
+            if (sp[0] == '\0') continue;
+            if (sess->monitor_count >= MONITOR_MAX) {
+                /* List full — 734 ERR_MONLISTFULL for the remaining targets.
+                 * Include `sp` plus any remaining comma-list in the error. */
+                char remaining[512];
+                size_t rlen = strlen(sp);
+                if (rlen < sizeof(remaining)) {
+                    memcpy(remaining, sp, rlen + 1);
+                    /* Append the rest of the comma-separated list. */
+                    if (tok && tok[0]) {
+                        size_t rlen2 = strlen(tok);
+                        if (rlen + 1 + rlen2 < sizeof(remaining)) {
+                            remaining[rlen] = ',';
+                            memcpy(remaining + rlen + 1, tok, rlen2 + 1);
+                        }
+                    }
+                    send_line(fd, ":%s 734 %s %d %s :Monitor list is full.",
+                              IRCD_SERVER, own_nick, MONITOR_MAX, remaining);
+                }
+                return;
+            }
+            /* Idempotent: if already monitored, still emit current status. */
+            size_t existing = monitor_find(sess, sp);
+            if (existing < sess->monitor_count) {
+                send_monitor_presence(fd, own_nick, sess->monitor_nicks[existing],
+                                      sess->monitor_online[existing]);
+                continue;
+            }
+            /* Add to grappa's notify list via REST. */
+            if (notify_add_rest(hc, cfg, sess, sp)) {
+                /* Add to local list; presence_changed will update online status. */
+                snprintf(sess->monitor_nicks[sess->monitor_count],
+                         sizeof(sess->monitor_nicks[0]), "%s", sp);
+                sess->monitor_online[sess->monitor_count] = false;
+                sess->monitor_count++;
+                /* Emit as offline until presence_changed arrives. */
+                send_line(fd, ":%s 731 %s :%s", IRCD_SERVER, own_nick, sp);
+            }
+        }
+        return;
+    }
+
+    if (subcmd[0] == '-') {
+        /* MONITOR - <nick1>[,<nick2>,…] */
+        const char *targets = msg->param_count >= 2 ? msg->params[1] : NULL;
+        if (!targets || targets[0] == '\0') return;
+        char targets_copy[512];
+        snprintf(targets_copy, sizeof(targets_copy), "%s", targets);
+        char *tok = targets_copy;
+        char *sp;
+        while ((sp = strtok_r(tok, ",", &tok)) != NULL) {
+            if (sp[0] == '\0') continue;
+            size_t idx = monitor_find(sess, sp);
+            if (idx >= sess->monitor_count) continue; /* not monitored */
+            notify_remove_rest(hc, cfg, sess, sp);
+            /* Remove from local list (compact the array). */
+            sess->monitor_count--;
+            if (idx < sess->monitor_count) {
+                memmove(sess->monitor_nicks[idx], sess->monitor_nicks[idx + 1],
+                        (sess->monitor_count - idx) * sizeof(sess->monitor_nicks[0]));
+                memmove(&sess->monitor_online[idx], &sess->monitor_online[idx + 1],
+                        (sess->monitor_count - idx) * sizeof(sess->monitor_online[0]));
+            }
+        }
+        return;
+    }
+
+    if (subcmd[0] == 'L' || subcmd[0] == 'l') {
+        monitor_send_list(fd, own_nick, sess);
+        return;
+    }
+
+    if (subcmd[0] == 'C' || subcmd[0] == 'c') {
+        /* MONITOR C — clear the whole list. */
+        notify_clear_rest(hc, cfg, sess);
+        sess->monitor_count = 0;
+        return;
+    }
+
+    if (subcmd[0] == 'S' || subcmd[0] == 's') {
+        /* MONITOR S — emit current 730/731 for all nicks. */
+        for (size_t i = 0; i < sess->monitor_count; i++)
+            send_monitor_presence(fd, own_nick, sess->monitor_nicks[i],
+                                  sess->monitor_online[i]);
+        return;
+    }
+
+    /* Unknown subcommand — no-op; real ircds silently ignore unknown MONITOR
+     * subcommands per the IRCv3 MONITOR spec ("unknown subcommand MUST be
+     * ignored silently"). */
+}
+
+/* Network filtering: `joined` rides the user topic for ALL networks the
  * account holds — drop events for networks other than ours before
  * doing anything (same discipline as `handle_grappa_isupport_changed_event`
  * and `handle_grappa_umode_changed_event`, except those filter by
@@ -7212,6 +7731,12 @@ static void handle_grappa_event(int fd, const char *nick, struct bridge *br,
         handle_grappa_read_cursor_set_event(fd, hc, cfg, sess, inner, topic_str);
     } else if (strcmp(kind, "joined") == 0) {
         handle_grappa_joined_event(fd, nick, br, sess, hc, cfg, inner);
+    } else if (strcmp(kind, "notify_list") == 0) {
+        handle_grappa_notify_list_event(sess, inner);
+    } else if (strcmp(kind, "presence_snapshot") == 0) {
+        handle_grappa_presence_snapshot_event(fd, nick, sess, inner);
+    } else if (strcmp(kind, "presence_changed") == 0) {
+        handle_grappa_presence_changed_event(fd, nick, sess, inner);
     } else if (strcmp(kind, "window_pending") == 0 || strcmp(kind, "channels_changed") == 0 ||
                strcmp(kind, "archive_changed") == 0 || strcmp(kind, "window_counts") == 0) {
         /* Recognized, deliberate no-ops — see this function's own doc. */
