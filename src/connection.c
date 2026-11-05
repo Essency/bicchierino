@@ -7122,7 +7122,7 @@ static void handle_markread(int fd, struct http_client *hc, const struct config 
  *      it to our session, subscribe the grappa WS topic (which triggers
  *      the post-join snapshot: topic/modes/members → existing handlers
  *      emit 332/333/353/366 to the IRC client), and send JOIN.
- *
+ */
 /* ── MONITOR/ISON presence helpers (issue #157) ──────────────────────────
  *
  * grappa tracks a notify/watch list per (subject, network) and broadcasts
